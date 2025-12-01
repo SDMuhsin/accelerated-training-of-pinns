@@ -178,7 +178,7 @@ def build_model_kwargs(args, model_name: str) -> Dict[str, Any]:
         kwargs['max_iter'] = args.max_iter
         kwargs['tol'] = args.tol
 
-        if model_name == 'dt-elm-pinn':
+        if model_name in ['dt-elm-pinn', 'dt-elm-pinn-cholesky', 'dt-elm-pinn-svd']:
             kwargs['use_skip_connections'] = not args.no_skip_connections
 
         if model_name == 'elm':
