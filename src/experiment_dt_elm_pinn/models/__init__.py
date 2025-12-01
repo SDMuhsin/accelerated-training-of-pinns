@@ -12,6 +12,7 @@ from .vanilla_pinn import VanillaPINN
 from .dt_pinn import DTPINN
 from .elm import ELM
 from .dt_elm_pinn import DTELMPINN, DTELMPINNCholesky, DTELMPINNSVD
+from .pielm import PIELM
 
 # Register all available models
 ModelRegistry.register('vanilla-pinn', VanillaPINN)
@@ -20,9 +21,10 @@ ModelRegistry.register('elm', ELM)
 ModelRegistry.register('dt-elm-pinn', DTELMPINN)  # Default (Cholesky)
 ModelRegistry.register('dt-elm-pinn-cholesky', DTELMPINNCholesky)
 ModelRegistry.register('dt-elm-pinn-svd', DTELMPINNSVD)
+ModelRegistry.register('pielm', PIELM)
 
 __all__ = [
     'BaseModel', 'ModelRegistry',
     'VanillaPINN', 'DTPINN', 'ELM', 'DTELMPINN',
-    'DTELMPINNCholesky', 'DTELMPINNSVD'
+    'DTELMPINNCholesky', 'DTELMPINNSVD', 'PIELM'
 ]
