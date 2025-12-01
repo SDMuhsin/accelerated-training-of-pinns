@@ -6,16 +6,16 @@ echo "Beginning DT-PINN experiment sbatch script submissions."
 # CPU-only models (fast, ELM-based) - no GPU needed
 cpu_models=(
     dt-elm-pinn
-    #dt-elm-pinn-cholesky
-    #dt-elm-pinn-svd
-    #pielm
-    #elm
+    dt-elm-pinn-cholesky
+    dt-elm-pinn-svd
+    pielm
+    elm
 )
 
 # GPU models (gradient-based, need CUDA)
 gpu_models=(
     vanilla-pinn
-    #dt-pinn
+    dt-pinn
 )
 
 # Tasks to run
@@ -26,7 +26,7 @@ tasks=(
 # Data files to test
 file_names=(
     2_2236
-    #2_582
+    2_582
 )
 
 # Seeds for reproducibility (5 seeds for statistical significance in papers)
@@ -36,7 +36,7 @@ seeds=(42) # 123 456 789 1024)
 # CPU models are very fast (<1 minute), but we give buffer
 CPU_TIME="0-00:30:00"  # 30 minutes
 # GPU models need longer for proper convergence
-GPU_TIME="0-06:00:00"  # 6 hours (for 1000 L-BFGS epochs)
+GPU_TIME="0-01:00:00"  # 6 hours (for 1000 L-BFGS epochs)
 
 # ============================================================================
 # PINN training parameters - Paper-quality settings
