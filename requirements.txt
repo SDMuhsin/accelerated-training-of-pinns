@@ -1,6 +1,6 @@
 numpy
 matplotlib
 scipy
-cupy-cuda12x
+cupy
 torch
 cupy
