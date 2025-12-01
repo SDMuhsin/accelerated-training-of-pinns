@@ -1,0 +1,5 @@
+numpy
+matplotlib
+scipy
+cupy-cuda12x
+torch

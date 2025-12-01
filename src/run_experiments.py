@@ -1,0 +1,735 @@
+"""
+Comprehensive DT-PINN vs Vanilla PINN comparison script.
+Supports multiple tasks, problem sizes, and training configurations via argparse.
+
+Usage examples:
+    # Run vanilla PINN on Poisson equation, 2236 points, 1000 epochs
+    python run_experiments.py --method vanilla --task poisson --size 2236 --epochs 1000
+
+    # Run DT-PINN on same problem with 5000 epochs
+    python run_experiments.py --method dtpinn --task poisson --size 2236 --epochs 5000
+
+    # Compare both methods (runs sequentially)
+    python run_experiments.py --method both --task poisson --size 2236 --epochs 2000
+"""
+
+import argparse
+import json
+import os
+import time
+from collections import defaultdict
+from math import isnan
+
+import torch
+import torch.nn.functional as F
+from torch.autograd import grad
+from torch import optim
+from torch.nn import MSELoss
+import numpy as np
+from scipy.io import loadmat
+
+# For DT-PINN
+import cupy
+from scipy.sparse import csr_matrix
+from torch.utils.dlpack import to_dlpack, from_dlpack
+import cupyx.scipy.sparse as cupy_sparse
+
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from network import W
+
+torch.manual_seed(0)
+
+# CUDA support
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    device_string = "cuda"
+    torch.cuda.manual_seed_all(0)
+else:
+    device = torch.device('cpu')
+    device_string = "cpu"
+
+# Global for DT-PINN
+L_t, B_t = None, None
+
+
+# ===================================================================
+# DT-PINN Custom Autograd Functions
+# ===================================================================
+class Cupy_mul_L(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u_pred_, sparse):
+        return from_dlpack(sparse.dot(cupy.from_dlpack(to_dlpack(u_pred_))).toDlpack())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return from_dlpack(L_t.dot(cupy.from_dlpack(to_dlpack(grad_output))).toDlpack()), None
+
+
+class Cupy_mul_B(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u_pred_, sparse):
+        return from_dlpack(sparse.dot(cupy.from_dlpack(to_dlpack(u_pred_))).toDlpack())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return from_dlpack(B_t.dot(cupy.from_dlpack(to_dlpack(grad_output))).toDlpack()), None
+
+
+# ===================================================================
+# Vanilla PINN Trainer
+# ===================================================================
+class VanillaTrainer:
+    def __init__(self, config, data_dict, task='poisson'):
+        self.config = config
+        self.task = task
+        self.lr = config['lr']
+        self.epochs = config['epochs']
+        self.precision = torch.float32 if config['precision'] == 'float32' else torch.float64
+
+        # Unpack data
+        for key, val in data_dict.items():
+            setattr(self, key, val)
+
+        self.logged_results = defaultdict(list)
+        self.w = W(config)
+
+        print(f"Network: {config['layers']} layers × {config['nodes']} nodes")
+        print(f"Precision: {config['precision']}")
+
+        # Setup points
+        self.x_interior = torch.vstack([self.x_i.clone()])
+        self.y_interior = torch.vstack([self.y_i.clone()])
+        self.X_interior = torch.hstack([self.x_interior, self.y_interior])
+
+        self.X_b = torch.hstack([self.x_b.clone(), self.y_b.clone()])
+
+        self.x_tilde = torch.vstack([self.x_i.clone(), self.x_b.clone()])
+        self.y_tilde = torch.vstack([self.y_i.clone(), self.y_b.clone()])
+        self.X_tilde = torch.hstack([self.x_tilde, self.y_tilde])
+
+        self.optimizer = optim.LBFGS(self.w.parameters(), lr=self.lr)
+
+    @staticmethod
+    def compute_mse(a, b):
+        return MSELoss()(torch.flatten(a), torch.flatten(b)).item()
+
+    @staticmethod
+    def compute_l2(a, b):
+        diff = torch.subtract(torch.flatten(a).detach().cpu(), torch.flatten(b).detach().cpu())
+        return (torch.linalg.norm(diff) / torch.linalg.norm(torch.flatten(b))).item()
+
+    def train(self):
+        epochs = self.epochs
+        self.u_tilde = self.u[:self.ib_idx]
+        self.f_interior = self.f[:self.b_starts]
+
+        if device_string == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for i in range(1, epochs + 1):
+            def closure():
+                self.optimizer.zero_grad()
+
+                # Interior PDE residual
+                u_pred_interior = self.w.forward(self.X_interior)
+                u_x = grad(u_pred_interior, self.x_interior, grad_outputs=torch.ones_like(
+                           u_pred_interior), create_graph=True, retain_graph=True)[0]
+                u_xx = grad(u_x, self.x_interior, grad_outputs=torch.ones_like(
+                            u_pred_interior), create_graph=True, retain_graph=True)[0]
+
+                u_y = grad(u_pred_interior, self.y_interior, grad_outputs=torch.ones_like(
+                           u_pred_interior), create_graph=True, retain_graph=True)[0]
+                u_yy = grad(u_y, self.y_interior, grad_outputs=torch.ones_like(
+                            u_pred_interior), create_graph=True, retain_graph=True)[0]
+
+                # Task-specific PDE residual
+                if self.task == 'poisson':
+                    f_pred = (u_xx + u_yy) - self.f_interior
+                elif self.task == 'poisson-nonlinear':
+                    f_pred = (u_xx + u_yy) - self.f_interior - torch.exp(u_pred_interior)
+                elif self.task == 'heat':
+                    raise NotImplementedError("Heat equation requires special time-dependent handling")
+                else:
+                    raise ValueError(f"Unknown task: {self.task}")
+
+                # Boundary residual
+                boundary_pred = self.w.forward(self.X_b)
+                l2_w_x = grad(boundary_pred, self.x_b, grad_outputs=torch.ones_like(boundary_pred),
+                              create_graph=True, retain_graph=True)[0]
+                l2_w_y = grad(boundary_pred, self.y_b, grad_outputs=torch.ones_like(boundary_pred),
+                              create_graph=True, retain_graph=True)[0]
+
+                w_xy = torch.hstack([l2_w_x, l2_w_y])
+                gradient_n = torch.multiply(self.n, w_xy).sum(dim=1).unsqueeze(dim=1)
+                boundary_loss_term = torch.multiply(self.alpha, gradient_n) + \
+                                     torch.multiply(self.beta, boundary_pred) - self.g
+
+                l2 = torch.mean(torch.square(torch.flatten(f_pred)))
+                l3 = torch.mean(torch.square(torch.flatten(boundary_loss_term)))
+
+                train_loss = l2 + l3
+                train_loss.backward(retain_graph=True)
+                return train_loss.item()
+
+            loss_value = self.optimizer.step(closure)
+            if device_string == "cuda":
+                torch.cuda.synchronize()
+            epoch_time = time.perf_counter() - start
+
+            # Logging
+            training_pred = self.w.forward(self.X_tilde)
+            test_pred = self.w.forward(self.test_X_tilde)
+
+            training_mse = self.compute_mse(training_pred, self.u_true)
+            test_mse = self.compute_mse(test_pred, self.test_u_true)
+            training_l2 = self.compute_l2(training_pred, self.u_true)
+            test_l2 = self.compute_l2(test_pred, self.test_u_true)
+
+            self.logged_results['training_losses'].append(loss_value)
+            self.logged_results['training_mse_losses'].append(training_mse)
+            self.logged_results['training_l2_losses'].append(training_l2)
+            self.logged_results['test_mse_losses'].append(test_mse)
+            self.logged_results['test_l2_losses'].append(test_l2)
+            self.logged_results['epochs_list'].append(i)
+            self.logged_results['epoch_time'].append(epoch_time)
+
+            if i > 30 and (isnan(loss_value) or loss_value > 500):
+                print(f"Loss exploded to: {loss_value}")
+                return False
+
+            if i % 100 == 0:
+                print(f'Epoch {i}/{epochs}, Loss: {loss_value:.6f}, '
+                      f'Train L2: {training_l2:.6f}, Test L2: {test_l2:.6f}, '
+                      f'Time: {epoch_time:.2f}s')
+
+        return dict(self.logged_results)
+
+
+# ===================================================================
+# DT-PINN Trainer
+# ===================================================================
+class DTPINNTrainer:
+    def __init__(self, config, data_dict, task='poisson'):
+        self.config = config
+        self.task = task
+        self.lr = config['lr']
+        self.epochs = config['epochs']
+        self.network_precision_dtype = torch.float32 if config['precision'] == 'float32' else torch.float64
+
+        # Unpack data
+        for key, val in data_dict.items():
+            setattr(self, key, val)
+
+        self.logged_results = defaultdict(list)
+        self.w = W(config)
+
+        print(f"Network: {config['layers']} layers × {config['nodes']} nodes")
+        print(f"Precision: {config['precision']}")
+
+        # Setup points
+        self.x_tilde = torch.vstack([self.x_i.clone(), self.x_b.clone()])
+        self.y_tilde = torch.vstack([self.y_i.clone(), self.y_b.clone()])
+        self.X_tilde = torch.hstack([self.x_tilde, self.y_tilde])
+
+        self.x_full = torch.vstack([self.x_i.clone(), self.x_b.clone(), self.x_g.clone()])
+        self.y_full = torch.vstack([self.y_i.clone(), self.y_b.clone(), self.y_g.clone()])
+        self.X_full = torch.hstack([self.x_full, self.y_full])
+
+        self.X_b = torch.hstack([self.x_b.clone(), self.y_b.clone()])
+
+        self.optimizer = optim.LBFGS(self.w.parameters(), lr=self.lr)
+
+    @staticmethod
+    def compute_mse(a, b):
+        return MSELoss()(torch.flatten(a), torch.flatten(b)).item()
+
+    @staticmethod
+    def compute_l2(a, b):
+        diff = torch.subtract(torch.flatten(a).detach().cpu(), torch.flatten(b).detach().cpu())
+        return (torch.linalg.norm(diff) / torch.linalg.norm(torch.flatten(b))).item()
+
+    def train(self):
+        global L_t, B_t
+        epochs = self.epochs
+        self.u_tilde = self.u[:self.ib_idx]
+
+        # Initialize sparse matrices on GPU
+        rand_vec = cupy.random.rand(self.L.shape[1], 2).astype(cupy.float64)
+        self.L.dot(rand_vec)
+        self.B.dot(rand_vec)
+
+        L_t = self.L.transpose()
+        B_t = self.B.transpose()
+
+        rand_L_vec = cupy.random.rand(self.L.shape[0], 2).astype(cupy.float64)
+        rand_B_vec = cupy.random.rand(self.B.shape[0], 2).astype(cupy.float64)
+        L_t.dot(rand_L_vec)
+        B_t.dot(rand_B_vec)
+
+        L_mul = Cupy_mul_L.apply
+        B_mul = Cupy_mul_B.apply
+
+        if device_string == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for i in range(1, epochs + 1):
+            def closure():
+                self.optimizer.zero_grad()
+
+                u_pred_full = self.w.forward(self.X_full)
+
+                # Task-specific PDE residual
+                if self.task == 'poisson':
+                    f_pred = L_mul(u_pred_full, self.L) - self.f
+                elif self.task == 'poisson-nonlinear':
+                    # For nonlinear: ∇²u - f - exp(u) = 0
+                    # Only evaluate exp on interior+boundary (first ib_idx points)
+                    lap_u = L_mul(u_pred_full, self.L)
+                    f_pred = lap_u[:self.ib_idx] - self.f[:self.ib_idx] - torch.exp(u_pred_full[:self.ib_idx])
+                elif self.task == 'heat':
+                    raise NotImplementedError("Heat equation requires special time-dependent handling")
+                else:
+                    raise ValueError(f"Unknown task: {self.task}")
+
+                boundary_loss_term = B_mul(u_pred_full, self.B) - self.g
+
+                l2 = torch.mean(torch.square(torch.flatten(f_pred)))
+                l3 = torch.mean(torch.square(torch.flatten(boundary_loss_term)))
+
+                train_loss = l2 + l3
+                train_loss.backward(retain_graph=True)
+                return train_loss.item()
+
+            loss_value = self.optimizer.step(closure)
+            if device_string == "cuda":
+                torch.cuda.synchronize()
+            epoch_time = time.perf_counter() - start
+
+            # Logging
+            training_pred = self.w.forward(self.X_tilde)
+            test_pred = self.w.forward(self.test_X_tilde)
+
+            training_mse = self.compute_mse(training_pred, self.u_true)
+            test_mse = self.compute_mse(test_pred, self.test_u_true)
+            training_l2 = self.compute_l2(training_pred, self.u_true)
+            test_l2 = self.compute_l2(test_pred, self.test_u_true)
+
+            self.logged_results['training_losses'].append(loss_value)
+            self.logged_results['training_mse_losses'].append(training_mse)
+            self.logged_results['training_l2_losses'].append(training_l2)
+            self.logged_results['test_mse_losses'].append(test_mse)
+            self.logged_results['test_l2_losses'].append(test_l2)
+            self.logged_results['epochs_list'].append(i)
+            self.logged_results['epoch_time'].append(epoch_time)
+
+            if i > 30 and (isnan(loss_value) or loss_value > 500):
+                print(f"Loss exploded to: {loss_value}")
+                return False
+
+            if i % 100 == 0:
+                print(f'Epoch {i}/{epochs}, Loss: {loss_value:.6f}, '
+                      f'Train L2: {training_l2:.6f}, Test L2: {test_l2:.6f}, '
+                      f'Time: {epoch_time:.2f}s')
+
+        return dict(self.logged_results)
+
+
+# ===================================================================
+# Data Loading
+# ===================================================================
+def load_mat_cupy(mat):
+    """Load scipy matrix and convert to cupy sparse"""
+    scipy_csr = csr_matrix(mat, dtype=np.float64)
+    cupy_csr = cupy_sparse.csr_matrix(scipy_csr)
+    return cupy_csr
+
+
+def load_data(task, size, precision_str):
+    """Load dataset for given task and size"""
+
+    precision = torch.float32 if precision_str == 'float32' else torch.float64
+
+    if task == 'poisson':
+        # Linear Poisson equation
+        file_name = f"2_{size}"
+        test_name = "2_21748_test"
+
+        # Training data
+        X_i = torch.tensor(loadmat(f"scai/files_{file_name}/Xi.mat")["Xi"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_b = torch.tensor(loadmat(f"scai/files_{file_name}/Xb.mat")["Xb"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_g = torch.tensor(loadmat(f"scai/files_{file_name}/Xg.mat")["X_g"],
+                          dtype=precision, requires_grad=True).to(device)
+        n = torch.tensor(loadmat(f"scai/files_{file_name}/n.mat")["n"],
+                        dtype=precision, requires_grad=True).to(device)
+        u_true = torch.tensor(loadmat(f"scai/files_{file_name}/u.mat")["u"], dtype=precision).to(device)
+        f = torch.tensor(loadmat(f"scai/files_{file_name}/f.mat")["f"],
+                        dtype=precision, requires_grad=True).to(device)
+        g = torch.tensor(loadmat(f"scai/files_{file_name}/g.mat")["g"],
+                        dtype=precision, requires_grad=True).to(device)
+        alpha = torch.tensor(loadmat(f"scai/files_{file_name}/alpha.mat")["Neucoeff"],
+                            dtype=precision, requires_grad=True).to(device)
+        beta = torch.tensor(loadmat(f"scai/files_{file_name}/beta.mat")["Dircoeff"],
+                           dtype=precision, requires_grad=True).to(device)
+
+        # DT-PINN matrices
+        L = load_mat_cupy(loadmat(f"scai/files_{file_name}/L1.mat")["L1"])
+        B = load_mat_cupy(loadmat(f"scai/files_{file_name}/B1.mat")["B1"])
+
+        # Test data
+        X_i_test = torch.tensor(loadmat(f"scai/files_{test_name}/Xi.mat")["Xi"],
+                               dtype=precision, requires_grad=True).to(device)
+        X_b_test = torch.tensor(loadmat(f"scai/files_{test_name}/Xb.mat")["Xb"],
+                               dtype=precision, requires_grad=True).to(device)
+        test_u_true = torch.tensor(loadmat(f"scai/files_{test_name}/u.mat")["u"], dtype=precision).to(device)
+
+        test_x_i = X_i_test[:, 0].unsqueeze(dim=1)
+        test_y_i = X_i_test[:, 1].unsqueeze(dim=1)
+        test_x_b = X_b_test[:, 0].unsqueeze(dim=1)
+        test_y_b = X_b_test[:, 1].unsqueeze(dim=1)
+
+        test_x_tilde = torch.vstack([test_x_i, test_x_b])
+        test_y_tilde = torch.vstack([test_y_i, test_y_b])
+        test_X_tilde = torch.hstack([test_x_tilde, test_y_tilde])
+
+        # Separate spatial dimensions
+        x_i = X_i[:, 0].unsqueeze(dim=1)
+        y_i = X_i[:, 1].unsqueeze(dim=1)
+        x_b = X_b[:, 0].unsqueeze(dim=1)
+        y_b = X_b[:, 1].unsqueeze(dim=1)
+        x_g = X_g[:, 0].unsqueeze(dim=1)
+        y_g = X_g[:, 1].unsqueeze(dim=1)
+
+        ib_idx = X_i.shape[0] + X_b.shape[0]
+        b_starts = X_i.shape[0]
+        b_end = b_starts + X_b.shape[0]
+
+        return {
+            'x_i': x_i, 'y_i': y_i, 'x_b': x_b, 'y_b': y_b, 'x_g': x_g, 'y_g': y_g,
+            'n': n, 'u': u_true, 'u_true': u_true[:ib_idx],
+            'f': f, 'g': g, 'alpha': alpha, 'beta': beta,
+            'L': L, 'B': B,
+            'test_X_tilde': test_X_tilde,
+            'test_u_true': test_u_true[:X_i_test.shape[0] + X_b_test.shape[0]],
+            'test_x_i': test_x_i, 'test_y_i': test_y_i,
+            'test_x_b': test_x_b, 'test_y_b': test_y_b,
+            'test_x_tilde': test_x_tilde, 'test_y_tilde': test_y_tilde,
+            'ib_idx': ib_idx, 'b_starts': b_starts, 'b_end': b_end
+        }
+
+    elif task == 'poisson-nonlinear':
+        # Nonlinear Poisson equation (same structure as linear, different folder)
+        file_name = f"2_{size}"
+        test_name = "2_21748_test"  # Reuse linear test set
+
+        # Training data
+        X_i = torch.tensor(loadmat(f"nonlinear/files_{file_name}/Xi.mat")["Xi"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_b = torch.tensor(loadmat(f"nonlinear/files_{file_name}/Xb.mat")["Xb"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_g = torch.tensor(loadmat(f"nonlinear/files_{file_name}/Xg.mat")["X_g"],
+                          dtype=precision, requires_grad=True).to(device)
+        n = torch.tensor(loadmat(f"nonlinear/files_{file_name}/n.mat")["n"],
+                        dtype=precision, requires_grad=True).to(device)
+        u_true = torch.tensor(loadmat(f"nonlinear/files_{file_name}/u.mat")["u"], dtype=precision).to(device)
+        f = torch.tensor(loadmat(f"nonlinear/files_{file_name}/f.mat")["f"],
+                        dtype=precision, requires_grad=True).to(device)
+        g = torch.tensor(loadmat(f"nonlinear/files_{file_name}/g.mat")["g"],
+                        dtype=precision, requires_grad=True).to(device)
+        alpha = torch.tensor(loadmat(f"nonlinear/files_{file_name}/alpha.mat")["Neucoeff"],
+                            dtype=precision, requires_grad=True).to(device)
+        beta = torch.tensor(loadmat(f"nonlinear/files_{file_name}/beta.mat")["Dircoeff"],
+                           dtype=precision, requires_grad=True).to(device)
+
+        # DT-PINN matrices
+        L = load_mat_cupy(loadmat(f"nonlinear/files_{file_name}/L1.mat")["L1"])
+        B = load_mat_cupy(loadmat(f"nonlinear/files_{file_name}/B1.mat")["B1"])
+
+        # Test data (reuse linear Poisson test set)
+        X_i_test = torch.tensor(loadmat(f"scai/files_{test_name}/Xi.mat")["Xi"],
+                               dtype=precision, requires_grad=True).to(device)
+        X_b_test = torch.tensor(loadmat(f"scai/files_{test_name}/Xb.mat")["Xb"],
+                               dtype=precision, requires_grad=True).to(device)
+        test_u_true = torch.tensor(loadmat(f"scai/files_{test_name}/u.mat")["u"], dtype=precision).to(device)
+
+        test_x_i = X_i_test[:, 0].unsqueeze(dim=1)
+        test_y_i = X_i_test[:, 1].unsqueeze(dim=1)
+        test_x_b = X_b_test[:, 0].unsqueeze(dim=1)
+        test_y_b = X_b_test[:, 1].unsqueeze(dim=1)
+
+        test_x_tilde = torch.vstack([test_x_i, test_x_b])
+        test_y_tilde = torch.vstack([test_y_i, test_y_b])
+        test_X_tilde = torch.hstack([test_x_tilde, test_y_tilde])
+
+        # Separate spatial dimensions
+        x_i = X_i[:, 0].unsqueeze(dim=1)
+        y_i = X_i[:, 1].unsqueeze(dim=1)
+        x_b = X_b[:, 0].unsqueeze(dim=1)
+        y_b = X_b[:, 1].unsqueeze(dim=1)
+        x_g = X_g[:, 0].unsqueeze(dim=1)
+        y_g = X_g[:, 1].unsqueeze(dim=1)
+
+        ib_idx = X_i.shape[0] + X_b.shape[0]
+        b_starts = X_i.shape[0]
+        b_end = b_starts + X_b.shape[0]
+
+        return {
+            'x_i': x_i, 'y_i': y_i, 'x_b': x_b, 'y_b': y_b, 'x_g': x_g, 'y_g': y_g,
+            'n': n, 'u': u_true, 'u_true': u_true[:ib_idx],
+            'f': f, 'g': g, 'alpha': alpha, 'beta': beta,
+            'L': L, 'B': B,
+            'test_X_tilde': test_X_tilde,
+            'test_u_true': test_u_true[:X_i_test.shape[0] + X_b_test.shape[0]],
+            'test_x_i': test_x_i, 'test_y_i': test_y_i,
+            'test_x_b': test_x_b, 'test_y_b': test_y_b,
+            'test_x_tilde': test_x_tilde, 'test_y_tilde': test_y_tilde,
+            'ib_idx': ib_idx, 'b_starts': b_starts, 'b_end': b_end
+        }
+
+    elif task == 'heat':
+        # Heat equation (time-dependent, 3D input: x, y, t)
+        file_name = f"2_{size}"
+
+        # Training data
+        X_i = torch.tensor(loadmat(f"heat/files_{file_name}/Xi.mat")["Xi"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_b = torch.tensor(loadmat(f"heat/files_{file_name}/Xb.mat")["Xb"],
+                          dtype=precision, requires_grad=True).to(device)
+        X_g = torch.tensor(loadmat(f"heat/files_{file_name}/Xg.mat")["X_g"],
+                          dtype=precision, requires_grad=True).to(device)
+        n = torch.tensor(loadmat(f"heat/files_{file_name}/n.mat")["n"],
+                        dtype=precision, requires_grad=True).to(device)
+        u_true = torch.tensor(loadmat(f"heat/files_{file_name}/u_heat.mat")["u_heat"], dtype=precision).to(device)
+        f = torch.tensor(loadmat(f"heat/files_{file_name}/f_heat.mat")["f_heat"],
+                        dtype=precision, requires_grad=True).to(device)
+        g = torch.tensor(loadmat(f"heat/files_{file_name}/g_heat.mat")["g_heat"],
+                        dtype=precision, requires_grad=True).to(device)
+        alpha = torch.tensor(loadmat(f"heat/files_{file_name}/alpha.mat")["Neucoeff"],
+                            dtype=precision, requires_grad=True).to(device)
+        beta = torch.tensor(loadmat(f"heat/files_{file_name}/beta.mat")["Dircoeff"],
+                           dtype=precision, requires_grad=True).to(device)
+
+        # DT-PINN matrices
+        L = load_mat_cupy(loadmat(f"heat/files_{file_name}/L1.mat")["L1"])
+        B = load_mat_cupy(loadmat(f"heat/files_{file_name}/B1.mat")["B1"])
+
+        # Separate spatial dimensions
+        x_i = X_i[:, 0].unsqueeze(dim=1)
+        y_i = X_i[:, 1].unsqueeze(dim=1)
+        x_b = X_b[:, 0].unsqueeze(dim=1)
+        y_b = X_b[:, 1].unsqueeze(dim=1)
+        x_g = X_g[:, 0].unsqueeze(dim=1)
+        y_g = X_g[:, 1].unsqueeze(dim=1)
+
+        ib_idx = X_i.shape[0] + X_b.shape[0]
+        b_starts = X_i.shape[0]
+        b_end = b_starts + X_b.shape[0]
+
+        # Time discretization for heat equation (25 time steps)
+        time_range = torch.linspace(0, 1, 25, dtype=precision, device=device)
+
+        # Test data (use same spatial points, evaluate at different time)
+        # For simplicity, use training points as test
+        test_x_i = x_i.clone()
+        test_y_i = y_i.clone()
+        test_x_b = x_b.clone()
+        test_y_b = y_b.clone()
+        test_x_tilde = torch.vstack([test_x_i, test_x_b])
+        test_y_tilde = torch.vstack([test_y_i, test_y_b])
+        test_X_tilde = torch.hstack([test_x_tilde, test_y_tilde])
+        test_u_true = u_true[:ib_idx]
+
+        return {
+            'x_i': x_i, 'y_i': y_i, 'x_b': x_b, 'y_b': y_b, 'x_g': x_g, 'y_g': y_g,
+            'n': n, 'u': u_true, 'u_true': u_true[:ib_idx],
+            'f': f, 'g': g, 'alpha': alpha, 'beta': beta,
+            'L': L, 'B': B,
+            'time_range': time_range,  # Heat-specific
+            'test_X_tilde': test_X_tilde,
+            'test_u_true': test_u_true,
+            'test_x_i': test_x_i, 'test_y_i': test_y_i,
+            'test_x_b': test_x_b, 'test_y_b': test_y_b,
+            'test_x_tilde': test_x_tilde, 'test_y_tilde': test_y_tilde,
+            'ib_idx': ib_idx, 'b_starts': b_starts, 'b_end': b_end
+        }
+
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
+
+# ===================================================================
+# Main Experiment Runner
+# ===================================================================
+def run_experiment(args):
+    """Run single experiment with given configuration"""
+
+    print("="*70)
+    print(f"EXPERIMENT: {args.method.upper()} on {args.task.upper()}")
+    print(f"Size: {args.size} points, Epochs: {args.epochs}")
+    print("="*70)
+
+    # Load data
+    print("Loading data...")
+    data = load_data(args.task, args.size, args.precision)
+
+    # Setup config
+    config = {
+        'spatial_dim': 2,
+        'precision': args.precision,
+        'activation': args.activation,
+        'order': 2,
+        'network_device': device_string,
+        'layers': args.layers,
+        'nodes': args.nodes,
+        'epochs': args.epochs,
+        'optimizer': 'lbfgs',
+        'lr': args.lr,
+    }
+
+    # Run training
+    print(f"\nStarting {args.method} training...")
+
+    flag = True
+    while flag:
+        if args.method == 'vanilla':
+            trainer = VanillaTrainer(config, data, task=args.task)
+        else:  # dtpinn
+            trainer = DTPINNTrainer(config, data, task=args.task)
+
+        results = trainer.train()
+
+        if type(results) == bool:  # Training failed
+            config['lr'] /= 2.0
+            print(f"Training failed, restarting with lr = {config['lr']}")
+            continue
+        else:
+            flag = False
+
+    # Add config to results
+    results.update(config)
+    results['task'] = args.task
+    results['size'] = args.size
+    results['method'] = args.method
+
+    # Save results
+    save_dir = f"results/{args.method}/{args.task}/{args.size}"
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/results_e{args.epochs}.json"
+
+    with open(save_path, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n{'='*70}")
+    print(f"RESULTS SAVED: {save_path}")
+    print(f"{'='*70}")
+    print(f"Final training L2: {results['training_l2_losses'][-1]:.6e}")
+    print(f"Final test L2: {results['test_l2_losses'][-1]:.6e}")
+    print(f"Total time: {results['epoch_time'][-1]:.2f}s")
+    print(f"{'='*70}\n")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description='DT-PINN vs Vanilla PINN Experiments')
+
+    # Method selection
+    parser.add_argument('--method', type=str, required=True,
+                       choices=['vanilla', 'dtpinn', 'both'],
+                       help='Training method: vanilla, dtpinn, or both')
+
+    # Task selection
+    parser.add_argument('--task', type=str, default='poisson',
+                       choices=['poisson', 'poisson-nonlinear', 'heat'],
+                       help='Task: poisson (linear), poisson-nonlinear, or heat')
+
+    # Problem configuration
+    parser.add_argument('--size', type=int, default=None,
+                       help='Problem size (auto: poisson/nonlinear→2236, heat→828)')
+
+    # Training configuration
+    parser.add_argument('--epochs', type=int, default=1000,
+                       help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=None,
+                       help='Learning rate (default: 0.2 for vanilla, 0.04 for dtpinn)')
+
+    # Network architecture
+    parser.add_argument('--layers', type=int, default=4,
+                       help='Number of hidden layers')
+    parser.add_argument('--nodes', type=int, default=50,
+                       help='Nodes per hidden layer')
+    parser.add_argument('--activation', type=str, default='tanh',
+                       choices=['tanh', 'relu'],
+                       help='Activation function')
+
+    # Precision
+    parser.add_argument('--precision', type=str, default=None,
+                       help='Precision (default: float32 for vanilla, float64 for dtpinn)')
+
+    args = parser.parse_args()
+
+    # Auto-select size based on task
+    if args.size is None:
+        if args.task == 'heat':
+            args.size = 828
+        else:  # poisson or poisson-nonlinear
+            args.size = 2236
+
+    # Set defaults based on method
+    if args.method == 'vanilla' or args.method == 'both':
+        if args.lr is None:
+            args.lr = 0.2
+        if args.precision is None:
+            args.precision = 'float32'
+
+    if args.method == 'dtpinn':
+        if args.lr is None:
+            args.lr = 0.04
+        if args.precision is None:
+            args.precision = 'float64'
+
+    # Run experiments
+    if args.method == 'both':
+        print("\n" + "="*70)
+        print("RUNNING BOTH METHODS FOR COMPARISON")
+        print("="*70 + "\n")
+
+        # Run vanilla
+        args_vanilla = argparse.Namespace(**vars(args))
+        args_vanilla.method = 'vanilla'
+        args_vanilla.lr = 0.2
+        args_vanilla.precision = 'float32'
+        vanilla_results = run_experiment(args_vanilla)
+
+        # Run DT-PINN
+        args_dtpinn = argparse.Namespace(**vars(args))
+        args_dtpinn.method = 'dtpinn'
+        args_dtpinn.lr = 0.04
+        args_dtpinn.precision = 'float64'
+        dtpinn_results = run_experiment(args_dtpinn)
+
+        # Print comparison
+        print("\n" + "="*70)
+        print("COMPARISON SUMMARY")
+        print("="*70)
+        print(f"Task: {args.task}, Size: {args.size}, Epochs: {args.epochs}")
+        print(f"\nVanilla PINN:")
+        print(f"  Time: {vanilla_results['epoch_time'][-1]:.2f}s")
+        print(f"  Test L2: {vanilla_results['test_l2_losses'][-1]:.6e}")
+        print(f"\nDT-PINN:")
+        print(f"  Time: {dtpinn_results['epoch_time'][-1]:.2f}s")
+        print(f"  Test L2: {dtpinn_results['test_l2_losses'][-1]:.6e}")
+        print(f"\nSpeedup: {vanilla_results['epoch_time'][-1] / dtpinn_results['epoch_time'][-1]:.2f}x")
+        print(f"Accuracy ratio: {dtpinn_results['test_l2_losses'][-1] / vanilla_results['test_l2_losses'][-1]:.2f}x")
+        print("="*70 + "\n")
+
+    else:
+        run_experiment(args)
+
+
+if __name__ == "__main__":
+    main()
