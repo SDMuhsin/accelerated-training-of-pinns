@@ -76,6 +76,7 @@ for task in "${tasks[@]}"; do
                     --error=${log_file}-%N-%j.err \
                     --wrap="
                         module load scipy-stack
+			module load arrow
                         source ./env/bin/activate
                         echo '========================================'
                         echo 'Job: $job_name'
@@ -123,6 +124,7 @@ for task in "${tasks[@]}"; do
                     --error=${log_file}-%N-%j.err \
                     --wrap="
                         module load scipy-stack cuda cudnn
+			module load arrow
                         source ./env/bin/activate
                         echo '========================================'
                         echo 'Job: $job_name'
