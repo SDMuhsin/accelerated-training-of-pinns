@@ -34,9 +34,9 @@ seeds=(42) # 123 456 789 1024)
 
 # Time allocations
 # CPU models are very fast (<1 minute), but we give buffer
-CPU_TIME="0-00:30:00"  # 30 minutes
+CPU_TIME="0-02:00:00"  # 30 minutes
 # GPU models need longer for proper convergence
-GPU_TIME="0-01:00:00"  # 6 hours (for 1000 L-BFGS epochs)
+GPU_TIME="0-06:00:00"  # 6 hours (for 1000 L-BFGS epochs)
 
 # ============================================================================
 # PINN training parameters - Paper-quality settings
