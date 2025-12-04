@@ -176,12 +176,15 @@ class DTELMPINN(BaseModel):
 
     def train(self, verbose: bool = False, **kwargs) -> TrainResult:
         """
-        Train using Newton iteration for nonlinear PDE.
+        Train using Newton iteration for nonlinear PDE, or direct solve for linear PDE.
 
-        For ∇²u = f + exp(u):
+        For nonlinear PDE (∇²u = f + exp(u)):
         - Linearize exp(u) around current solution
         - Solve linear system via lstsq
         - Iterate until convergence
+
+        For linear PDE (∇²u = f):
+        - Direct least-squares solve (no Newton iteration)
         """
         if not self._is_setup:
             self.setup()
@@ -195,49 +198,82 @@ class DTELMPINN(BaseModel):
 
         start_time = time.perf_counter()
 
-        # Initial solve: approximate exp(u) ≈ exp(0) = 1
-        A_init = np.vstack([self.LH, self.BH])
-        b_init = np.concatenate([f + 1.0, g])
-        self.W_out = self._solve_lstsq(A_init, b_init)
+        # Check if task is linear (no nonlinear terms like exp(u))
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
-        u = self.H @ self.W_out
-        u_ib = u[:N_ib]
+        if is_linear:
+            # LINEAR PDE: Direct solve with single lstsq
+            # PDE: L @ u = f (no exp(u) term)
+            # BC:  B @ u = g
+            if verbose:
+                print("  Linear PDE detected: using direct solve")
 
-        residual_history = []
+            A = np.vstack([self.LH, self.BH])
+            b = np.concatenate([f, g])
 
-        # Newton iterations
-        for k in range(self.max_iter):
-            # Compute residual: F = L @ u - f - exp(u)
-            Lu = (L @ u)[:N_ib]
-            exp_u = np.exp(u_ib)
-            F_pde = Lu - f - exp_u
-            F_bc = (B @ u) - g
-
-            residual = np.sqrt(np.mean(F_pde**2) + np.mean(F_bc**2))
-            residual_history.append(residual)
-
-            if verbose and (k < 5 or k % 5 == 0):
-                print(f"  Newton iter {k}: residual = {residual:.4e}")
-
-            if residual < self.tol:
+            try:
+                self.W_out = self._solve_lstsq(A, b)
+            except np.linalg.LinAlgError:
+                # Fallback to SVD if Cholesky fails
                 if verbose:
-                    print(f"  Converged at iteration {k+1}")
-                break
+                    print("  Cholesky failed, falling back to SVD solver")
+                self.W_out = _solve_lstsq_svd(A, b)
 
-            # Form Jacobian: J = L - diag(exp(u))
-            # J @ H = LH - diag(exp(u)) @ H_ib
-            H_ib = self.H[:N_ib, :]
-            JH = self.LH - exp_u[:, np.newaxis] * H_ib
+            u = self.H @ self.W_out
+            residual_history = []
 
-            # Solve linear system: [JH; BH] @ delta_W = -[F_pde; F_bc]
-            A = np.vstack([JH, self.BH])
-            F = np.concatenate([-F_pde, -F_bc])
+            # Compute final residual for reporting
+            Lu = (L @ u)[:N_ib]
+            F_pde = Lu - f
+            F_bc = (B @ u) - g
+            final_residual = np.sqrt(np.mean(F_pde**2) + np.mean(F_bc**2))
+            residual_history.append(final_residual)
 
-            delta_W = self._solve_lstsq(A, F)
-            self.W_out = self.W_out + delta_W
+        else:
+            # NONLINEAR PDE: Newton iteration
+            # Initial solve: approximate exp(u) ≈ exp(0) = 1
+            A_init = np.vstack([self.LH, self.BH])
+            b_init = np.concatenate([f + 1.0, g])
+            self.W_out = self._solve_lstsq(A_init, b_init)
 
             u = self.H @ self.W_out
             u_ib = u[:N_ib]
+
+            residual_history = []
+
+            # Newton iterations
+            for k in range(self.max_iter):
+                # Compute residual: F = L @ u - f - exp(u)
+                Lu = (L @ u)[:N_ib]
+                exp_u = np.exp(u_ib)
+                F_pde = Lu - f - exp_u
+                F_bc = (B @ u) - g
+
+                residual = np.sqrt(np.mean(F_pde**2) + np.mean(F_bc**2))
+                residual_history.append(residual)
+
+                if verbose and (k < 5 or k % 5 == 0):
+                    print(f"  Newton iter {k}: residual = {residual:.4e}")
+
+                if residual < self.tol:
+                    if verbose:
+                        print(f"  Converged at iteration {k+1}")
+                    break
+
+                # Form Jacobian: J = L - diag(exp(u))
+                # J @ H = LH - diag(exp(u)) @ H_ib
+                H_ib = self.H[:N_ib, :]
+                JH = self.LH - exp_u[:, np.newaxis] * H_ib
+
+                # Solve linear system: [JH; BH] @ delta_W = -[F_pde; F_bc]
+                A = np.vstack([JH, self.BH])
+                F = np.concatenate([-F_pde, -F_bc])
+
+                delta_W = self._solve_lstsq(A, F)
+                self.W_out = self.W_out + delta_W
+
+                u = self.H @ self.W_out
+                u_ib = u[:N_ib]
 
         train_time = time.perf_counter() - start_time
 
@@ -258,6 +294,7 @@ class DTELMPINN(BaseModel):
             extra={
                 'hidden_sizes': self.hidden_sizes,
                 'total_features': self.H.shape[1],
+                'is_linear': is_linear,
             }
         )
 

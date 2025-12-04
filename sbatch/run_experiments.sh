@@ -18,15 +18,27 @@ gpu_models=(
     dt-pinn
 )
 
-# Tasks to run
+# Tasks to run (11 tasks total)
+# - Original MATLAB-based tasks
+# - Python RBF-FD generated tasks (poisson-* and nonlinear-poisson-*)
 tasks=(
     nonlinear-poisson
+    heat-equation
+    poisson-rbf-fd
+    poisson-disk-sin
+    poisson-disk-quadratic
+    poisson-square-constant
+    poisson-square-sin
+    nonlinear-poisson-rbf-fd
+    nonlinear-poisson-disk-sin
+    nonlinear-poisson-square-constant
+    nonlinear-poisson-square-sin
 )
 
-# Data files to test
+# Data files to test (only used for nonlinear-poisson task which has MATLAB data)
+# Other tasks use Python-generated data internally
 file_names=(
     2_2236
-    2_582
 )
 
 # Seeds for reproducibility (5 seeds for statistical significance in papers)
@@ -60,9 +72,47 @@ echo "--- Submitting CPU jobs (ELM-based models) ---"
 
 for task in "${tasks[@]}"; do
     for model in "${cpu_models[@]}"; do
-        for file_name in "${file_names[@]}"; do
-            for seed in "${seeds[@]}"; do
-                job_name="${model}_${task}_${file_name}_s${seed}"
+        for seed in "${seeds[@]}"; do
+            # Only nonlinear-poisson uses file_name; other tasks use Python-generated data
+            if [[ "$task" == "nonlinear-poisson" ]]; then
+                for file_name in "${file_names[@]}"; do
+                    job_name="${model}_${task}_${file_name}_s${seed}"
+                    log_file="./logs/${job_name}"
+                    file_name_arg="--file-name=$file_name"
+
+                    echo "Submitting CPU job: $job_name"
+                    sbatch \
+                        --nodes=1 \
+                        --ntasks-per-node=1 \
+                        --cpus-per-task=4 \
+                        --mem=8000M \
+                        --time=$CPU_TIME \
+                        --output=${log_file}-%N-%j.out \
+                        --error=${log_file}-%N-%j.err \
+                        --wrap="
+                            module load scipy-stack
+                            module load arrow
+                            source ./env/bin/activate
+                            echo '========================================'
+                            echo 'Job: $job_name'
+                            echo 'Started: '\$(date)
+                            echo '========================================'
+                            which python3
+                            export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                            python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                                --task=$task \
+                                --model=$model \
+                                $file_name_arg \
+                                --seed=$seed \
+                                --verbose
+                            echo '========================================'
+                            echo 'Finished: '\$(date)
+                            echo '========================================'
+                        "
+                done
+            else
+                # Tasks without file_name (RBF-FD generated, heat-equation, etc.)
+                job_name="${model}_${task}_s${seed}"
                 log_file="./logs/${job_name}"
 
                 echo "Submitting CPU job: $job_name"
@@ -76,7 +126,7 @@ for task in "${tasks[@]}"; do
                     --error=${log_file}-%N-%j.err \
                     --wrap="
                         module load scipy-stack
-			module load arrow
+                        module load arrow
                         source ./env/bin/activate
                         echo '========================================'
                         echo 'Job: $job_name'
@@ -87,14 +137,13 @@ for task in "${tasks[@]}"; do
                         python3 -m src.experiment_dt_elm_pinn.train_pinn \
                             --task=$task \
                             --model=$model \
-                            --file-name=$file_name \
                             --seed=$seed \
                             --verbose
                         echo '========================================'
                         echo 'Finished: '\$(date)
                         echo '========================================'
                     "
-            done
+            fi
         done
     done
 done
@@ -107,9 +156,52 @@ echo "--- Submitting GPU jobs (gradient-based models) ---"
 
 for task in "${tasks[@]}"; do
     for model in "${gpu_models[@]}"; do
-        for file_name in "${file_names[@]}"; do
-            for seed in "${seeds[@]}"; do
-                job_name="${model}_${task}_${file_name}_s${seed}"
+        for seed in "${seeds[@]}"; do
+            # Only nonlinear-poisson uses file_name; other tasks use Python-generated data
+            if [[ "$task" == "nonlinear-poisson" ]]; then
+                for file_name in "${file_names[@]}"; do
+                    job_name="${model}_${task}_${file_name}_s${seed}"
+                    log_file="./logs/${job_name}"
+                    file_name_arg="--file-name=$file_name"
+
+                    echo "Submitting GPU job: $job_name"
+                    sbatch \
+                        --nodes=1 \
+                        --ntasks-per-node=1 \
+                        --cpus-per-task=2 \
+                        --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 \
+                        --mem=16000M \
+                        --time=$GPU_TIME \
+                        --output=${log_file}-%N-%j.out \
+                        --error=${log_file}-%N-%j.err \
+                        --wrap="
+                            module load scipy-stack cuda cudnn
+                            module load arrow
+                            source ./env/bin/activate
+                            echo '========================================'
+                            echo 'Job: $job_name'
+                            echo 'Started: '\$(date)
+                            echo '========================================'
+                            which python3
+                            nvidia-smi
+                            export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                            python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                                --task=$task \
+                                --model=$model \
+                                $file_name_arg \
+                                --seed=$seed \
+                                --layers=$LAYERS \
+                                --nodes=$NODES \
+                                --epochs=$EPOCHS \
+                                --verbose
+                            echo '========================================'
+                            echo 'Finished: '\$(date)
+                            echo '========================================'
+                        "
+                done
+            else
+                # Tasks without file_name (RBF-FD generated, heat-equation, etc.)
+                job_name="${model}_${task}_s${seed}"
                 log_file="./logs/${job_name}"
 
                 echo "Submitting GPU job: $job_name"
@@ -124,7 +216,7 @@ for task in "${tasks[@]}"; do
                     --error=${log_file}-%N-%j.err \
                     --wrap="
                         module load scipy-stack cuda cudnn
-			module load arrow
+                        module load arrow
                         source ./env/bin/activate
                         echo '========================================'
                         echo 'Job: $job_name'
@@ -136,7 +228,6 @@ for task in "${tasks[@]}"; do
                         python3 -m src.experiment_dt_elm_pinn.train_pinn \
                             --task=$task \
                             --model=$model \
-                            --file-name=$file_name \
                             --seed=$seed \
                             --layers=$LAYERS \
                             --nodes=$NODES \
@@ -146,7 +237,7 @@ for task in "${tasks[@]}"; do
                         echo 'Finished: '\$(date)
                         echo '========================================'
                     "
-            done
+            fi
         done
     done
 done
@@ -156,8 +247,11 @@ echo "=============================================="
 echo "All jobs submitted."
 echo ""
 echo "Summary:"
-echo "  - CPU models: ${#cpu_models[@]} models x ${#tasks[@]} tasks x ${#file_names[@]} files x ${#seeds[@]} seeds"
-echo "  - GPU models: ${#gpu_models[@]} models x ${#tasks[@]} tasks x ${#file_names[@]} files x ${#seeds[@]} seeds"
+echo "  - Tasks: ${#tasks[@]} (11 total)"
+echo "  - CPU models: ${#cpu_models[@]} (5 ELM-based)"
+echo "  - GPU models: ${#gpu_models[@]} (2 gradient-based)"
+echo "  - Seeds: ${#seeds[@]}"
+echo "  - Total jobs: $((${#tasks[@]} * (${#cpu_models[@]} + ${#gpu_models[@]}) * ${#seeds[@]}))"
 echo "  - GPU epochs: $EPOCHS (L-BFGS)"
 echo "  - Network: ${LAYERS} layers x ${NODES} nodes"
 echo ""

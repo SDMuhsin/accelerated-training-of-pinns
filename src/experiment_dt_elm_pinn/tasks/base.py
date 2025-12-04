@@ -133,6 +133,15 @@ class BaseTask(ABC):
         """Check if discrete operators (L, B) are available."""
         return self.data.L is not None and self.data.B is not None
 
+    def is_linear(self) -> bool:
+        """
+        Check if this is a linear PDE (no nonlinear terms like exp(u)).
+
+        Linear PDEs can be solved with a single lstsq solve (no Newton iteration).
+        Override this in subclasses to indicate linearity.
+        """
+        return False  # Default: assume nonlinear for safety
+
     @classmethod
     def get_default_args(cls) -> Dict[str, Any]:
         """Return default arguments for this task."""
