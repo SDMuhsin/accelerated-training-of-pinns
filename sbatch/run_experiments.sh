@@ -18,12 +18,11 @@ gpu_models=(
     dt-pinn
 )
 
-# Tasks to run (11 tasks total)
-# - Original MATLAB-based tasks
-# - Python RBF-FD generated tasks (poisson-* and nonlinear-poisson-*)
+# Tasks to run (14 tasks total)
+# - Original MATLAB-based tasks (nonlinear-poisson)
+# - Python RBF-FD generated tasks (poisson-*, nonlinear-poisson-*, laplace-*, heat-*)
 tasks=(
     nonlinear-poisson
-    heat-equation
     poisson-rbf-fd
     poisson-disk-sin
     poisson-disk-quadratic
@@ -33,6 +32,10 @@ tasks=(
     nonlinear-poisson-disk-sin
     nonlinear-poisson-square-constant
     nonlinear-poisson-square-sin
+    laplace-disk
+    laplace-square
+    heat-equation
+    heat-fast-decay
 )
 
 # Data files to test (only used for nonlinear-poisson task which has MATLAB data)
@@ -247,7 +250,7 @@ echo "=============================================="
 echo "All jobs submitted."
 echo ""
 echo "Summary:"
-echo "  - Tasks: ${#tasks[@]} (11 total)"
+echo "  - Tasks: ${#tasks[@]} (14 total)"
 echo "  - CPU models: ${#cpu_models[@]} (5 ELM-based)"
 echo "  - GPU models: ${#gpu_models[@]} (2 gradient-based)"
 echo "  - Seeds: ${#seeds[@]}"

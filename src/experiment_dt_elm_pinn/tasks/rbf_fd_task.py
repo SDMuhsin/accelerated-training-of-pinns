@@ -197,29 +197,46 @@ class PoissonRBFFDTask(RBFFDTask):
 
     def _compute_source_and_solution(
         self, X: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute source term and exact solution.
 
+        Different solutions are used for disk vs square domains to ensure
+        the exact solution satisfies the boundary conditions.
+
         Returns:
             f: Source term at all points
-            g: Boundary values
             u_exact: Exact solution (if available)
         """
         x, y = X[:, 0], X[:, 1]
 
         if self.source_func == 'constant':
-            # u = (r² - R²)/4, ∇²u = 1
-            f = np.ones(len(X), dtype=self.precision)
-            u_exact = (x**2 + y**2 - self.radius**2) / 4
+            if self.domain == 'disk':
+                # Disk: u = (r² - R²)/4, ∇²u = 1, u=0 on boundary r=R
+                f = np.ones(len(X), dtype=self.precision)
+                u_exact = (x**2 + y**2 - self.radius**2) / 4
+            else:
+                # Square [-1,1]²: Use a polynomial that's zero on all edges
+                # u = (1-x²)(1-y²)/4 satisfies u=0 on boundary
+                # ∇²u = (x² + y²)/2 - 1
+                # So f = ∇²u = (x² + y²)/2 - 1
+                u_exact = (1 - x**2) * (1 - y**2) / 4
+                f = (x**2 + y**2) / 2 - 1
 
         elif self.source_func == 'quadratic':
-            # u = x² + y², ∇²u = 4
-            f = 4 * np.ones(len(X), dtype=self.precision)
-            u_exact = x**2 + y**2
+            if self.domain == 'disk':
+                # Disk: u = x² + y², ∇²u = 4
+                f = 4 * np.ones(len(X), dtype=self.precision)
+                u_exact = x**2 + y**2
+            else:
+                # Square: u = (1-x²)(1-y²), ∇²u = 2x² + 2y² - 4
+                # So f = ∇²u = 2(x² + y²) - 4
+                u_exact = (1 - x**2) * (1 - y**2)
+                f = 2 * (x**2 + y**2) - 4
 
         elif self.source_func == 'sin':
             # u = sin(πx)sin(πy), ∇²u = -2π²u
+            # This works for BOTH disk and square domains since sin(±π) = 0
             u_exact = np.sin(np.pi * x) * np.sin(np.pi * y)
             f = -2 * np.pi**2 * u_exact
         else:
@@ -296,10 +313,65 @@ class NonlinearPoissonRBFFDTask(PoissonRBFFDTask):
     PDE: ∇²u = f + exp(u)   in Ω
     BC:  u = g              on ∂Ω
 
-    This matches the original DT-PINN benchmark but uses Python operators.
+    Uses manufactured solutions where f is derived from a chosen u_exact:
+    f = ∇²u_exact - exp(u_exact)
+
+    This ensures the exact solution satisfies the nonlinear PDE.
     """
 
     name = "nonlinear-poisson-rbf-fd"
+
+    def _compute_source_and_solution(
+        self, X: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute source term and exact solution for NONLINEAR Poisson.
+
+        For nonlinear PDE: ∇²u = f + exp(u)
+        Given u_exact, compute f = ∇²u_exact - exp(u_exact)
+
+        Returns:
+            f: Source term at all points
+            u_exact: Exact solution
+        """
+        x, y = X[:, 0], X[:, 1]
+
+        if self.source_func == 'constant':
+            if self.domain == 'disk':
+                # Disk: u = (r² - R²)/4, ∇²u = 1
+                # f = ∇²u - exp(u) = 1 - exp((r² - R²)/4)
+                u_exact = (x**2 + y**2 - self.radius**2) / 4
+                f = 1 - np.exp(u_exact)
+            else:
+                # Square: u = (1-x²)(1-y²)/4, ∇²u = (x² + y²)/2 - 1
+                # f = ∇²u - exp(u)
+                u_exact = (1 - x**2) * (1 - y**2) / 4
+                laplacian_u = (x**2 + y**2) / 2 - 1
+                f = laplacian_u - np.exp(u_exact)
+
+        elif self.source_func == 'quadratic':
+            if self.domain == 'disk':
+                # Disk: u = x² + y², ∇²u = 4
+                # f = 4 - exp(x² + y²)
+                u_exact = x**2 + y**2
+                f = 4 - np.exp(u_exact)
+            else:
+                # Square: u = (1-x²)(1-y²), ∇²u = 2(x² + y²) - 4
+                # f = ∇²u - exp(u)
+                u_exact = (1 - x**2) * (1 - y**2)
+                laplacian_u = 2 * (x**2 + y**2) - 4
+                f = laplacian_u - np.exp(u_exact)
+
+        elif self.source_func == 'sin':
+            # u = sin(πx)sin(πy), ∇²u = -2π²u
+            # f = -2π²u - exp(u)
+            u_exact = np.sin(np.pi * x) * np.sin(np.pi * y)
+            laplacian_u = -2 * np.pi**2 * u_exact
+            f = laplacian_u - np.exp(u_exact)
+        else:
+            raise ValueError(f"Unknown source_func: {self.source_func}")
+
+        return f.astype(self.precision), u_exact.astype(self.precision)
 
     def compute_pde_residual(self, u: np.ndarray, laplacian_u: np.ndarray) -> np.ndarray:
         """PDE residual: ∇²u - f - exp(u) = 0"""

@@ -230,7 +230,7 @@ class DTELMPINN(BaseModel):
             residual_history.append(final_residual)
 
         else:
-            # NONLINEAR PDE: Newton iteration
+            # NONLINEAR PDE: Damped Newton iteration with backtracking line search
             # Initial solve: approximate exp(u) ≈ exp(0) = 1
             A_init = np.vstack([self.LH, self.BH])
             b_init = np.concatenate([f + 1.0, g])
@@ -241,16 +241,33 @@ class DTELMPINN(BaseModel):
 
             residual_history = []
 
-            # Newton iterations
+            def compute_residual(u_vec, u_ib_vec):
+                """Compute PDE + BC residual."""
+                Lu_vec = (L @ u_vec)[:N_ib]
+                exp_u_vec = np.exp(np.clip(u_ib_vec, -50, 50))  # Clip to avoid overflow
+                F_pde_vec = Lu_vec - f - exp_u_vec
+                F_bc_vec = (B @ u_vec) - g
+                return np.sqrt(np.mean(F_pde_vec**2) + np.mean(F_bc_vec**2))
+
+            # Track best solution found
+            best_residual = float('inf')
+            best_W_out = self.W_out.copy()
+
+            # Newton iterations with damping
             for k in range(self.max_iter):
                 # Compute residual: F = L @ u - f - exp(u)
                 Lu = (L @ u)[:N_ib]
-                exp_u = np.exp(u_ib)
+                exp_u = np.exp(np.clip(u_ib, -50, 50))  # Clip to avoid overflow
                 F_pde = Lu - f - exp_u
                 F_bc = (B @ u) - g
 
                 residual = np.sqrt(np.mean(F_pde**2) + np.mean(F_bc**2))
                 residual_history.append(residual)
+
+                # Track best solution
+                if residual < best_residual:
+                    best_residual = residual
+                    best_W_out = self.W_out.copy()
 
                 if verbose and (k < 5 or k % 5 == 0):
                     print(f"  Newton iter {k}: residual = {residual:.4e}")
@@ -270,10 +287,27 @@ class DTELMPINN(BaseModel):
                 F = np.concatenate([-F_pde, -F_bc])
 
                 delta_W = self._solve_lstsq(A, F)
-                self.W_out = self.W_out + delta_W
+
+                # Backtracking line search
+                alpha = 1.0
+                W_out_old = self.W_out.copy()
+                for _ in range(10):  # Max 10 backtracking steps
+                    self.W_out = W_out_old + alpha * delta_W
+                    u_new = self.H @ self.W_out
+                    u_ib_new = u_new[:N_ib]
+                    new_residual = compute_residual(u_new, u_ib_new)
+
+                    if new_residual < residual * (1 - 1e-4 * alpha):
+                        # Sufficient decrease achieved
+                        break
+                    alpha *= 0.5
 
                 u = self.H @ self.W_out
                 u_ib = u[:N_ib]
+
+            # Restore best solution
+            self.W_out = best_W_out
+            u = self.H @ self.W_out
 
         train_time = time.perf_counter() - start_time
 

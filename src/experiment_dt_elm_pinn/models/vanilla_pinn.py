@@ -194,6 +194,9 @@ class VanillaPINN(BaseModel):
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
+        # Check if task is linear (no exp(u) term)
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
+
         for epoch in range(1, self.epochs + 1):
             def closure():
                 optimizer.zero_grad()
@@ -202,8 +205,13 @@ class VanillaPINN(BaseModel):
                 u_interior = self.network(X_interior)
                 laplacian_u = self._compute_laplacian(u_interior, X_interior)
 
-                # Nonlinear Poisson: ∇²u - f - exp(u) = 0
-                pde_residual = laplacian_u - f_interior - torch.exp(u_interior)
+                # PDE residual depends on whether task is linear or nonlinear
+                if is_linear:
+                    # Linear Poisson: ∇²u - f = 0
+                    pde_residual = laplacian_u - f_interior
+                else:
+                    # Nonlinear Poisson: ∇²u - f - exp(u) = 0
+                    pde_residual = laplacian_u - f_interior - torch.exp(u_interior)
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss

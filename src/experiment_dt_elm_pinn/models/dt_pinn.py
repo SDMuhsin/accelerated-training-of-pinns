@@ -165,11 +165,25 @@ class DTPINN(BaseModel):
             return self._cpu_sparse_matmul(sparse_mat, tensor)
 
     def _cpu_sparse_matmul(self, sparse_mat, tensor):
-        """CPU sparse matrix multiplication."""
-        # Convert to numpy, multiply, convert back
-        tensor_np = tensor.detach().cpu().numpy()
-        result_np = sparse_mat.dot(tensor_np)
-        return torch.tensor(result_np, dtype=tensor.dtype, device=tensor.device)
+        """CPU sparse matrix multiplication with autograd support."""
+        sparse_t = sparse_mat.T.tocsr()
+
+        class SparseMulCPU(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, u_pred):
+                # Store shape info for backward pass
+                ctx.save_for_backward(torch.tensor([u_pred.shape[0]]))
+                tensor_np = u_pred.detach().cpu().numpy()
+                result_np = sparse_mat.dot(tensor_np)
+                return torch.tensor(result_np, dtype=u_pred.dtype, device=u_pred.device, requires_grad=True)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                grad_np = grad_output.detach().cpu().numpy()
+                result_np = sparse_t.dot(grad_np)
+                return torch.tensor(result_np, dtype=grad_output.dtype, device=grad_output.device)
+
+        return SparseMulCPU.apply(tensor)
 
     def _cuda_sparse_matmul(self, sparse_mat, tensor, sparse_t):
         """GPU sparse matrix multiplication with autograd support."""
@@ -220,6 +234,9 @@ class DTPINN(BaseModel):
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
+        # Check if task is linear (no exp(u) term)
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
+
         for epoch in range(1, self.epochs + 1):
             def closure():
                 optimizer.zero_grad()
@@ -227,9 +244,14 @@ class DTPINN(BaseModel):
                 # Forward pass
                 u_pred = self.network(X_full)
 
-                # PDE loss: L @ u - f - exp(u) = 0
+                # PDE loss depends on whether task is linear or nonlinear
                 Lu = self._sparse_matmul(self.L_sparse, u_pred, self.L_t)
-                pde_residual = Lu[:N_ib] - f - torch.exp(u_pred[:N_ib])
+                if is_linear:
+                    # Linear Poisson: L @ u - f = 0
+                    pde_residual = Lu[:N_ib] - f
+                else:
+                    # Nonlinear Poisson: L @ u - f - exp(u) = 0
+                    pde_residual = Lu[:N_ib] - f - torch.exp(u_pred[:N_ib])
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss: B @ u - g = 0
