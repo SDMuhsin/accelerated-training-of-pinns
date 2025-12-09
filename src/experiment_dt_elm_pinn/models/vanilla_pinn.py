@@ -182,11 +182,23 @@ class VanillaPINN(BaseModel):
         else:
             use_robin = False
 
+        # Check if task is linear (no exp(u) term)
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
+
         # Setup optimizer
-        if self.optimizer_name == 'lbfgs':
-            optimizer = torch.optim.LBFGS(self.network.parameters(), lr=self.lr)
+        # For nonlinear problems, prefer Adam over L-BFGS to avoid gradient explosion
+        effective_optimizer = self.optimizer_name
+        effective_lr = self.lr
+        effective_epochs = self.epochs
+        if not is_linear and self.optimizer_name == 'lbfgs':
+            effective_optimizer = 'adam'
+            effective_lr = 0.001
+            effective_epochs = max(self.epochs, 2000)  # Adam needs more iterations
+
+        if effective_optimizer == 'lbfgs':
+            optimizer = torch.optim.LBFGS(self.network.parameters(), lr=effective_lr)
         else:
-            optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr)
+            optimizer = torch.optim.Adam(self.network.parameters(), lr=effective_lr)
 
         loss_history = []
 
@@ -194,10 +206,7 @@ class VanillaPINN(BaseModel):
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
-        # Check if task is linear (no exp(u) term)
-        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
-
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(1, effective_epochs + 1):
             def closure():
                 optimizer.zero_grad()
 
@@ -211,7 +220,9 @@ class VanillaPINN(BaseModel):
                     pde_residual = laplacian_u - f_interior
                 else:
                     # Nonlinear Poisson: ∇²u - f - exp(u) = 0
-                    pde_residual = laplacian_u - f_interior - torch.exp(u_interior)
+                    # Clamp u to prevent exp overflow (exp(88) ≈ 1e38, exp(100) overflows float32)
+                    u_clamped = torch.clamp(u_interior, max=50.0)
+                    pde_residual = laplacian_u - f_interior - torch.exp(u_clamped)
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss

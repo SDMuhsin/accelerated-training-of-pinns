@@ -222,11 +222,27 @@ class DTPINN(BaseModel):
         f = torch.tensor(data.f, dtype=precision, device=self.device).unsqueeze(1)
         g = torch.tensor(data.g, dtype=precision, device=self.device).unsqueeze(1)
 
+        # Check if task is linear (no exp(u) term)
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
+
         # Setup optimizer
-        if self.optimizer_name == 'lbfgs':
-            optimizer = torch.optim.LBFGS(self.network.parameters(), lr=self.lr)
+        # Note: L-BFGS doesn't work well with CPU sparse autograd due to tensor
+        # recreation in custom autograd Functions. Always use Adam for CPU mode.
+        # For nonlinear problems, also prefer Adam to avoid gradient explosion.
+        effective_optimizer = self.optimizer_name
+        effective_lr = self.lr
+        effective_epochs = self.epochs
+
+        # Force Adam on CPU or for nonlinear problems
+        if (not self.use_cuda or not is_linear) and self.optimizer_name == 'lbfgs':
+            effective_optimizer = 'adam'
+            effective_lr = 0.001
+            effective_epochs = max(self.epochs, 2000)  # Adam needs more iterations
+
+        if effective_optimizer == 'lbfgs':
+            optimizer = torch.optim.LBFGS(self.network.parameters(), lr=effective_lr)
         else:
-            optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr)
+            optimizer = torch.optim.Adam(self.network.parameters(), lr=effective_lr)
 
         loss_history = []
 
@@ -234,10 +250,7 @@ class DTPINN(BaseModel):
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
-        # Check if task is linear (no exp(u) term)
-        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
-
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(1, effective_epochs + 1):
             def closure():
                 optimizer.zero_grad()
 
@@ -251,7 +264,9 @@ class DTPINN(BaseModel):
                     pde_residual = Lu[:N_ib] - f
                 else:
                     # Nonlinear Poisson: L @ u - f - exp(u) = 0
-                    pde_residual = Lu[:N_ib] - f - torch.exp(u_pred[:N_ib])
+                    # Clamp u to prevent exp overflow
+                    u_clamped = torch.clamp(u_pred[:N_ib], max=50.0)
+                    pde_residual = Lu[:N_ib] - f - torch.exp(u_clamped)
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss: B @ u - g = 0

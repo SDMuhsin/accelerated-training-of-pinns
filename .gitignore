@@ -76,3 +76,7 @@ scai/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Paper stuff
+llmdocs
+paper
