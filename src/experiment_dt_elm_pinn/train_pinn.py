@@ -171,13 +171,23 @@ def build_model_kwargs(args, model_name: str) -> Dict[str, Any]:
         'seed': args.seed,
     }
 
+    # All DT-ELM-PINN variants (including deep versions)
+    dt_elm_pinn_variants = [
+        'dt-elm-pinn', 'dt-elm-pinn-cholesky', 'dt-elm-pinn-svd',
+        'dt-elm-pinn-deep2', 'dt-elm-pinn-deep3', 'dt-elm-pinn-deep4'
+    ]
+
     # ELM-based models
-    if model_name in ['elm', 'dt-elm-pinn']:
-        kwargs['hidden_sizes'] = args.hidden_sizes
+    if model_name in ['elm', 'pielm'] + dt_elm_pinn_variants:
         kwargs['activation'] = args.activation
         kwargs['max_iter'] = args.max_iter
         kwargs['tol'] = args.tol
 
+        # Only pass hidden_sizes if not a deep variant (deep variants set their own)
+        if model_name not in ['dt-elm-pinn-deep2', 'dt-elm-pinn-deep3', 'dt-elm-pinn-deep4']:
+            kwargs['hidden_sizes'] = args.hidden_sizes
+
+        # Skip connections only for base dt-elm-pinn variants (not deep, they set their own)
         if model_name in ['dt-elm-pinn', 'dt-elm-pinn-cholesky', 'dt-elm-pinn-svd']:
             kwargs['use_skip_connections'] = not args.no_skip_connections
 

@@ -58,6 +58,33 @@ def _solve_lstsq_svd(A: np.ndarray, b: np.ndarray) -> np.ndarray:
     return x
 
 
+def _solve_lstsq_robust(A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Solve least squares with robust fallback: try Cholesky first, fall back to SVD.
+
+    This is ideal for deep networks where the normal equations matrix may become
+    ill-conditioned due to concatenation of many layer outputs.
+
+    Args:
+        A: Design matrix (m, n) with m > n
+        b: Right-hand side (m,)
+
+    Returns:
+        x: Solution (n,)
+    """
+    try:
+        AtA = A.T @ A
+        Atb = A.T @ b
+        # Add small regularization for numerical stability
+        AtA += 1e-10 * np.eye(AtA.shape[0])
+        c, low = scipy.linalg.cho_factor(AtA)
+        return scipy.linalg.cho_solve((c, low), Atb)
+    except np.linalg.LinAlgError:
+        # Fall back to SVD if Cholesky fails
+        x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        return x
+
+
 class DTELMPINN(BaseModel):
     """
     DT-ELM-PINN solver.
@@ -111,8 +138,10 @@ class DTELMPINN(BaseModel):
             self._solve_lstsq = _solve_lstsq_cholesky
         elif solver == 'svd':
             self._solve_lstsq = _solve_lstsq_svd
+        elif solver == 'robust':
+            self._solve_lstsq = _solve_lstsq_robust
         else:
-            raise ValueError(f"Unknown solver: {solver}. Use 'cholesky' or 'svd'.")
+            raise ValueError(f"Unknown solver: {solver}. Use 'cholesky', 'svd', or 'robust'.")
 
         # Will be set during setup
         self.H = None           # Hidden layer outputs
@@ -412,4 +441,53 @@ class DTELMPINNSVD(DTELMPINN):
 
     def __init__(self, task, **kwargs):
         kwargs['solver'] = 'svd'
+        super().__init__(task, **kwargs)
+
+
+# =============================================================================
+# Deep (Multi-Layer) Variants
+# =============================================================================
+# These use skip connections (concatenate all layer outputs) to preserve
+# information across layers. This is what enables ELM to work with multiple
+# layers - unlike PIELM which requires analytical derivatives σ''(z).
+
+class DTELMPINNDeep2(DTELMPINN):
+    """DT-ELM-PINN with 2 hidden layers [100, 100] and skip connections."""
+
+    name = "dt-elm-pinn-deep2"
+
+    def __init__(self, task, **kwargs):
+        # Force 2-layer architecture with skip connections
+        # Use robust solver to handle potential ill-conditioning from concatenated layers
+        kwargs['hidden_sizes'] = [100, 100]
+        kwargs['use_skip_connections'] = True
+        kwargs['solver'] = 'robust'
+        super().__init__(task, **kwargs)
+
+
+class DTELMPINNDeep3(DTELMPINN):
+    """DT-ELM-PINN with 3 hidden layers [100, 100, 100] and skip connections."""
+
+    name = "dt-elm-pinn-deep3"
+
+    def __init__(self, task, **kwargs):
+        # Force 3-layer architecture with skip connections
+        # Use robust solver to handle potential ill-conditioning from concatenated layers
+        kwargs['hidden_sizes'] = [100, 100, 100]
+        kwargs['use_skip_connections'] = True
+        kwargs['solver'] = 'robust'
+        super().__init__(task, **kwargs)
+
+
+class DTELMPINNDeep4(DTELMPINN):
+    """DT-ELM-PINN with 4 hidden layers [100, 100, 100, 100] and skip connections."""
+
+    name = "dt-elm-pinn-deep4"
+
+    def __init__(self, task, **kwargs):
+        # Force 4-layer architecture with skip connections
+        # Use robust solver to handle potential ill-conditioning from concatenated layers
+        kwargs['hidden_sizes'] = [100, 100, 100, 100]
+        kwargs['use_skip_connections'] = True
+        kwargs['solver'] = 'robust'
         super().__init__(task, **kwargs)

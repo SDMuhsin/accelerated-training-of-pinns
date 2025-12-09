@@ -4,19 +4,34 @@ echo "Beginning DT-PINN experiment sbatch script submissions."
 
 # Define models categorized by resource requirements
 # CPU-only models (fast, ELM-based) - no GPU needed
+
+# ============================================================================
+# MULTILAYER DISCO-ELM EXPERIMENTS
+# These are the new deep variants with skip connections.
+# Use 'robust' solver to handle ill-conditioned matrices from concatenated layers.
+# ============================================================================
 cpu_models=(
-    dt-elm-pinn
-    dt-elm-pinn-cholesky
-    dt-elm-pinn-svd
-    pielm
-    elm
+    dt-elm-pinn-deep2    # 2 layers [100, 100] with skip connections
+    dt-elm-pinn-deep3    # 3 layers [100, 100, 100] with skip connections
+    dt-elm-pinn-deep4    # 4 layers [100, 100, 100, 100] with skip connections
 )
 
+# Original single-layer models (commented out for multilayer experiments)
+# cpu_models=(
+#     dt-elm-pinn
+#     dt-elm-pinn-cholesky
+#     dt-elm-pinn-svd
+#     pielm
+#     elm
+# )
+
 # GPU models (gradient-based, need CUDA)
-gpu_models=(
-    vanilla-pinn
-    dt-pinn
-)
+# Commented out for multilayer experiments - enable if comparing against baselines
+# gpu_models=(
+#     vanilla-pinn
+#     dt-pinn
+# )
+gpu_models=()
 
 # Tasks to run (14 tasks total)
 # - Original MATLAB-based tasks (nonlinear-poisson)
@@ -251,14 +266,19 @@ echo "All jobs submitted."
 echo ""
 echo "Summary:"
 echo "  - Tasks: ${#tasks[@]} (14 total)"
-echo "  - CPU models: ${#cpu_models[@]} (5 ELM-based)"
-echo "  - GPU models: ${#gpu_models[@]} (2 gradient-based)"
+echo "  - CPU models: ${#cpu_models[@]} (multilayer DISCO-ELM variants)"
+echo "  - GPU models: ${#gpu_models[@]} (gradient-based, commented out)"
 echo "  - Seeds: ${#seeds[@]}"
 echo "  - Total jobs: $((${#tasks[@]} * (${#cpu_models[@]} + ${#gpu_models[@]}) * ${#seeds[@]}))"
-echo "  - GPU epochs: $EPOCHS (L-BFGS)"
-echo "  - Network: ${LAYERS} layers x ${NODES} nodes"
+if [ ${#gpu_models[@]} -gt 0 ]; then
+    echo "  - GPU epochs: $EPOCHS (L-BFGS)"
+    echo "  - Network: ${LAYERS} layers x ${NODES} nodes"
+fi
+echo ""
+echo "Multilayer models use skip connections (concatenate all layer outputs)"
+echo "and robust solver (Cholesky with regularization, SVD fallback)."
 echo ""
 echo "Results will be saved to:"
 echo "  - Logs: ./logs/"
-echo "  - CSV: ./results/experiments_pinnacle.csv"
+echo "  - CSV: ./results/experiments.csv"
 echo "=============================================="
