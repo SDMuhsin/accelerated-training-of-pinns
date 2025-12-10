@@ -226,15 +226,16 @@ class DTPINN(BaseModel):
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         # Setup optimizer
-        # Note: L-BFGS doesn't work well with CPU sparse autograd due to tensor
-        # recreation in custom autograd Functions. Always use Adam for CPU mode.
-        # For nonlinear problems, also prefer Adam to avoid gradient explosion.
+        # Note: L-BFGS doesn't work well with sparse operators in general:
+        # - CPU: tensor recreation in custom autograd Functions breaks L-BFGS
+        # - GPU: L-BFGS line search has convergence issues with RBF-FD operators
+        # Always use Adam for DT-PINN as it's more robust.
         effective_optimizer = self.optimizer_name
         effective_lr = self.lr
         effective_epochs = self.epochs
 
-        # Force Adam on CPU or for nonlinear problems
-        if (not self.use_cuda or not is_linear) and self.optimizer_name == 'lbfgs':
+        # Force Adam for all DT-PINN runs (L-BFGS has convergence issues)
+        if self.optimizer_name == 'lbfgs':
             effective_optimizer = 'adam'
             effective_lr = 0.001
             effective_epochs = max(self.epochs, 2000)  # Adam needs more iterations
@@ -278,7 +279,7 @@ class DTPINN(BaseModel):
                 loss.backward(retain_graph=True)
                 return loss
 
-            if self.optimizer_name == 'lbfgs':
+            if effective_optimizer == 'lbfgs':
                 loss = optimizer.step(closure)
             else:
                 loss = closure()
