@@ -158,3 +158,11 @@ if _rbf_fd_available:
         'PoissonRBFFDTask',
         'NonlinearPoissonRBFFDTask',
     ])
+
+# Import Spectral Collocation tasks (registers them automatically)
+try:
+    from . import spectral
+    _spectral_available = True
+except ImportError as e:
+    _spectral_available = False
+    print(f"Warning: Spectral tasks not available: {e}")
