@@ -367,6 +367,51 @@ class DAS(BaseModel):
             boundary = torch.cat([bottom, top, left, right], dim=0)
             return boundary[:n_samples]
 
+        elif dim == 3:
+            # Generate points on faces of unit cube
+            n_per_face = n_samples // 6
+
+            faces = []
+
+            # x = lb face (sample y, z)
+            yz = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            yz = self.domain_lb + (self.domain_ub - self.domain_lb) * yz
+            x_lb = torch.full((n_per_face, 1), self.domain_lb, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([x_lb, yz], dim=1))
+
+            # x = ub face (sample y, z)
+            yz = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            yz = self.domain_lb + (self.domain_ub - self.domain_lb) * yz
+            x_ub = torch.full((n_per_face, 1), self.domain_ub, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([x_ub, yz], dim=1))
+
+            # y = lb face (sample x, z)
+            xz = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            xz = self.domain_lb + (self.domain_ub - self.domain_lb) * xz
+            y_lb = torch.full((n_per_face, 1), self.domain_lb, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([xz[:, :1], y_lb, xz[:, 1:]], dim=1))
+
+            # y = ub face (sample x, z)
+            xz = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            xz = self.domain_lb + (self.domain_ub - self.domain_lb) * xz
+            y_ub = torch.full((n_per_face, 1), self.domain_ub, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([xz[:, :1], y_ub, xz[:, 1:]], dim=1))
+
+            # z = lb face (sample x, y)
+            xy = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            xy = self.domain_lb + (self.domain_ub - self.domain_lb) * xy
+            z_lb = torch.full((n_per_face, 1), self.domain_lb, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([xy, z_lb], dim=1))
+
+            # z = ub face (sample x, y)
+            xy = torch.rand(n_per_face, 2, dtype=self.precision, device=self.device)
+            xy = self.domain_lb + (self.domain_ub - self.domain_lb) * xy
+            z_ub = torch.full((n_per_face, 1), self.domain_ub, dtype=self.precision, device=self.device)
+            faces.append(torch.cat([xy, z_ub], dim=1))
+
+            boundary = torch.cat(faces, dim=0)
+            return boundary[:n_samples]
+
         else:
             raise NotImplementedError(f"Boundary sampling not implemented for dim={dim}")
 
