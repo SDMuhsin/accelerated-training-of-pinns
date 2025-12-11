@@ -80,3 +80,6 @@ htmlcov/
 # Paper stuff
 llmdocs
 paper
+
+# Temp
+temp/

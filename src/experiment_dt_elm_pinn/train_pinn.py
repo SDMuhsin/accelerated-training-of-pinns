@@ -117,6 +117,14 @@ Examples:
     parser.add_argument('--bc-weight', type=float, default=1.0,
                         help='BC loss weight (vanilla PINN)')
 
+    # RoPINN-specific arguments
+    parser.add_argument('--initial-region', type=float, default=1e-4,
+                        help='RoPINN: Initial region radius (default: 1e-4)')
+    parser.add_argument('--sample-num', type=int, default=1,
+                        help='RoPINN: Number of region samples per iteration (default: 1)')
+    parser.add_argument('--past-iterations', type=int, default=10,
+                        help='RoPINN: Window for gradient variance computation (default: 10)')
+
     # Hardware options
     parser.add_argument('--no-cuda', action='store_true',
                         help='Disable CUDA')
@@ -208,6 +216,24 @@ def build_model_kwargs(args, model_name: str) -> Dict[str, Any]:
             kwargs['pde_weight'] = args.pde_weight
             kwargs['bc_weight'] = args.bc_weight
 
+    # RoPINN models (region-optimized PINN)
+    if model_name in ['ropinn', 'ropinn-large']:
+        kwargs['layers'] = args.layers
+        # ropinn-large uses 512 nodes by default (matches RoPINN paper)
+        if model_name == 'ropinn-large' and args.nodes == 50:  # Default not overridden
+            kwargs['nodes'] = 512
+        else:
+            kwargs['nodes'] = args.nodes
+        kwargs['activation'] = args.activation
+        kwargs['epochs'] = args.epochs
+        kwargs['use_cuda'] = not args.no_cuda
+        kwargs['pde_weight'] = args.pde_weight
+        kwargs['bc_weight'] = args.bc_weight
+        # RoPINN-specific
+        kwargs['initial_region'] = args.initial_region
+        kwargs['sample_num'] = args.sample_num
+        kwargs['past_iterations'] = args.past_iterations
+
     return kwargs
 
 
@@ -236,6 +262,13 @@ def format_results(result, task, model, args) -> Dict[str, Any]:
         output['config']['nodes'] = args.nodes
         output['config']['optimizer'] = args.optimizer
         output['config']['epochs'] = args.epochs
+    elif args.model in ['ropinn', 'ropinn-large']:
+        output['config']['layers'] = args.layers
+        output['config']['nodes'] = args.nodes
+        output['config']['epochs'] = args.epochs
+        output['config']['initial_region'] = args.initial_region
+        output['config']['sample_num'] = args.sample_num
+        output['config']['past_iterations'] = args.past_iterations
 
     return output
 
@@ -275,6 +308,11 @@ def write_csv_result_threadsafe(result, args, csv_path: Path):
         'epochs': args.epochs if hasattr(args, 'epochs') else '',
         'pde_weight': args.pde_weight if hasattr(args, 'pde_weight') else '',
         'bc_weight': args.bc_weight if hasattr(args, 'bc_weight') else '',
+
+        # RoPINN-specific hyperparameters
+        'initial_region': args.initial_region if hasattr(args, 'initial_region') else '',
+        'sample_num': args.sample_num if hasattr(args, 'sample_num') else '',
+        'past_iterations': args.past_iterations if hasattr(args, 'past_iterations') else '',
 
         # Results
         'l2_error': result.l2_error,

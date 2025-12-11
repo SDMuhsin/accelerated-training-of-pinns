@@ -16,6 +16,7 @@ from .dt_elm_pinn import (
     DTELMPINNDeep2, DTELMPINNDeep3, DTELMPINNDeep4
 )
 from .pielm import PIELM
+from .ropinn import RoPINN, RoPINNLarge
 
 # Register all available models
 ModelRegistry.register('vanilla-pinn', VanillaPINN)
@@ -31,9 +32,14 @@ ModelRegistry.register('dt-elm-pinn-deep2', DTELMPINNDeep2)  # 2 layers [100, 10
 ModelRegistry.register('dt-elm-pinn-deep3', DTELMPINNDeep3)  # 3 layers [100, 100, 100]
 ModelRegistry.register('dt-elm-pinn-deep4', DTELMPINNDeep4)  # 4 layers [100, 100, 100, 100]
 
+# RoPINN: Region-Optimized PINN (2024 baseline)
+ModelRegistry.register('ropinn', RoPINN)              # 4 layers x 50 nodes (matches vanilla-pinn)
+ModelRegistry.register('ropinn-large', RoPINNLarge)   # 4 layers x 512 nodes (RoPINN paper default)
+
 __all__ = [
     'BaseModel', 'ModelRegistry',
     'VanillaPINN', 'DTPINN', 'ELM', 'DTELMPINN',
     'DTELMPINNCholesky', 'DTELMPINNSVD', 'PIELM',
-    'DTELMPINNDeep2', 'DTELMPINNDeep3', 'DTELMPINNDeep4'
+    'DTELMPINNDeep2', 'DTELMPINNDeep3', 'DTELMPINNDeep4',
+    'RoPINN', 'RoPINNLarge',
 ]
