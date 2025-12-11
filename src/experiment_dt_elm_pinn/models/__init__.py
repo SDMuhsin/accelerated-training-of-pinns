@@ -17,6 +17,7 @@ from .dt_elm_pinn import (
 )
 from .pielm import PIELM
 from .ropinn import RoPINN, RoPINNLarge
+from .das import DAS
 
 # Register all available models
 ModelRegistry.register('vanilla-pinn', VanillaPINN)
@@ -36,10 +37,14 @@ ModelRegistry.register('dt-elm-pinn-deep4', DTELMPINNDeep4)  # 4 layers [100, 10
 ModelRegistry.register('ropinn', RoPINN)              # 4 layers x 50 nodes (matches vanilla-pinn)
 ModelRegistry.register('ropinn-large', RoPINNLarge)   # 4 layers x 512 nodes (RoPINN paper default)
 
+# DAS: Deep Adaptive Sampling (2022 baseline)
+ModelRegistry.register('das', DAS)  # Multi-stage training with normalizing flow sampling
+
 __all__ = [
     'BaseModel', 'ModelRegistry',
     'VanillaPINN', 'DTPINN', 'ELM', 'DTELMPINN',
     'DTELMPINNCholesky', 'DTELMPINNSVD', 'PIELM',
     'DTELMPINNDeep2', 'DTELMPINNDeep3', 'DTELMPINNDeep4',
     'RoPINN', 'RoPINNLarge',
+    'DAS',
 ]

@@ -125,6 +125,29 @@ Examples:
     parser.add_argument('--past-iterations', type=int, default=10,
                         help='RoPINN: Window for gradient variance computation (default: 10)')
 
+    # DAS-specific arguments
+    parser.add_argument('--das-flow-layers', type=int, default=6,
+                        help='DAS: Number of coupling layers in flow model (default: 6)')
+    parser.add_argument('--das-flow-hidden', type=int, default=64,
+                        help='DAS: Hidden dimension in flow networks (default: 64)')
+    parser.add_argument('--das-max-stage', type=int, default=5,
+                        help='DAS: Maximum number of adaptive stages (default: 5)')
+    parser.add_argument('--das-pde-epochs', type=int, default=200,
+                        help='DAS: PDE training epochs per stage (default: 200, 5 stages = 1000 total)')
+    parser.add_argument('--das-flow-epochs', type=int, default=200,
+                        help='DAS: Flow training epochs per stage (default: 200)')
+    parser.add_argument('--das-n-train', type=int, default=1000,
+                        help='DAS: Number of training samples per stage (default: 1000)')
+    parser.add_argument('--das-quantity', type=str, default='residual',
+                        choices=['residual', 'slope'],
+                        help='DAS: Quantity for adaptivity (default: residual)')
+    parser.add_argument('--das-replace-all', action='store_true',
+                        help='DAS: Replace all samples each stage (DAS-R mode)')
+    parser.add_argument('--das-lambda-bd', type=float, default=1.0,
+                        help='DAS: Boundary condition loss weight (default: 1.0)')
+    parser.add_argument('--das-tol', type=float, default=1e-7,
+                        help='DAS: Convergence tolerance (default: 1e-7)')
+
     # Hardware options
     parser.add_argument('--no-cuda', action='store_true',
                         help='Disable CUDA')
@@ -233,6 +256,25 @@ def build_model_kwargs(args, model_name: str) -> Dict[str, Any]:
         kwargs['initial_region'] = args.initial_region
         kwargs['sample_num'] = args.sample_num
         kwargs['past_iterations'] = args.past_iterations
+
+    # DAS models (Deep Adaptive Sampling)
+    if model_name == 'das':
+        kwargs['layers'] = args.layers
+        kwargs['nodes'] = args.nodes
+        kwargs['activation'] = args.activation
+        kwargs['use_cuda'] = not args.no_cuda
+        # DAS-specific
+        kwargs['flow_layers'] = args.das_flow_layers
+        kwargs['flow_hidden'] = args.das_flow_hidden
+        kwargs['max_stage'] = args.das_max_stage
+        kwargs['pde_epochs'] = args.das_pde_epochs
+        kwargs['flow_epochs'] = args.das_flow_epochs
+        kwargs['n_train'] = args.das_n_train
+        kwargs['quantity_type'] = args.das_quantity
+        kwargs['replace_all'] = args.das_replace_all
+        kwargs['lambda_bd'] = args.das_lambda_bd
+        kwargs['tol'] = args.das_tol
+        kwargs['lr'] = args.lr
 
     return kwargs
 
