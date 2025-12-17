@@ -97,7 +97,7 @@ echo "Submitting Deep SPECTO-ELM Rerun Jobs (CPU)"
 echo "=============================================="
 
 for task in "${all_tasks[@]}"; do
-    csv_file="./results/by_task/${task}.csv"
+    csv_file="./results/by_task/deep_only_${task}.csv"
 
     for model in "${deep_models[@]}"; do
         for seed in "${seeds[@]}"; do
