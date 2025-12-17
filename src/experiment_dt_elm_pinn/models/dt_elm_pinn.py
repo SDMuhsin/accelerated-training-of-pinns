@@ -75,8 +75,9 @@ def _solve_lstsq_robust(A: np.ndarray, b: np.ndarray) -> np.ndarray:
     try:
         AtA = A.T @ A
         Atb = A.T @ b
-        # Add small regularization for numerical stability
-        AtA += 1e-10 * np.eye(AtA.shape[0])
+        # Add regularization for numerical stability (1e-8 ensures positive definiteness
+        # for deep networks with skip connections, which can have negative eigenvalues ~1e-10)
+        AtA += 1e-8 * np.eye(AtA.shape[0])
         c, low = scipy.linalg.cho_factor(AtA)
         return scipy.linalg.cho_solve((c, low), Atb)
     except np.linalg.LinAlgError:
