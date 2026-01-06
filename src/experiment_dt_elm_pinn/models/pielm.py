@@ -213,7 +213,8 @@ class PIELM(BaseModel):
 
         # Check if this is a nonlinear problem (has exp(u) term)
         # For our nonlinear Poisson: ∇²u = f + exp(u)
-        is_nonlinear = True  # Assume nonlinear for this task
+        # Query the task to determine if it's linear or nonlinear
+        is_nonlinear = not (hasattr(self.task, 'is_linear') and self.task.is_linear())
 
         residual_history = []
 

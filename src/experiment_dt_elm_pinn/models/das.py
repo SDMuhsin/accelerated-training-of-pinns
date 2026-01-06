@@ -214,38 +214,19 @@ class DAS(BaseModel):
         """
         Get source term function for the PDE.
 
-        For manufactured solutions, we know f analytically.
-        For general tasks, use interpolation from task's points.
+        Uses the task's evaluate_source method to ensure correctness
+        for all task types (constant source, sin source, etc.).
         """
-        task_name = self.task.name.lower()
+        # Check if task has evaluate_source method (preferred)
+        if hasattr(self.task, 'evaluate_source'):
+            def f_from_task(X):
+                X_np = X.detach().cpu().numpy()
+                f_vals = self.task.evaluate_source(X_np)
+                return torch.tensor(f_vals, dtype=X.dtype, device=X.device)
+            return f_from_task
 
-        if 'poisson' in task_name and 'nonlinear' not in task_name:
-            # Linear Poisson: -nabla^2 u = f
-            # For spectral-poisson-square: u = sin(pi*x)*sin(pi*y)
-            # f = 2*pi^2 * sin(pi*x) * sin(pi*y)
-            def f_poisson(X):
-                return 2 * np.pi**2 * torch.sin(np.pi * X[:, 0]) * torch.sin(np.pi * X[:, 1])
-            return f_poisson
-
-        elif 'laplace' in task_name:
-            # Laplace: -nabla^2 u = 0
-            def f_laplace(X):
-                return torch.zeros(X.shape[0], device=X.device, dtype=X.dtype)
-            return f_laplace
-
-        elif 'nonlinear' in task_name and 'poisson' in task_name:
-            # Nonlinear Poisson: -nabla^2 u + exp(u) = f
-            # For manufactured solution u = sin(pi*x)*sin(pi*y):
-            # f = 2*pi^2 * sin(pi*x)*sin(pi*y) + exp(sin(pi*x)*sin(pi*y))
-            def f_nonlinear_poisson(X):
-                u_exact = torch.sin(np.pi * X[:, 0]) * torch.sin(np.pi * X[:, 1])
-                lap_u = 2 * np.pi**2 * u_exact
-                return lap_u + torch.exp(u_exact)
-            return f_nonlinear_poisson
-
-        else:
-            # Fallback: interpolate from task's pre-computed values
-            return self._create_interpolated_source()
+        # Fallback: interpolate from task's pre-computed values
+        return self._create_interpolated_source()
 
     def _create_interpolated_source(self) -> Callable:
         """Create interpolated source function from task's points."""
@@ -305,12 +286,12 @@ class DAS(BaseModel):
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         if is_linear:
-            # Linear Poisson: nabla^2 u + f = 0 (note: our formulation has -nabla^2 u = f)
-            residual = (laplacian_u + f) ** 2
+            # Linear Poisson: ∇²u = f, so residual = ∇²u - f
+            residual = (laplacian_u - f) ** 2
         else:
-            # Nonlinear Poisson: nabla^2 u + f - exp(u) = 0
+            # Nonlinear Poisson: ∇²u = f + exp(u), so residual = ∇²u - f - exp(u)
             u_clamped = torch.clamp(u, max=50.0)
-            residual = (laplacian_u + f - torch.exp(u_clamped)) ** 2
+            residual = (laplacian_u - f - torch.exp(u_clamped)) ** 2
 
         return residual
 

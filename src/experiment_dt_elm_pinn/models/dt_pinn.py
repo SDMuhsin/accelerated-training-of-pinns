@@ -131,9 +131,28 @@ class DTPINN(BaseModel):
         self._is_setup = True
 
     def _setup_cpu_operators(self, data, precision):
-        """Setup sparse operators for CPU computation."""
-        from scipy.sparse import csr_matrix
+        """Setup sparse operators for CPU computation using torch sparse tensors."""
+        from scipy.sparse import coo_matrix
 
+        # Convert to COO format for torch sparse tensor creation
+        L_coo = coo_matrix(data.L, dtype=np.float64)
+        B_coo = coo_matrix(data.B, dtype=np.float64)
+
+        # Create torch sparse tensors (enables proper autograd for L-BFGS)
+        L_indices = torch.tensor(np.vstack([L_coo.row, L_coo.col]), dtype=torch.long)
+        L_values = torch.tensor(L_coo.data, dtype=precision)
+        self.L_torch = torch.sparse_coo_tensor(
+            L_indices, L_values, L_coo.shape
+        ).coalesce()
+
+        B_indices = torch.tensor(np.vstack([B_coo.row, B_coo.col]), dtype=torch.long)
+        B_values = torch.tensor(B_coo.data, dtype=precision)
+        self.B_torch = torch.sparse_coo_tensor(
+            B_indices, B_values, B_coo.shape
+        ).coalesce()
+
+        # Keep scipy sparse for fallback (if needed)
+        from scipy.sparse import csr_matrix
         self.L_sparse = csr_matrix(data.L, dtype=np.float64)
         self.B_sparse = csr_matrix(data.B, dtype=np.float64)
 
@@ -167,33 +186,36 @@ class DTPINN(BaseModel):
             self.use_cuda = False
             self._setup_cpu_operators(data, precision)
 
-    def _sparse_matmul(self, sparse_mat, tensor, sparse_t=None):
+    def _sparse_matmul(self, sparse_mat, tensor, sparse_t=None, use_torch_sparse=None):
         """Multiply sparse matrix with torch tensor."""
         if self.use_cuda:
             return self._cuda_sparse_matmul(sparse_mat, tensor, sparse_t)
         else:
-            return self._cpu_sparse_matmul(sparse_mat, tensor)
+            return self._cpu_sparse_matmul(sparse_mat, tensor, use_torch_sparse)
 
-    def _cpu_sparse_matmul(self, sparse_mat, tensor):
-        """CPU sparse matrix multiplication with autograd support."""
-        sparse_t = sparse_mat.T.tocsr()
+    def _cpu_sparse_matmul(self, sparse_mat, tensor, use_torch_sparse=None):
+        """CPU sparse matrix multiplication with autograd support.
 
-        class SparseMulCPU(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, u_pred):
-                # Store shape info for backward pass
-                ctx.save_for_backward(torch.tensor([u_pred.shape[0]]))
-                tensor_np = u_pred.detach().cpu().numpy()
-                result_np = sparse_mat.dot(tensor_np)
-                return torch.tensor(result_np, dtype=u_pred.dtype, device=u_pred.device, requires_grad=True)
+        Uses torch.sparse.mm which properly supports autograd for L-BFGS.
+        """
+        # Determine which torch sparse tensor to use
+        if use_torch_sparse is not None:
+            sparse_torch = use_torch_sparse
+        elif sparse_mat is self.L_sparse:
+            sparse_torch = self.L_torch
+        elif sparse_mat is self.B_sparse:
+            sparse_torch = self.B_torch
+        else:
+            # Fallback: create torch sparse tensor on the fly
+            from scipy.sparse import coo_matrix
+            coo = coo_matrix(sparse_mat)
+            indices = torch.tensor(np.vstack([coo.row, coo.col]), dtype=torch.long)
+            values = torch.tensor(coo.data, dtype=tensor.dtype)
+            sparse_torch = torch.sparse_coo_tensor(indices, values, coo.shape).coalesce()
 
-            @staticmethod
-            def backward(ctx, grad_output):
-                grad_np = grad_output.detach().cpu().numpy()
-                result_np = sparse_t.dot(grad_np)
-                return torch.tensor(result_np, dtype=grad_output.dtype, device=grad_output.device)
-
-        return SparseMulCPU.apply(tensor)
+        # Use torch.sparse.mm for proper autograd support
+        # This enables L-BFGS to work correctly
+        return torch.sparse.mm(sparse_torch, tensor)
 
     def _cuda_sparse_matmul(self, sparse_mat, tensor, sparse_t):
         """GPU sparse matrix multiplication with autograd support."""
@@ -236,22 +258,17 @@ class DTPINN(BaseModel):
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         # Setup optimizer
-        # Note: L-BFGS doesn't work well with sparse operators in general:
-        # - CPU: tensor recreation in custom autograd Functions breaks L-BFGS
-        # - GPU: L-BFGS line search has convergence issues with RBF-FD operators
-        # Always use Adam for DT-PINN as it's more robust.
+        # Using torch.sparse.mm now enables proper autograd for L-BFGS
         effective_optimizer = self.optimizer_name
         effective_lr = self.lr
         effective_epochs = self.epochs
 
-        # Force Adam for all DT-PINN runs (L-BFGS has convergence issues)
-        if self.optimizer_name == 'lbfgs':
-            effective_optimizer = 'adam'
-            effective_lr = 0.001
-            effective_epochs = max(self.epochs, 2000)  # Adam needs more iterations
-
         if effective_optimizer == 'lbfgs':
-            optimizer = torch.optim.LBFGS(self.network.parameters(), lr=effective_lr)
+            optimizer = torch.optim.LBFGS(
+                self.network.parameters(),
+                lr=effective_lr,
+                line_search_fn='strong_wolfe'  # More robust line search
+            )
         else:
             optimizer = torch.optim.Adam(self.network.parameters(), lr=effective_lr)
 
