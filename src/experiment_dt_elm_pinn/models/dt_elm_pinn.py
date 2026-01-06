@@ -10,6 +10,9 @@ Combines spectral collocation discretization with ELM's direct solve.
 IMPORTANT: This model uses SPECTRAL COLLOCATION which requires TENSOR-PRODUCT
 domains (square, cube). For non-tensor-product domains (disk, L-shape), use
 DT-PINN instead which uses RBF-FD discretization.
+
+NOTE: This model builds its own spectral operators using SpectralDiscretizer.
+It does NOT use operators provided by the task.
 """
 
 import numpy as np
@@ -18,6 +21,12 @@ import time
 from typing import Dict, Any, List, Optional
 
 from .base import BaseModel, TrainResult
+
+# Import discretizer - handle both relative and absolute import
+try:
+    from ..discretization import SpectralDiscretizer
+except ImportError:
+    from src.experiment_dt_elm_pinn.discretization import SpectralDiscretizer
 
 
 def _solve_lstsq_cholesky(A: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -121,11 +130,12 @@ class DTELMPINN(BaseModel):
         seed: int = 42,
         use_skip_connections: bool = True,
         solver: str = 'cholesky',
+        N: int = 25,
         **kwargs
     ):
         """
         Args:
-            task: Task object providing PDE data
+            task: Task object providing PDE definition (not operators)
             hidden_sizes: List of hidden layer sizes. Default: [100]
             activation: Activation function ('tanh', 'sin')
             max_iter: Maximum Newton iterations
@@ -134,14 +144,12 @@ class DTELMPINN(BaseModel):
             use_skip_connections: If True, concatenate all layer outputs (recommended)
             solver: Least squares solver ('cholesky' or 'svd'). Cholesky is ~2x faster,
                    SVD is more numerically stable for ill-conditioned problems.
+            N: Number of Chebyshev points per dimension for spectral discretization.
 
         Raises:
             ValueError: If task domain is not compatible with spectral collocation.
         """
         super().__init__(task, **kwargs)
-
-        # Check domain compatibility for spectral collocation
-        self._check_domain_compatibility(task)
 
         self.hidden_sizes = hidden_sizes or [100]
         self.activation = activation
@@ -150,6 +158,11 @@ class DTELMPINN(BaseModel):
         self.seed = seed
         self.use_skip_connections = use_skip_connections
         self.solver = solver
+        self.N = N
+
+        # Create discretizer and check domain compatibility
+        self.discretizer = SpectralDiscretizer(N=N)
+        self._check_domain_compatibility(task)
 
         # Select solver function
         if solver == 'cholesky':
@@ -167,6 +180,15 @@ class DTELMPINN(BaseModel):
         self.LH = None          # Precomputed L @ H
         self.BH = None          # Precomputed B @ H
 
+        # Discretized data (built by model, not task)
+        self.L = None           # Laplacian operator
+        self.B = None           # Boundary operator
+        self.X_interior = None  # Interior points (Chebyshev grid)
+        self.X_boundary = None  # Boundary points (Chebyshev grid)
+        self.f = None           # Source term at interior+boundary
+        self.g = None           # BC values at boundary
+        self.u_true = None      # True solution (if available)
+
     def _check_domain_compatibility(self, task):
         """
         Check if task domain is compatible with spectral collocation.
@@ -180,22 +202,10 @@ class DTELMPINN(BaseModel):
             return
 
         domain_type = task.domain_type
+        task_name = getattr(task, 'name', 'unknown')
 
-        if domain_type not in self.COMPATIBLE_DOMAINS:
-            task_name = getattr(task, 'name', 'unknown')
-            raise ValueError(
-                f"\n{'='*70}\n"
-                f"SPECTO-ELM (dt-elm-pinn) requires a TENSOR-PRODUCT domain\n"
-                f"(square, cube) for spectral collocation.\n"
-                f"\n"
-                f"Task '{task_name}' uses domain '{domain_type}' which is NOT supported.\n"
-                f"\n"
-                f"Alternatives:\n"
-                f"  - Use --model dt-pinn (RBF-FD discretization, works on any domain)\n"
-                f"  - Use --model vanilla-pinn (autodiff, works on any domain)\n"
-                f"  - Use a square/cube domain task (e.g., poisson-square-sin, laplace-square)\n"
-                f"{'='*70}"
-            )
+        # Use discretizer's compatibility check
+        self.discretizer.check_compatibility(domain_type, task_name)
 
     def _activation_fn(self, x: np.ndarray) -> np.ndarray:
         """Apply activation function."""
@@ -207,12 +217,67 @@ class DTELMPINN(BaseModel):
             raise ValueError(f"Unknown activation: {self.activation}")
 
     def setup(self):
-        """Build hidden layer features and precompute operator products."""
+        """
+        Build discretization and hidden layer features.
+
+        This method:
+        1. Generates Chebyshev grid using SpectralDiscretizer
+        2. Builds L, B operators using SpectralDiscretizer
+        3. Evaluates f, g, u_true at Chebyshev points using task methods
+        4. Builds multi-layer hidden features
+        5. Precomputes L @ H and B @ H for efficient training
+        """
         np.random.seed(self.seed)
 
-        data = self.task.data
-        X = data.X_full
-        precision = X.dtype
+        # Get domain info from task
+        domain_type = getattr(self.task, 'domain_type', 'square')
+        domain_bounds = getattr(self.task, 'domain_bounds', {'x': (0.0, 1.0), 'y': (0.0, 1.0)})
+
+        # Generate Chebyshev grid
+        self.X_interior, self.X_boundary, perm = self.discretizer.generate_grid(
+            domain_type, domain_bounds
+        )
+
+        # Build operators using discretizer
+        self.L, self.B, _ = self.discretizer.build_operators(
+            self.X_interior, self.X_boundary,
+            domain_type=domain_type,
+            domain_bounds=domain_bounds
+        )
+
+        # Compute N_interior, N_boundary, N_ib
+        N_interior = self.X_interior.shape[0]
+        N_boundary = self.X_boundary.shape[0]
+        N_ib = N_interior + N_boundary
+
+        # Stack points: interior first, then boundary
+        X_ib = np.vstack([self.X_interior, self.X_boundary])
+        precision = X_ib.dtype
+
+        # Evaluate source term, BC values, and true solution at Chebyshev points
+        if hasattr(self.task, 'evaluate_source'):
+            self.f = self.task.evaluate_source(X_ib)
+        else:
+            # Fallback to task's pre-computed f (may be at different points)
+            self.f = self.task.data.f[:N_ib] if hasattr(self.task, 'data') else np.zeros(N_ib)
+
+        if hasattr(self.task, 'evaluate_bc'):
+            self.g = self.task.evaluate_bc(self.X_boundary)
+        else:
+            self.g = self.task.data.g if hasattr(self.task, 'data') else np.zeros(N_boundary)
+
+        if hasattr(self.task, 'evaluate_exact'):
+            self.u_true = self.task.evaluate_exact(X_ib)
+        else:
+            self.u_true = self.task.data.u_true[:N_ib] if hasattr(self.task, 'data') and self.task.data.u_true is not None else None
+
+        # Store dimensions for later use
+        self.N_interior = N_interior
+        self.N_boundary = N_boundary
+        self.N_ib = N_ib
+
+        # Build X_full for ELM (no ghost points in spectral)
+        X = X_ib
 
         # Build multi-layer hidden representation
         if self.use_skip_connections:
@@ -237,14 +302,10 @@ class DTELMPINN(BaseModel):
             self.H = self._activation_fn(X @ W + b)
 
         # Precompute operator products
-        L = data.L
-        B = data.B
-        N_ib = data.N_ib
-
-        # L @ H gives (N_total, n_features), but we only need first N_ib rows for PDE
-        LH_full = L @ self.H
+        # L @ H gives (N_total, n_features), we need first N_ib rows for PDE
+        LH_full = self.L @ self.H
         self.LH = LH_full[:N_ib, :]  # (N_ib, n_features)
-        self.BH = B @ self.H         # (N_bc, n_features)
+        self.BH = self.B @ self.H    # (N_bc, n_features)
 
         # Initialize output weights
         self.W_out = np.zeros(self.H.shape[1], dtype=precision)
@@ -266,12 +327,12 @@ class DTELMPINN(BaseModel):
         if not self._is_setup:
             self.setup()
 
-        data = self.task.data
-        N_ib = data.N_ib
-        f = data.f
-        g = data.g
-        L = data.L
-        B = data.B
+        # Use model's own discretized data (not task's data)
+        N_ib = self.N_ib
+        f = self.f
+        g = self.g
+        L = self.L
+        B = self.B
 
         start_time = time.perf_counter()
 
@@ -391,9 +452,8 @@ class DTELMPINN(BaseModel):
         # Compute L2 error if ground truth available
         u_pred = u[:N_ib]
         l2_error = None
-        if data.u_true is not None:
-            u_true_ib = data.u_true[:N_ib]
-            l2_error = self.compute_l2_error(u_pred, u_true_ib)
+        if self.u_true is not None:
+            l2_error = self.compute_l2_error(u_pred, self.u_true)
 
         return TrainResult(
             u_pred=u_pred,

@@ -7,12 +7,15 @@ Gradient-based training (L-BFGS or Adam) optimizes network parameters.
 
 Key properties:
 - Works on ANY domain geometry (disk, square, L-shape, etc.)
-- Uses task-provided discrete operators from RBF-FD or similar methods
+- Builds its own RBF-FD operators using RBFFDDiscretizer
 - Network predicts u values at collocation points
 - Spatial derivatives computed via sparse matrix-vector products
 
 For tensor-product domains (square, cube), consider SPECTO-ELM which uses
 spectral collocation for potentially higher accuracy.
+
+NOTE: This model builds its own RBF-FD operators using RBFFDDiscretizer.
+It does NOT use operators provided by the task.
 """
 
 import numpy as np
@@ -22,6 +25,12 @@ import time
 from typing import Dict, Any, List, Optional
 
 from .base import BaseModel, TrainResult
+
+# Import discretizer
+try:
+    from ..discretization import RBFFDDiscretizer
+except ImportError:
+    from src.experiment_dt_elm_pinn.discretization import RBFFDDiscretizer
 
 
 class DTPINN(BaseModel):
@@ -47,11 +56,14 @@ class DTPINN(BaseModel):
         epochs: int = 1000,
         use_cuda: bool = True,
         seed: int = 0,
+        stencil_size: int = 21,
+        poly_degree: int = 3,
+        rbf_order: int = 5,
         **kwargs
     ):
         """
         Args:
-            task: Task object providing PDE data
+            task: Task object providing PDE definition (not operators)
             layers: Number of hidden layers
             nodes: Nodes per hidden layer
             activation: Activation function ('tanh', 'relu', 'sin')
@@ -60,6 +72,9 @@ class DTPINN(BaseModel):
             epochs: Number of training epochs
             use_cuda: Whether to use GPU acceleration
             seed: Random seed
+            stencil_size: Number of neighbors for RBF-FD stencil
+            poly_degree: Polynomial augmentation degree
+            rbf_order: Polyharmonic spline order
         """
         super().__init__(task, **kwargs)
 
@@ -72,6 +87,13 @@ class DTPINN(BaseModel):
         self.use_cuda = use_cuda and torch.cuda.is_available()
         self.seed = seed
 
+        # Create RBF-FD discretizer
+        self.discretizer = RBFFDDiscretizer(
+            stencil_size=stencil_size,
+            poly_degree=poly_degree,
+            rbf_order=rbf_order,
+        )
+
         # Will be set during setup
         self.network = None
         self.device = None
@@ -79,6 +101,14 @@ class DTPINN(BaseModel):
         self.B_sparse = None
         self.L_t = None
         self.B_t = None
+
+        # Discretized data (built by model, not task)
+        self.L = None           # Laplacian operator (scipy sparse)
+        self.B = None           # Boundary operator (scipy sparse)
+        self.X_ghost = None     # Ghost points
+        self.f = None           # Source term
+        self.g = None           # BC values
+        self.u_true = None      # True solution
 
     def _build_network(self, input_dim: int, precision: torch.dtype) -> nn.Module:
         """Build MLP network."""
@@ -108,35 +138,101 @@ class DTPINN(BaseModel):
         return network
 
     def setup(self):
-        """Initialize network and prepare sparse operators."""
+        """
+        Initialize network and build RBF-FD operators.
+
+        This method:
+        1. Gets X_interior, X_boundary from task
+        2. Builds L, B operators using RBFFDDiscretizer
+        3. Evaluates f, g, u_true using task methods
+        4. Prepares sparse operators for training
+        """
         torch.manual_seed(self.seed)
 
+        # Get points from task (task provides points, model builds operators)
         data = self.task.data
-        precision = torch.float64 if data.X_full.dtype == np.float64 else torch.float32
+        X_interior = data.X_interior
+        X_boundary = data.X_boundary
+        precision = torch.float64 if X_interior.dtype == np.float64 else torch.float32
+
+        # Build RBF-FD operators using discretizer
+        self.L, self.B, self.X_ghost = self.discretizer.build_operators(
+            X_interior, X_boundary
+        )
+
+        # Compute dimensions
+        N_interior = X_interior.shape[0]
+        N_boundary = X_boundary.shape[0]
+        N_ghost = self.X_ghost.shape[0] if self.X_ghost is not None else 0
+        N_ib = N_interior + N_boundary
+        N_full = N_ib + N_ghost
+
+        # Store dimensions
+        self.N_interior = N_interior
+        self.N_boundary = N_boundary
+        self.N_ghost = N_ghost
+        self.N_ib = N_ib
+        self.N_full = N_full
+
+        # Identify well-conditioned interior rows (filter out ill-conditioned stencils)
+        # This is critical for RBF-FD: near-boundary stencils can have extreme weights
+        L_dense = self.L.toarray()
+        row_max_abs = np.abs(L_dense[:N_interior]).max(axis=1)
+        weight_threshold = 1e4  # Rows with weights larger than this are ill-conditioned
+        self.valid_interior_mask = row_max_abs < weight_threshold
+        self.N_valid_interior = self.valid_interior_mask.sum()
+
+        # Build X_full: [interior, boundary, ghost]
+        if self.X_ghost is not None and len(self.X_ghost) > 0:
+            self.X_full = np.vstack([X_interior, X_boundary, self.X_ghost])
+        else:
+            self.X_full = np.vstack([X_interior, X_boundary])
+
+        # Evaluate source term, BC values, and true solution
+        X_ib = np.vstack([X_interior, X_boundary])
+
+        # Note: f is only needed at valid interior points (PDE is enforced there, not at boundary)
+        # Use the valid_interior_mask to filter out ill-conditioned points
+        if hasattr(self.task, 'evaluate_source'):
+            f_all = self.task.evaluate_source(X_interior)
+            self.f = f_all[self.valid_interior_mask]
+        else:
+            f_all = data.f[:N_interior] if hasattr(data, 'f') else np.zeros(N_interior)
+            self.f = f_all[self.valid_interior_mask]
+
+        if hasattr(self.task, 'evaluate_bc'):
+            self.g = self.task.evaluate_bc(X_boundary)
+        else:
+            self.g = data.g if hasattr(data, 'g') else np.zeros(N_boundary)
+
+        if hasattr(self.task, 'evaluate_exact'):
+            self.u_true = self.task.evaluate_exact(X_ib)
+        else:
+            self.u_true = data.u_true[:N_ib] if hasattr(data, 'u_true') and data.u_true is not None else None
 
         # Set device
         self.device = torch.device('cuda' if self.use_cuda else 'cpu')
 
         # Build network
-        input_dim = data.spatial_dim
+        input_dim = X_interior.shape[1]
         self.network = self._build_network(input_dim, precision)
         self.network = self.network.to(self.device)
 
-        # Setup sparse operators
+        # Setup sparse operators for torch
         if self.use_cuda:
-            self._setup_cuda_operators(data, precision)
+            self._setup_cuda_operators_from_scipy(precision)
         else:
-            self._setup_cpu_operators(data, precision)
+            self._setup_cpu_operators_from_scipy(precision)
 
         self._is_setup = True
 
-    def _setup_cpu_operators(self, data, precision):
+    def _setup_cpu_operators_from_scipy(self, precision):
         """Setup sparse operators for CPU computation using torch sparse tensors."""
-        from scipy.sparse import coo_matrix
+        from scipy.sparse import coo_matrix, csr_matrix
 
         # Convert to COO format for torch sparse tensor creation
-        L_coo = coo_matrix(data.L, dtype=np.float64)
-        B_coo = coo_matrix(data.B, dtype=np.float64)
+        L_coo = coo_matrix(self.L, dtype=np.float64)
+        B_coo = coo_matrix(self.B, dtype=np.float64)
 
         # Create torch sparse tensors (enables proper autograd for L-BFGS)
         L_indices = torch.tensor(np.vstack([L_coo.row, L_coo.col]), dtype=torch.long)
@@ -151,20 +247,19 @@ class DTPINN(BaseModel):
             B_indices, B_values, B_coo.shape
         ).coalesce()
 
-        # Keep scipy sparse for fallback (if needed)
-        from scipy.sparse import csr_matrix
-        self.L_sparse = csr_matrix(data.L, dtype=np.float64)
-        self.B_sparse = csr_matrix(data.B, dtype=np.float64)
+        # Keep scipy sparse for fallback
+        self.L_sparse = csr_matrix(self.L, dtype=np.float64)
+        self.B_sparse = csr_matrix(self.B, dtype=np.float64)
 
-    def _setup_cuda_operators(self, data, precision):
+    def _setup_cuda_operators_from_scipy(self, precision):
         """Setup sparse operators for GPU computation with CuPy."""
         try:
             import cupy
             from cupy.sparse import csr_matrix as cupy_csr
 
             # Convert to CuPy sparse matrices
-            self.L_sparse = cupy_csr(data.L, dtype=np.float64)
-            self.B_sparse = cupy_csr(data.B, dtype=np.float64)
+            self.L_sparse = cupy_csr(self.L, dtype=np.float64)
+            self.B_sparse = cupy_csr(self.B, dtype=np.float64)
 
             # Initialize kernel by doing a dummy multiplication
             dummy = cupy.zeros((self.L_sparse.shape[1], 1), dtype=np.float64)
@@ -184,7 +279,7 @@ class DTPINN(BaseModel):
         except ImportError:
             print("CuPy not available, falling back to CPU")
             self.use_cuda = False
-            self._setup_cpu_operators(data, precision)
+            self._setup_cpu_operators_from_scipy(precision)
 
     def _sparse_matmul(self, sparse_mat, tensor, sparse_t=None, use_torch_sparse=None):
         """Multiply sparse matrix with torch tensor."""
@@ -245,14 +340,18 @@ class DTPINN(BaseModel):
         if not self._is_setup:
             self.setup()
 
-        data = self.task.data
-        N_ib = data.N_ib
-        precision = torch.float64 if data.X_full.dtype == np.float64 else torch.float32
+        # Use model's own discretized data
+        N_interior = self.N_interior
+        N_ib = self.N_ib
+        precision = torch.float64 if self.X_full.dtype == np.float64 else torch.float32
 
         # Prepare data tensors
-        X_full = torch.tensor(data.X_full, dtype=precision, device=self.device)
-        f = torch.tensor(data.f, dtype=precision, device=self.device).unsqueeze(1)
-        g = torch.tensor(data.g, dtype=precision, device=self.device).unsqueeze(1)
+        X_full = torch.tensor(self.X_full, dtype=precision, device=self.device)
+        f = torch.tensor(self.f, dtype=precision, device=self.device).unsqueeze(1)
+        g = torch.tensor(self.g, dtype=precision, device=self.device).unsqueeze(1)
+
+        # Mask for valid interior points (well-conditioned stencils)
+        valid_mask = torch.tensor(self.valid_interior_mask, dtype=torch.bool, device=self.device)
 
         # Check if task is linear (no exp(u) term)
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
@@ -286,15 +385,19 @@ class DTPINN(BaseModel):
                 u_pred = self.network(X_full)
 
                 # PDE loss depends on whether task is linear or nonlinear
+                # IMPORTANT: Only apply PDE at valid interior points
+                # (near-boundary stencils are ill-conditioned and must be filtered out)
                 Lu = self._sparse_matmul(self.L_sparse, u_pred, self.L_t)
+                Lu_valid = Lu[:N_interior][valid_mask]  # Filter to valid interior points
                 if is_linear:
-                    # Linear Poisson: L @ u - f = 0
-                    pde_residual = Lu[:N_ib] - f
+                    # Linear Poisson: L @ u - f = 0 at valid interior points only
+                    pde_residual = Lu_valid - f
                 else:
-                    # Nonlinear Poisson: L @ u - f - exp(u) = 0
+                    # Nonlinear Poisson: L @ u - f - exp(u) = 0 at valid interior points
                     # Clamp u to prevent exp overflow
-                    u_clamped = torch.clamp(u_pred[:N_ib], max=50.0)
-                    pde_residual = Lu[:N_ib] - f - torch.exp(u_clamped)
+                    u_valid = u_pred[:N_interior][valid_mask]
+                    u_clamped = torch.clamp(u_valid, max=50.0)
+                    pde_residual = Lu_valid - f - torch.exp(u_clamped)
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss: B @ u - g = 0
@@ -324,14 +427,14 @@ class DTPINN(BaseModel):
 
         # Get final predictions
         with torch.no_grad():
-            X_ib = torch.tensor(data.X_ib, dtype=precision, device=self.device)
-            u_pred = self.network(X_ib).cpu().numpy().flatten()
+            X_ib_np = self.X_full[:N_ib]  # Interior + boundary points
+            X_ib_t = torch.tensor(X_ib_np, dtype=precision, device=self.device)
+            u_pred = self.network(X_ib_t).cpu().numpy().flatten()
 
         # Compute L2 error
         l2_error = None
-        if data.u_true is not None:
-            u_true_ib = data.u_true[:N_ib]
-            l2_error = self.compute_l2_error(u_pred, u_true_ib)
+        if self.u_true is not None:
+            l2_error = self.compute_l2_error(u_pred, self.u_true)
 
         return TrainResult(
             u_pred=u_pred,
