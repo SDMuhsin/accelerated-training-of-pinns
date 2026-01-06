@@ -305,6 +305,45 @@ class PoissonRBFFDTask(RBFFDTask):
             'rbf_order': 5,
         }
 
+    # =========================================================================
+    # Domain Properties (required for discretization compatibility)
+    # =========================================================================
+
+    @property
+    def domain_type(self) -> str:
+        """Return domain type: 'disk' or 'square'."""
+        return self.domain
+
+    @property
+    def domain_bounds(self) -> Dict[str, Tuple[float, float]]:
+        """Return domain bounds for spectral discretization."""
+        if self.domain == 'disk':
+            # Disk uses radius, but bounds would be [-R, R]^2 bounding box
+            R = self.radius
+            return {'x': (-R, R), 'y': (-R, R)}
+        else:
+            # Square domain is [-1, 1]^2
+            return {'x': (-1.0, 1.0), 'y': (-1.0, 1.0)}
+
+    # =========================================================================
+    # Point Evaluation Methods (required for spectral discretization)
+    # =========================================================================
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate source term f at arbitrary points."""
+        f, _ = self._compute_source_and_solution(X)
+        return f
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate boundary condition g at boundary points."""
+        _, u_exact = self._compute_source_and_solution(X)
+        return u_exact  # Dirichlet BC: g = u_exact on boundary
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate exact solution at arbitrary points."""
+        _, u_exact = self._compute_source_and_solution(X)
+        return u_exact
+
 
 class NonlinearPoissonRBFFDTask(PoissonRBFFDTask):
     """

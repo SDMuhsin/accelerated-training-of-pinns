@@ -6,9 +6,10 @@ Tasks define:
 - PDE equation (e.g., Laplacian, source terms)
 - Boundary conditions
 - Ground truth solution (if available)
-- Precomputed operators (L, B) for discrete methods
 
-Supports both MATLAB-generated operators and Python RBF-FD operators.
+Note: Discrete operators (L, B) are now built by discretizers, not tasks.
+- DT-PINN uses RBF-FD discretization (works on any domain)
+- SPECTO-ELM uses Spectral collocation (requires tensor-product domains: square, cube)
 """
 
 from functools import partial
@@ -31,19 +32,41 @@ try:
 except ImportError:
     _rbf_fd_available = False
 
-# Register all available tasks
-# 1. Nonlinear Poisson (MATLAB data) - L-shaped domain
-TaskRegistry.register('nonlinear-poisson', NonlinearPoissonTask)
+# Import Spectral tasks
+try:
+    from .spectral import (
+        SpectralPoissonSquareTask,
+        SpectralLaplaceSquareTask,
+        SpectralNonlinearPoissonSquareTask,
+        SpectralPoissonCubeTask,
+        SpectralLaplaceCubeTask,
+        SpectralNonlinearPoissonCubeTask,
+        SpectralPoissonPeakedTask,
+        SpectralBoundaryLayerTask,
+        SpectralPoissonCornerTask,
+    )
+    _spectral_available = True
+except ImportError as e:
+    _spectral_available = False
+    print(f"Warning: Spectral tasks not available: {e}")
 
-# 2. Heat/Laplace equation (MATLAB data) - Linear PDE (DEPRECATED - has data issues)
-# TaskRegistry.register('heat-equation-matlab', HeatEquationTask)  # Kept for reference
+# =============================================================================
+# Register all available tasks with CLEAN names (no discretization prefix)
+# =============================================================================
 
-# Register RBF-FD tasks (Python-generated operators) if available
+# -----------------------------------------------------------------------------
+# Nonlinear Poisson on L-shaped domain (MATLAB data) - special case
+# This is the only task that uses precomputed MATLAB operators
+# -----------------------------------------------------------------------------
+TaskRegistry.register('nonlinear-poisson-lshape', NonlinearPoissonTask)
+
+# -----------------------------------------------------------------------------
+# Disk domain tasks (RBF-FD only, no spectral support)
+# -----------------------------------------------------------------------------
 if _rbf_fd_available:
-    # 3. Poisson on disk - constant source
-    TaskRegistry.register('poisson-rbf-fd', PoissonRBFFDTask)
+    # Poisson on disk
+    TaskRegistry.register('poisson-disk', PoissonRBFFDTask)  # constant source
 
-    # 4. Poisson on disk - sinusoidal source
     class PoissonDiskSinTask(PoissonRBFFDTask):
         name = "poisson-disk-sin"
         def __init__(self, **kwargs):
@@ -52,7 +75,6 @@ if _rbf_fd_available:
             super().__init__(**kwargs)
     TaskRegistry.register('poisson-disk-sin', PoissonDiskSinTask)
 
-    # 5. Poisson on disk - quadratic source
     class PoissonDiskQuadraticTask(PoissonRBFFDTask):
         name = "poisson-disk-quadratic"
         def __init__(self, **kwargs):
@@ -61,28 +83,9 @@ if _rbf_fd_available:
             super().__init__(**kwargs)
     TaskRegistry.register('poisson-disk-quadratic', PoissonDiskQuadraticTask)
 
-    # 6. Poisson on square - constant source
-    class PoissonSquareConstantTask(PoissonRBFFDTask):
-        name = "poisson-square-constant"
-        def __init__(self, **kwargs):
-            kwargs.setdefault('domain', 'square')
-            kwargs.setdefault('source_func', 'constant')
-            super().__init__(**kwargs)
-    TaskRegistry.register('poisson-square-constant', PoissonSquareConstantTask)
+    # Nonlinear Poisson on disk
+    TaskRegistry.register('nonlinear-poisson-disk', NonlinearPoissonRBFFDTask)
 
-    # 7. Poisson on square - sinusoidal source
-    class PoissonSquareSinTask(PoissonRBFFDTask):
-        name = "poisson-square-sin"
-        def __init__(self, **kwargs):
-            kwargs.setdefault('domain', 'square')
-            kwargs.setdefault('source_func', 'sin')
-            super().__init__(**kwargs)
-    TaskRegistry.register('poisson-square-sin', PoissonSquareSinTask)
-
-    # 8. Nonlinear Poisson on disk (Python operators)
-    TaskRegistry.register('nonlinear-poisson-rbf-fd', NonlinearPoissonRBFFDTask)
-
-    # 9. Nonlinear Poisson on disk - sinusoidal source
     class NonlinearPoissonDiskSinTask(NonlinearPoissonRBFFDTask):
         name = "nonlinear-poisson-disk-sin"
         def __init__(self, **kwargs):
@@ -91,29 +94,7 @@ if _rbf_fd_available:
             super().__init__(**kwargs)
     TaskRegistry.register('nonlinear-poisson-disk-sin', NonlinearPoissonDiskSinTask)
 
-    # 10. Nonlinear Poisson on square - constant source
-    class NonlinearPoissonSquareConstantTask(NonlinearPoissonRBFFDTask):
-        name = "nonlinear-poisson-square-constant"
-        def __init__(self, **kwargs):
-            kwargs.setdefault('domain', 'square')
-            kwargs.setdefault('source_func', 'constant')
-            super().__init__(**kwargs)
-    TaskRegistry.register('nonlinear-poisson-square-constant', NonlinearPoissonSquareConstantTask)
-
-    # 11. Nonlinear Poisson on square - sinusoidal source
-    class NonlinearPoissonSquareSinTask(NonlinearPoissonRBFFDTask):
-        name = "nonlinear-poisson-square-sin"
-        def __init__(self, **kwargs):
-            kwargs.setdefault('domain', 'square')
-            kwargs.setdefault('source_func', 'sin')
-            super().__init__(**kwargs)
-    TaskRegistry.register('nonlinear-poisson-square-sin', NonlinearPoissonSquareSinTask)
-
-    # =========================================================================
-    # Heat/Laplace Equation Tasks (Python RBF-FD)
-    # =========================================================================
-
-    # 12. Laplace equation (∇²u = 0) on disk - harmonic solution
+    # Laplace on disk
     class LaplaceDiskTask(LaplaceEquationTask):
         name = "laplace-disk"
         def __init__(self, **kwargs):
@@ -122,19 +103,87 @@ if _rbf_fd_available:
             super().__init__(**kwargs)
     TaskRegistry.register('laplace-disk', LaplaceDiskTask)
 
-    # 13. Laplace equation on square - harmonic solution
-    class LaplaceSquareTask(LaplaceEquationTask):
-        name = "laplace-square"
+# -----------------------------------------------------------------------------
+# Square domain tasks (both RBF-FD and spectral support)
+# Using spectral task implementations when available (better accuracy)
+# -----------------------------------------------------------------------------
+if _spectral_available:
+    # Poisson on square (sin solution - spectral)
+    TaskRegistry.register('poisson-square-sin', SpectralPoissonSquareTask)
+
+    # Laplace on square (spectral)
+    TaskRegistry.register('laplace-square', SpectralLaplaceSquareTask)
+
+    # Nonlinear Poisson on square (spectral)
+    TaskRegistry.register('nonlinear-poisson-square', SpectralNonlinearPoissonSquareTask)
+
+    # Localized feature tasks
+    TaskRegistry.register('poisson-peaked', SpectralPoissonPeakedTask)
+    TaskRegistry.register('boundary-layer', SpectralBoundaryLayerTask)
+    TaskRegistry.register('poisson-corner', SpectralPoissonCornerTask)
+
+# Add RBF-FD square tasks (constant and sin source variants)
+if _rbf_fd_available:
+    class PoissonSquareConstantTask(PoissonRBFFDTask):
+        name = "poisson-square-constant"
         def __init__(self, **kwargs):
             kwargs.setdefault('domain', 'square')
-            kwargs.setdefault('solution_type', 'harmonic')
+            kwargs.setdefault('source_func', 'constant')
             super().__init__(**kwargs)
-    TaskRegistry.register('laplace-square', LaplaceSquareTask)
+    TaskRegistry.register('poisson-square-constant', PoissonSquareConstantTask)
 
-    # 14. Heat equation (time-dependent) - replaces broken MATLAB version
+    # Only register if spectral not available (avoid duplicate)
+    if not _spectral_available:
+        class PoissonSquareSinTask(PoissonRBFFDTask):
+            name = "poisson-square-sin"
+            def __init__(self, **kwargs):
+                kwargs.setdefault('domain', 'square')
+                kwargs.setdefault('source_func', 'sin')
+                super().__init__(**kwargs)
+        TaskRegistry.register('poisson-square-sin', PoissonSquareSinTask)
+
+    # Nonlinear Poisson on square - constant source variant
+    class NonlinearPoissonSquareConstantTask(NonlinearPoissonRBFFDTask):
+        name = "nonlinear-poisson-square-constant"
+        def __init__(self, **kwargs):
+            kwargs.setdefault('domain', 'square')
+            kwargs.setdefault('source_func', 'constant')
+            super().__init__(**kwargs)
+    TaskRegistry.register('nonlinear-poisson-square-constant', NonlinearPoissonSquareConstantTask)
+
+    # Nonlinear Poisson on square - sin source variant
+    class NonlinearPoissonSquareSinTask(NonlinearPoissonRBFFDTask):
+        name = "nonlinear-poisson-square-sin"
+        def __init__(self, **kwargs):
+            kwargs.setdefault('domain', 'square')
+            kwargs.setdefault('source_func', 'sin')
+            super().__init__(**kwargs)
+    TaskRegistry.register('nonlinear-poisson-square-sin', NonlinearPoissonSquareSinTask)
+
+    # Only register if spectral not available
+    if not _spectral_available:
+        class LaplaceSquareTask(LaplaceEquationTask):
+            name = "laplace-square"
+            def __init__(self, **kwargs):
+                kwargs.setdefault('domain', 'square')
+                kwargs.setdefault('solution_type', 'harmonic')
+                super().__init__(**kwargs)
+        TaskRegistry.register('laplace-square', LaplaceSquareTask)
+
+# -----------------------------------------------------------------------------
+# Cube domain tasks (3D, spectral only)
+# -----------------------------------------------------------------------------
+if _spectral_available:
+    TaskRegistry.register('poisson-cube', SpectralPoissonCubeTask)
+    TaskRegistry.register('laplace-cube', SpectralLaplaceCubeTask)
+    TaskRegistry.register('nonlinear-poisson-cube', SpectralNonlinearPoissonCubeTask)
+
+# -----------------------------------------------------------------------------
+# Heat equation tasks (time-dependent, square domain)
+# -----------------------------------------------------------------------------
+if _rbf_fd_available:
     TaskRegistry.register('heat-equation', HeatEquationSpaceTimeTask)
 
-    # 15. Heat equation on square with different parameters
     class HeatEquationFastDecayTask(HeatEquationSpaceTimeTask):
         name = "heat-fast-decay"
         def __init__(self, **kwargs):
@@ -143,6 +192,7 @@ if _rbf_fd_available:
             kwargs.setdefault('T_final', 0.05)
             super().__init__(**kwargs)
     TaskRegistry.register('heat-fast-decay', HeatEquationFastDecayTask)
+
 
 __all__ = [
     'BaseTask',
@@ -157,12 +207,19 @@ if _rbf_fd_available:
         'RBFFDTask',
         'PoissonRBFFDTask',
         'NonlinearPoissonRBFFDTask',
+        'LaplaceEquationTask',
+        'HeatEquationSpaceTimeTask',
     ])
 
-# Import Spectral Collocation tasks (registers them automatically)
-try:
-    from . import spectral
-    _spectral_available = True
-except ImportError as e:
-    _spectral_available = False
-    print(f"Warning: Spectral tasks not available: {e}")
+if _spectral_available:
+    __all__.extend([
+        'SpectralPoissonSquareTask',
+        'SpectralLaplaceSquareTask',
+        'SpectralNonlinearPoissonSquareTask',
+        'SpectralPoissonCubeTask',
+        'SpectralLaplaceCubeTask',
+        'SpectralNonlinearPoissonCubeTask',
+        'SpectralPoissonPeakedTask',
+        'SpectralBoundaryLayerTask',
+        'SpectralPoissonCornerTask',
+    ])

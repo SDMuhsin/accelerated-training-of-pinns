@@ -1,5 +1,6 @@
 """
-DT-ELM-PINN Accelerated: GPU-accelerated version using PyTorch.
+SPECTO-ELM Accelerated: GPU-accelerated version using PyTorch.
+(Also known as DT-ELM-PINN Accelerated)
 
 Key optimizations:
 1. PyTorch Cholesky solver (4.4x faster than SciPy on CPU for large M)
@@ -8,6 +9,9 @@ Key optimizations:
 
 This implementation achieves significant speedups especially for deep networks
 where M (total features) is large due to skip connection concatenation.
+
+IMPORTANT: Uses SPECTRAL COLLOCATION which requires TENSOR-PRODUCT domains
+(square, cube). For non-tensor-product domains (disk, L-shape), use DT-PINN.
 """
 
 import numpy as np
@@ -27,7 +31,7 @@ from .base import BaseModel, TrainResult
 
 class DTELMPINNAccelerated(BaseModel):
     """
-    GPU-accelerated DT-ELM-PINN solver using PyTorch.
+    GPU-accelerated SPECTO-ELM / DT-ELM-PINN solver using PyTorch.
 
     Network: u(x) = H @ W_out where H = concat([h1, h2, ..., hL])
     Each layer: h_l = tanh(h_{l-1} @ W_l + b_l)
@@ -36,9 +40,15 @@ class DTELMPINNAccelerated(BaseModel):
     - Only W_out is solved via least squares
     - Uses PyTorch for faster linear algebra operations
     - Automatically uses GPU when available
+
+    IMPORTANT: Requires tensor-product domain (square, cube) for spectral collocation.
+    For disk or L-shaped domains, use DT-PINN (RBF-FD discretization) instead.
     """
 
     name = "dt-elm-pinn-accel"
+
+    # Domain types compatible with spectral collocation
+    COMPATIBLE_DOMAINS = ('square', 'cube')
 
     def __init__(
         self,
@@ -62,8 +72,14 @@ class DTELMPINNAccelerated(BaseModel):
             seed: Random seed for reproducibility
             use_skip_connections: If True, concatenate all layer outputs
             device: 'auto' (GPU if available), 'cuda', or 'cpu'
+
+        Raises:
+            ValueError: If task domain is not compatible with spectral collocation.
         """
         super().__init__(task, **kwargs)
+
+        # Check domain compatibility for spectral collocation
+        self._check_domain_compatibility(task)
 
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for DTELMPINNAccelerated")
@@ -89,6 +105,34 @@ class DTELMPINNAccelerated(BaseModel):
 
         # Store random weights for prediction
         self._weights = []
+
+    def _check_domain_compatibility(self, task):
+        """
+        Check if task domain is compatible with spectral collocation.
+
+        Raises:
+            ValueError: If domain is not tensor-product (square, cube).
+        """
+        if not hasattr(task, 'domain_type'):
+            return
+
+        domain_type = task.domain_type
+
+        if domain_type not in self.COMPATIBLE_DOMAINS:
+            task_name = getattr(task, 'name', 'unknown')
+            raise ValueError(
+                f"\n{'='*70}\n"
+                f"SPECTO-ELM (dt-elm-pinn-accel) requires a TENSOR-PRODUCT domain\n"
+                f"(square, cube) for spectral collocation.\n"
+                f"\n"
+                f"Task '{task_name}' uses domain '{domain_type}' which is NOT supported.\n"
+                f"\n"
+                f"Alternatives:\n"
+                f"  - Use --model dt-pinn (RBF-FD discretization, works on any domain)\n"
+                f"  - Use --model vanilla-pinn (autodiff, works on any domain)\n"
+                f"  - Use a square/cube domain task (e.g., poisson-square-sin, laplace-square)\n"
+                f"{'='*70}"
+            )
 
     def _activation_fn(self, x: torch.Tensor) -> torch.Tensor:
         """Apply activation function."""

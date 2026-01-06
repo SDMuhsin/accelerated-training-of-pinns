@@ -193,6 +193,40 @@ class LaplaceEquationTask(RBFFDTask):
             'solution_type': 'harmonic',
         }
 
+    # =========================================================================
+    # Domain Properties (required for discretization compatibility)
+    # =========================================================================
+
+    @property
+    def domain_type(self) -> str:
+        """Return domain type: 'disk' or 'square'."""
+        return self.domain
+
+    @property
+    def domain_bounds(self) -> Dict[str, Tuple[float, float]]:
+        """Return domain bounds for spectral discretization."""
+        # Both disk and square use [-1, 1]^2 for Laplace
+        return {'x': (-1.0, 1.0), 'y': (-1.0, 1.0)}
+
+    # =========================================================================
+    # Point Evaluation Methods (required for spectral discretization)
+    # =========================================================================
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate source term f at arbitrary points."""
+        f, _ = self._compute_source_and_solution(X)
+        return f
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate boundary condition g at boundary points."""
+        _, u_exact = self._compute_source_and_solution(X)
+        return u_exact
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate exact solution at arbitrary points."""
+        _, u_exact = self._compute_source_and_solution(X)
+        return u_exact
+
 
 class HeatEquationSpaceTimeTask(RBFFDTask):
     """
@@ -360,3 +394,38 @@ class HeatEquationSpaceTimeTask(RBFFDTask):
             'k_y': 1,
             'T_final': 0.1,
         }
+
+    # =========================================================================
+    # Domain Properties (required for discretization compatibility)
+    # =========================================================================
+
+    @property
+    def domain_type(self) -> str:
+        """Heat equation uses square domain."""
+        return 'square'
+
+    @property
+    def domain_bounds(self) -> Dict[str, Tuple[float, float]]:
+        """Return domain bounds: [0,1]^2 for heat equation."""
+        return {'x': (0.0, 1.0), 'y': (0.0, 1.0)}
+
+    # =========================================================================
+    # Point Evaluation Methods (required for spectral discretization)
+    # =========================================================================
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate source term f at arbitrary points."""
+        t = self.T_final
+        u_exact = self._exact_solution(X[:, 0], X[:, 1], t)
+        laplacian_coef = -np.pi**2 * (self.k_x**2 + self.k_y**2)
+        return (laplacian_coef * u_exact).astype(self.precision)
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate boundary condition g at boundary points."""
+        t = self.T_final
+        return self._exact_solution(X[:, 0], X[:, 1], t).astype(self.precision)
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate exact solution at arbitrary points."""
+        t = self.T_final
+        return self._exact_solution(X[:, 0], X[:, 1], t).astype(self.precision)

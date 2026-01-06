@@ -15,16 +15,13 @@ cpu_models=(
 )
 
 # ============================================================================
-# SPECTRAL TASKS - Comparable to existing RBF-FD tasks in paper
+# TASKS - Square domain (compatible with SPECTO-ELM spectral collocation)
 # ============================================================================
-# spectral-poisson-square      ↔ poisson-square-sin (linear Poisson)
-# spectral-laplace-square      ↔ laplace-square (Laplace equation)
-# spectral-nonlinear-poisson   ↔ nonlinear-poisson-square-sin (nonlinear)
 
 spectral_tasks=(
-    spectral-poisson-square
-    spectral-laplace-square
-    spectral-nonlinear-poisson-square
+    poisson-square-sin               # linear Poisson (spectral)
+    laplace-square                   # Laplace equation (spectral)
+    nonlinear-poisson-square         # nonlinear Poisson (spectral)
 )
 
 # Seeds - match existing experiments
@@ -95,10 +92,10 @@ echo "All Spectral DISCO-ELM jobs submitted!"
 echo "=============================================="
 echo ""
 echo "SUMMARY:"
-echo "  Spectral Tasks: ${#spectral_tasks[@]}"
-echo "    - spectral-poisson-square (compare to poisson-square-sin)"
-echo "    - spectral-laplace-square (compare to laplace-square)"
-echo "    - spectral-nonlinear-poisson-square (compare to nonlinear-poisson-square-sin)"
+echo "  Tasks: ${#spectral_tasks[@]}"
+echo "    - poisson-square-sin (linear Poisson)"
+echo "    - laplace-square (Laplace equation)"
+echo "    - nonlinear-poisson-square (nonlinear Poisson)"
 echo ""
 echo "  Models: ${#cpu_models[@]}"
 echo "    - dt-elm-pinn (1 layer)"

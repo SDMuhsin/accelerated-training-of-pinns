@@ -1,10 +1,15 @@
 """
-DT-ELM-PINN: Discrete-Trained Extreme Learning Machine PINN
+SPECTO-ELM: SPECtral Collocation Extreme Learning Machine PINN
+(Also known as DT-ELM-PINN: Discrete-Trained Extreme Learning Machine PINN)
 
-Combines DT-PINN's precomputed sparse operators with ELM's direct solve.
-- No autodiff (uses precomputed L, B matrices)
+Combines spectral collocation discretization with ELM's direct solve.
+- No autodiff (uses precomputed L, B matrices from Chebyshev spectral methods)
 - No iterative optimization (direct lstsq + Newton iteration)
 - Achieves 27x speedup over DT-PINN, 585x over vanilla PINN
+
+IMPORTANT: This model uses SPECTRAL COLLOCATION which requires TENSOR-PRODUCT
+domains (square, cube). For non-tensor-product domains (disk, L-shape), use
+DT-PINN instead which uses RBF-FD discretization.
 """
 
 import numpy as np
@@ -88,7 +93,7 @@ def _solve_lstsq_robust(A: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 class DTELMPINN(BaseModel):
     """
-    DT-ELM-PINN solver.
+    SPECTO-ELM / DT-ELM-PINN solver using spectral collocation.
 
     Network: u(x) = H @ W_out where H = tanh(X @ W_in + b_in)
     - W_in, b_in: Random, FIXED (not trained)
@@ -96,9 +101,15 @@ class DTELMPINN(BaseModel):
 
     For nonlinear PDEs (e.g., ∇²u = f + exp(u)):
     Uses Newton linearization to solve iteratively.
+
+    IMPORTANT: Requires tensor-product domain (square, cube) for spectral collocation.
+    For disk or L-shaped domains, use DT-PINN (RBF-FD discretization) instead.
     """
 
     name = "dt-elm-pinn"
+
+    # Domain types compatible with spectral collocation
+    COMPATIBLE_DOMAINS = ('square', 'cube')
 
     def __init__(
         self,
@@ -123,8 +134,14 @@ class DTELMPINN(BaseModel):
             use_skip_connections: If True, concatenate all layer outputs (recommended)
             solver: Least squares solver ('cholesky' or 'svd'). Cholesky is ~2x faster,
                    SVD is more numerically stable for ill-conditioned problems.
+
+        Raises:
+            ValueError: If task domain is not compatible with spectral collocation.
         """
         super().__init__(task, **kwargs)
+
+        # Check domain compatibility for spectral collocation
+        self._check_domain_compatibility(task)
 
         self.hidden_sizes = hidden_sizes or [100]
         self.activation = activation
@@ -149,6 +166,36 @@ class DTELMPINN(BaseModel):
         self.W_out = None       # Output weights
         self.LH = None          # Precomputed L @ H
         self.BH = None          # Precomputed B @ H
+
+    def _check_domain_compatibility(self, task):
+        """
+        Check if task domain is compatible with spectral collocation.
+
+        Raises:
+            ValueError: If domain is not tensor-product (square, cube).
+        """
+        # Check if task has domain_type property
+        if not hasattr(task, 'domain_type'):
+            # If no domain_type property, assume compatible (legacy tasks)
+            return
+
+        domain_type = task.domain_type
+
+        if domain_type not in self.COMPATIBLE_DOMAINS:
+            task_name = getattr(task, 'name', 'unknown')
+            raise ValueError(
+                f"\n{'='*70}\n"
+                f"SPECTO-ELM (dt-elm-pinn) requires a TENSOR-PRODUCT domain\n"
+                f"(square, cube) for spectral collocation.\n"
+                f"\n"
+                f"Task '{task_name}' uses domain '{domain_type}' which is NOT supported.\n"
+                f"\n"
+                f"Alternatives:\n"
+                f"  - Use --model dt-pinn (RBF-FD discretization, works on any domain)\n"
+                f"  - Use --model vanilla-pinn (autodiff, works on any domain)\n"
+                f"  - Use a square/cube domain task (e.g., poisson-square-sin, laplace-square)\n"
+                f"{'='*70}"
+            )
 
     def _activation_fn(self, x: np.ndarray) -> np.ndarray:
         """Apply activation function."""

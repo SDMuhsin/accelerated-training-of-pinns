@@ -4,7 +4,7 @@ Base task interface and registry for PDE problems.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional, Any, Type
+from typing import Dict, Optional, Any, Type, Tuple
 import numpy as np
 import torch
 
@@ -146,6 +146,114 @@ class BaseTask(ABC):
     def get_default_args(cls) -> Dict[str, Any]:
         """Return default arguments for this task."""
         return {}
+
+    # =========================================================================
+    # Domain Properties (for discretization compatibility)
+    # =========================================================================
+
+    @property
+    def domain_type(self) -> str:
+        """
+        Return the domain type for this task.
+
+        Returns one of: 'disk', 'square', 'cube', 'lshape'
+
+        This is used by models to determine discretization compatibility:
+        - RBF-FD works on ANY domain
+        - Spectral collocation requires 'square' or 'cube' (tensor-product)
+
+        Subclasses MUST override this property.
+        """
+        raise NotImplementedError(
+            f"Task '{self.name}' must implement domain_type property. "
+            f"Return one of: 'disk', 'square', 'cube', 'lshape'"
+        )
+
+    @property
+    def is_tensor_product(self) -> bool:
+        """
+        Check if domain supports spectral methods.
+
+        Tensor-product domains (square, cube) can use spectral collocation.
+        Non-tensor-product domains (disk, lshape) require RBF-FD.
+        """
+        return self.domain_type in ('square', 'cube')
+
+    @property
+    def domain_bounds(self) -> Dict[str, Tuple[float, float]]:
+        """
+        Return domain bounds for each dimension.
+
+        Example for 2D: {'x': (0.0, 1.0), 'y': (0.0, 1.0)}
+        Example for 3D: {'x': (0.0, 1.0), 'y': (0.0, 1.0), 'z': (0.0, 1.0)}
+
+        Used by spectral discretizer to scale operators correctly.
+
+        Subclasses should override if not using default [0,1]^d domain.
+        """
+        dim = self.data.spatial_dim
+        if dim == 2:
+            return {'x': (0.0, 1.0), 'y': (0.0, 1.0)}
+        elif dim == 3:
+            return {'x': (0.0, 1.0), 'y': (0.0, 1.0), 'z': (0.0, 1.0)}
+        else:
+            raise ValueError(f"Unsupported dimension: {dim}")
+
+    # =========================================================================
+    # Point Evaluation Methods (for spectral discretizer)
+    # =========================================================================
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """
+        Evaluate source term f at arbitrary points.
+
+        Args:
+            X: Points to evaluate at (N, d)
+
+        Returns:
+            f: Source term values (N,)
+
+        Default: raises NotImplementedError. Override in subclasses
+        that support spectral discretization.
+        """
+        raise NotImplementedError(
+            f"Task '{self.name}' does not implement evaluate_source(). "
+            f"Required for spectral discretization."
+        )
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        """
+        Evaluate boundary condition g at arbitrary points.
+
+        Args:
+            X: Boundary points to evaluate at (N, d)
+
+        Returns:
+            g: Boundary condition values (N,)
+
+        Default: raises NotImplementedError. Override in subclasses.
+        """
+        raise NotImplementedError(
+            f"Task '{self.name}' does not implement evaluate_bc(). "
+            f"Required for spectral discretization."
+        )
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        """
+        Evaluate exact solution u_true at arbitrary points.
+
+        Args:
+            X: Points to evaluate at (N, d)
+
+        Returns:
+            u_true: Exact solution values (N,)
+
+        Default: raises NotImplementedError. Override in subclasses.
+        """
+        raise NotImplementedError(
+            f"Task '{self.name}' does not implement evaluate_exact(). "
+            f"Required for spectral discretization."
+        )
 
 
 class TaskRegistry:

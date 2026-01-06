@@ -1,5 +1,6 @@
 """
-DT-ELM-PINN Hybrid: Smart acceleration that picks the best backend.
+SPECTO-ELM Hybrid: Smart acceleration that picks the best backend.
+(Also known as DT-ELM-PINN Hybrid)
 
 Key insight from profiling:
 - On CPU: SciPy sparse×dense is FASTER than PyTorch
@@ -10,6 +11,9 @@ This implementation:
 1. Uses SciPy for sparse×dense (L @ H) on CPU
 2. Uses PyTorch for Cholesky solve when M > 200 (where it's faster)
 3. Uses full PyTorch on GPU
+
+IMPORTANT: Uses SPECTRAL COLLOCATION which requires TENSOR-PRODUCT domains
+(square, cube). For non-tensor-product domains (disk, L-shape), use DT-PINN.
 """
 
 import numpy as np
@@ -62,18 +66,24 @@ def _solve_lstsq_torch_cholesky(A: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 class DTELMPINNHybrid(BaseModel):
     """
-    Hybrid DT-ELM-PINN with smart backend selection.
+    Hybrid SPECTO-ELM / DT-ELM-PINN with smart backend selection.
 
     Uses:
     - SciPy for sparse×dense (faster on CPU)
     - PyTorch Cholesky when M > 200 features (4.4x faster on CPU)
     - Full PyTorch on GPU
+
+    IMPORTANT: Requires tensor-product domain (square, cube) for spectral collocation.
+    For disk or L-shaped domains, use DT-PINN (RBF-FD discretization) instead.
     """
 
     name = "dt-elm-pinn-hybrid"
 
     # Threshold: use PyTorch Cholesky when M > this value
     TORCH_CHOLESKY_THRESHOLD = 200
+
+    # Domain types compatible with spectral collocation
+    COMPATIBLE_DOMAINS = ('square', 'cube')
 
     def __init__(
         self,
@@ -87,6 +97,9 @@ class DTELMPINNHybrid(BaseModel):
         **kwargs
     ):
         super().__init__(task, **kwargs)
+
+        # Check domain compatibility for spectral collocation
+        self._check_domain_compatibility(task)
 
         self.hidden_sizes = hidden_sizes or [100]
         self.activation = activation
@@ -104,6 +117,34 @@ class DTELMPINNHybrid(BaseModel):
         # Decide if we should use PyTorch for Cholesky
         total_features = sum(self.hidden_sizes) if use_skip_connections else self.hidden_sizes[0]
         self.use_torch_cholesky = TORCH_AVAILABLE and total_features > self.TORCH_CHOLESKY_THRESHOLD
+
+    def _check_domain_compatibility(self, task):
+        """
+        Check if task domain is compatible with spectral collocation.
+
+        Raises:
+            ValueError: If domain is not tensor-product (square, cube).
+        """
+        if not hasattr(task, 'domain_type'):
+            return
+
+        domain_type = task.domain_type
+
+        if domain_type not in self.COMPATIBLE_DOMAINS:
+            task_name = getattr(task, 'name', 'unknown')
+            raise ValueError(
+                f"\n{'='*70}\n"
+                f"SPECTO-ELM (dt-elm-pinn-hybrid) requires a TENSOR-PRODUCT domain\n"
+                f"(square, cube) for spectral collocation.\n"
+                f"\n"
+                f"Task '{task_name}' uses domain '{domain_type}' which is NOT supported.\n"
+                f"\n"
+                f"Alternatives:\n"
+                f"  - Use --model dt-pinn (RBF-FD discretization, works on any domain)\n"
+                f"  - Use --model vanilla-pinn (autodiff, works on any domain)\n"
+                f"  - Use a square/cube domain task (e.g., poisson-square-sin, laplace-square)\n"
+                f"{'='*70}"
+            )
 
     def _activation_fn(self, x: np.ndarray) -> np.ndarray:
         if self.activation == 'tanh':

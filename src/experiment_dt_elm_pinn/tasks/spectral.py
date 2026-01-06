@@ -350,6 +350,26 @@ class SpectralPoissonSquareTask(BaseTask):
         """Poisson is a linear PDE."""
         return True
 
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """f = -2*pi^2 * sin(pi*x) * sin(pi*y)"""
+        return -2 * np.pi**2 * np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1])
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        """g = 0 (homogeneous Dirichlet)"""
+        return np.zeros(X.shape[0])
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        """u = sin(pi*x) * sin(pi*y)"""
+        return np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1])
+
 
 class SpectralLaplaceSquareTask(BaseTask):
     """
@@ -445,6 +465,23 @@ class SpectralLaplaceSquareTask(BaseTask):
     def is_linear(self) -> bool:
         return True
 
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])  # Laplace: f = 0
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X[:, 0], X[:, 1])
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X[:, 0], X[:, 1])
+
 
 class SpectralNonlinearPoissonSquareTask(BaseTask):
     """
@@ -536,6 +573,26 @@ class SpectralNonlinearPoissonSquareTask(BaseTask):
 
     def is_linear(self) -> bool:
         return False  # Nonlinear due to exp(u) term
+
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        """f = laplacian(u) - exp(u)"""
+        u = self.evaluate_exact(X)
+        lap_u = -2 * np.pi**2 * np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1])
+        return lap_u - np.exp(u)
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])  # Homogeneous Dirichlet
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1])
 
 
 # =============================================================================
@@ -762,6 +819,24 @@ class SpectralPoissonCubeTask(BaseTask):
     def is_linear(self) -> bool:
         return True
 
+    @property
+    def domain_type(self) -> str:
+        return 'cube'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range, 'z': self.z_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        u = self.evaluate_exact(X)
+        return -3 * np.pi**2 * u
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1]) * np.sin(np.pi * X[:, 2])
+
 
 class SpectralLaplaceCubeTask(BaseTask):
     """
@@ -838,6 +913,23 @@ class SpectralLaplaceCubeTask(BaseTask):
 
     def is_linear(self) -> bool:
         return True
+
+    @property
+    def domain_type(self) -> str:
+        return 'cube'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range, 'z': self.z_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])  # Laplace: f = 0
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
 
 
 class SpectralNonlinearPoissonCubeTask(BaseTask):
@@ -918,6 +1010,25 @@ class SpectralNonlinearPoissonCubeTask(BaseTask):
 
     def is_linear(self) -> bool:
         return False
+
+    @property
+    def domain_type(self) -> str:
+        return 'cube'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range, 'z': self.z_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        u = self.evaluate_exact(X)
+        lap_u = -3 * np.pi**2 * u
+        return lap_u - np.exp(u)
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return np.sin(np.pi * X[:, 0]) * np.sin(np.pi * X[:, 1]) * np.sin(np.pi * X[:, 2])
 
 
 # =============================================================================
@@ -1017,6 +1128,26 @@ class SpectralPoissonPeakedTask(BaseTask):
 
     def is_linear(self) -> bool:
         return True
+
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        r_squared = ((X[:, 0] - self.x0[0])**2 + (X[:, 1] - self.x0[1])**2)
+        A = 100.0
+        return -A * np.exp(-r_squared / (2 * self.sigma**2))
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(X.shape[0])
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        # No closed-form solution; return zeros (evaluation will use numerical solution)
+        return np.zeros(X.shape[0])
 
 
 class SpectralBoundaryLayerTask(BaseTask):
@@ -1129,6 +1260,23 @@ class SpectralBoundaryLayerTask(BaseTask):
     def is_linear(self) -> bool:
         return True
 
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        return self._compute_source(X)
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
+
 
 class SpectralPoissonCornerTask(BaseTask):
     """
@@ -1225,22 +1373,26 @@ class SpectralPoissonCornerTask(BaseTask):
     def is_linear(self) -> bool:
         return True
 
+    @property
+    def domain_type(self) -> str:
+        return 'square'
+
+    @property
+    def domain_bounds(self):
+        return {'x': self.x_range, 'y': self.y_range}
+
+    def evaluate_source(self, X: np.ndarray) -> np.ndarray:
+        # Source is computed numerically
+        return np.zeros(X.shape[0])
+
+    def evaluate_bc(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
+
+    def evaluate_exact(self, X: np.ndarray) -> np.ndarray:
+        return self._true_solution(X)
+
 
 # =============================================================================
-# Register all spectral tasks
+# Task Registration moved to tasks/__init__.py
+# Old spectral-prefixed names are deprecated in favor of domain-based names
 # =============================================================================
-
-# 2D Smooth Tasks (existing)
-TaskRegistry.register("spectral-poisson-square", SpectralPoissonSquareTask)
-TaskRegistry.register("spectral-laplace-square", SpectralLaplaceSquareTask)
-TaskRegistry.register("spectral-nonlinear-poisson-square", SpectralNonlinearPoissonSquareTask)
-
-# 3D Tasks
-TaskRegistry.register("spectral-poisson-cube", SpectralPoissonCubeTask)
-TaskRegistry.register("spectral-laplace-cube", SpectralLaplaceCubeTask)
-TaskRegistry.register("spectral-nonlinear-poisson-cube", SpectralNonlinearPoissonCubeTask)
-
-# 2D Localized Feature Tasks
-TaskRegistry.register("spectral-poisson-peaked", SpectralPoissonPeakedTask)
-TaskRegistry.register("spectral-boundary-layer", SpectralBoundaryLayerTask)
-TaskRegistry.register("spectral-poisson-corner", SpectralPoissonCornerTask)

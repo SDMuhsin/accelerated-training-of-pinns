@@ -165,3 +165,22 @@ class NonlinearPoissonTask(BaseTask):
     def list_available_sizes(cls) -> list:
         """List available problem sizes."""
         return [582, 828, 1663, 2236, 3196, 4977, 6114, 8767, 19638]
+
+    # =========================================================================
+    # Domain Properties (required for discretization compatibility)
+    # =========================================================================
+
+    @property
+    def domain_type(self) -> str:
+        """L-shaped domain - not tensor-product, requires RBF-FD."""
+        return 'lshape'
+
+    @property
+    def domain_bounds(self):
+        """Approximate bounding box for L-shaped domain."""
+        # L-shaped domain is typically subset of [-1, 1]^2
+        return {'x': (-1.0, 1.0), 'y': (-1.0, 1.0)}
+
+    def is_linear(self) -> bool:
+        """Nonlinear PDE (has exp(u) term)."""
+        return False

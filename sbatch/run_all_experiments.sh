@@ -1,84 +1,75 @@
 #!/bin/bash
 
 echo "========================================================================"
-echo "COMPREHENSIVE BENCHMARK: All Models × All Tasks"
+echo "COMPREHENSIVE BENCHMARK: All Models × Square Domain Tasks"
 echo "========================================================================"
 echo ""
-echo "This script runs all available models on all available tasks."
+echo "This script runs all available models on square domain tasks"
+echo "(compatible with ALL methods: SPECTO-ELM, DT-PINN, VanillaPINN, PIELM, DAS)"
 echo "Results are saved to ./results/experiments.csv"
 echo ""
 
 # ============================================================================
-# TASK DEFINITIONS
+# TASK DEFINITIONS - Square domain only (compatible with ALL methods)
 # ============================================================================
 
-# RBF-FD Tasks (scattered points, various domains)
-rbf_tasks=(
-    poisson-rbf-fd
-    nonlinear-poisson
-    nonlinear-poisson-rbf-fd
-    poisson-disk-sin
-    poisson-disk-quadratic
-    poisson-square-constant
-    poisson-square-sin
-    nonlinear-poisson-disk-sin
-    nonlinear-poisson-square-constant
-    nonlinear-poisson-square-sin
-    laplace-disk
-    laplace-square
-    heat-equation
-    heat-fast-decay
-)
+# Square domain tasks support:
+# - SPECTO-ELM (spectral collocation - requires tensor-product domain)
+# - DT-PINN (RBF-FD discretization)
+# - VanillaPINN (autodiff)
+# - PIELM (point collocation)
+# - DAS (adaptive sampling)
+# - RoPINN (region-optimized)
 
-# Spectral Tasks - 2D Smooth (Chebyshev collocation)
-spectral_2d_smooth=(
-    spectral-poisson-square
-    spectral-laplace-square
-    spectral-nonlinear-poisson-square
-)
+square_tasks=(
+    # Linear Poisson
+    poisson-square-constant          # constant source
+    poisson-square-sin               # sinusoidal source
 
-# Spectral Tasks - 3D (test scalability)
-spectral_3d=(
-    spectral-poisson-cube
-    spectral-laplace-cube
-    spectral-nonlinear-poisson-cube
-)
+    # Laplace
+    #laplace-square                   # homogeneous Laplace
 
-# Spectral Tasks - Localized Features (favor adaptive methods)
-spectral_localized=(
-    spectral-poisson-peaked
-    spectral-boundary-layer
-    spectral-poisson-corner
-)
+    # Nonlinear Poisson (exp(u) nonlinearity)
+    #nonlinear-poisson-square         # standard nonlinear
+    #nonlinear-poisson-square-constant  # constant source variant
+    #nonlinear-poisson-square-sin     # sin source variant
 
-# Combine all tasks
-all_tasks=(
-    "${rbf_tasks[@]}"
-    "${spectral_2d_smooth[@]}"
-    "${spectral_3d[@]}"
-    "${spectral_localized[@]}"
+    # Heat equation (time-dependent)
+    #heat-equation                    # standard heat diffusion
+    #heat-fast-decay                  # fast decay variant
+
+    # Localized features (challenging for spectral)
+    #poisson-peaked                   # peaked Gaussian source
+    #boundary-layer                   # sharp boundary gradient
+    #poisson-corner                   # corner singularity
 )
 
 # ============================================================================
 # MODEL DEFINITIONS
 # ============================================================================
 
-# SPECTO-ELM variants (CPU, very fast)
+# SPECTO-ELM variants (CPU, very fast, spectral collocation)
 specto_elm_models=(
-    dt-elm-pinn          # Single-pass (linear tasks only)
-    dt-elm-pinn-deep2    # 2 iterations
-    dt-elm-pinn-deep3    # 3 iterations
-    dt-elm-pinn-deep4    # 4 iterations (recommended for nonlinear)
+    dt-elm-pinn          # Single layer [100]
+    dt-elm-pinn-deep2    # 2 layers with skip connections
+    dt-elm-pinn-deep3    # 3 layers with skip connections
+    dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
 )
 
-# Other ELM baselines (CPU)
+# DT-PINN (CPU, RBF-FD discretization)
+dt_pinn_models=(
+    dt-pinn              # RBF-FD based PINN
+)
+
+# ELM baselines (CPU, fast)
 elm_baselines=(
     pielm                # Physics-Informed ELM
+    elm                  # Standard ELM baseline
 )
 
-# Gradient-based methods (GPU recommended)
+# Gradient-based PINN methods (GPU recommended)
 pinn_models=(
-    vanilla-pinn         # Standard PINN
+    vanilla-pinn         # Standard PINN with autodiff
 )
 
 # Advanced PINN methods (GPU required)
@@ -109,6 +100,9 @@ PINN_EPOCHS=2000
 # RoPINN settings
 ROPINN_EPOCHS=1000
 
+# DT-PINN settings
+DT_PINN_EPOCHS=500
+
 # Create logs and results directories
 mkdir -p ./logs
 mkdir -p ./results/by_task
@@ -123,7 +117,7 @@ echo "=============================================="
 echo "Section 1: SPECTO-ELM Jobs (CPU)"
 echo "=============================================="
 
-for task in "${all_tasks[@]}"; do
+for task in "${square_tasks[@]}"; do
     csv_file="./results/by_task/${task}.csv"
 
     for model in "${specto_elm_models[@]}"; do
@@ -167,14 +161,66 @@ for task in "${all_tasks[@]}"; do
 done
 
 # ============================================================================
-# SECTION 2: PIELM JOBS (CPU)
+# SECTION 2: DT-PINN JOBS (CPU)
 # ============================================================================
 echo ""
 echo "=============================================="
-echo "Section 2: PIELM Jobs (CPU)"
+echo "Section 2: DT-PINN Jobs (CPU)"
 echo "=============================================="
 
-for task in "${all_tasks[@]}"; do
+for task in "${square_tasks[@]}"; do
+    csv_file="./results/by_task/${task}.csv"
+
+    for model in "${dt_pinn_models[@]}"; do
+        for seed in "${seeds[@]}"; do
+            job_name="${model}_${task}_s${seed}"
+            log_file="./logs/${job_name}"
+
+            echo "Submitting: $job_name"
+            sbatch \
+                --nodes=1 \
+                --ntasks-per-node=1 \
+                --cpus-per-task=4 \
+                --mem=16000M \
+                --time=$CPU_TIME \
+                --output=${log_file}-%N-%j.out \
+                --error=${log_file}-%N-%j.err \
+                --wrap="
+                    module load scipy-stack
+                    module load arrow
+                    source ./env/bin/activate
+                    echo '========================================'
+                    echo 'Job: $job_name'
+                    echo 'Model: DT-PINN (RBF-FD)'
+                    echo 'Task: $task'
+                    echo 'Started: '\$(date)
+                    echo '========================================'
+                    export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                    python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                        --task=$task \
+                        --model=$model \
+                        --seed=$seed \
+                        --epochs=$DT_PINN_EPOCHS \
+                        --csv-output=$csv_file \
+                        --verbose
+                    echo '========================================'
+                    echo 'Finished: '\$(date)
+                    echo '========================================'
+                "
+            ((job_count++))
+        done
+    done
+done
+
+# ============================================================================
+# SECTION 3: PIELM/ELM JOBS (CPU)
+# ============================================================================
+echo ""
+echo "=============================================="
+echo "Section 3: PIELM/ELM Jobs (CPU)"
+echo "=============================================="
+
+for task in "${square_tasks[@]}"; do
     csv_file="./results/by_task/${task}.csv"
 
     for model in "${elm_baselines[@]}"; do
@@ -218,14 +264,14 @@ for task in "${all_tasks[@]}"; do
 done
 
 # ============================================================================
-# SECTION 3: VANILLA PINN JOBS (GPU)
+# SECTION 4: VANILLA PINN JOBS (GPU)
 # ============================================================================
 echo ""
 echo "=============================================="
-echo "Section 3: Vanilla PINN Jobs (GPU)"
+echo "Section 4: Vanilla PINN Jobs (GPU)"
 echo "=============================================="
 
-for task in "${all_tasks[@]}"; do
+for task in "${square_tasks[@]}"; do
     csv_file="./results/by_task/${task}.csv"
 
     for model in "${pinn_models[@]}"; do
@@ -272,14 +318,14 @@ for task in "${all_tasks[@]}"; do
 done
 
 # ============================================================================
-# SECTION 4: RoPINN JOBS (GPU)
+# SECTION 5: RoPINN JOBS (GPU)
 # ============================================================================
 echo ""
 echo "=============================================="
-echo "Section 4: RoPINN Jobs (GPU)"
+echo "Section 5: RoPINN Jobs (GPU)"
 echo "=============================================="
 
-for task in "${all_tasks[@]}"; do
+for task in "${square_tasks[@]}"; do
     csv_file="./results/by_task/${task}.csv"
 
     for seed in "${seeds[@]}"; do
@@ -324,14 +370,14 @@ for task in "${all_tasks[@]}"; do
 done
 
 # ============================================================================
-# SECTION 5: DAS JOBS (GPU)
+# SECTION 6: DAS JOBS (GPU)
 # ============================================================================
 echo ""
 echo "=============================================="
-echo "Section 5: DAS Jobs (GPU)"
+echo "Section 6: DAS Jobs (GPU)"
 echo "=============================================="
 
-for task in "${all_tasks[@]}"; do
+for task in "${square_tasks[@]}"; do
     csv_file="./results/by_task/${task}.csv"
 
     for seed in "${seeds[@]}"; do
@@ -387,32 +433,40 @@ echo "========================================================================"
 echo "ALL JOBS SUBMITTED"
 echo "========================================================================"
 echo ""
-echo "TASK SUMMARY:"
-echo "  RBF-FD Tasks:           ${#rbf_tasks[@]}"
-echo "  Spectral 2D Smooth:     ${#spectral_2d_smooth[@]}"
-echo "  Spectral 3D:            ${#spectral_3d[@]}"
-echo "  Spectral Localized:     ${#spectral_localized[@]}"
-echo "  ─────────────────────────────"
-echo "  TOTAL TASKS:            ${#all_tasks[@]}"
+echo "TASKS (${#square_tasks[@]} square domain tasks compatible with ALL methods):"
+echo "  Linear Poisson:"
+echo "    - poisson-square-constant"
+echo "    - poisson-square-sin"
+echo "  Laplace:"
+echo "    - laplace-square"
+echo "  Nonlinear Poisson:"
+echo "    - nonlinear-poisson-square"
+echo "    - nonlinear-poisson-square-constant"
+echo "    - nonlinear-poisson-square-sin"
+echo "  Heat Equation:"
+echo "    - heat-equation"
+echo "    - heat-fast-decay"
+echo "  Localized Features:"
+echo "    - poisson-peaked"
+echo "    - boundary-layer"
+echo "    - poisson-corner"
 echo ""
-echo "MODEL SUMMARY:"
-echo "  SPECTO-ELM variants:    ${#specto_elm_models[@]} (dt-elm-pinn, deep2, deep3, deep4)"
-echo "  ELM baselines:          ${#elm_baselines[@]} (pielm)"
-echo "  Vanilla PINN:           ${#pinn_models[@]}"
-echo "  RoPINN:                 1"
-echo "  DAS:                    1"
+echo "MODELS:"
+echo "  SPECTO-ELM (CPU):     ${#specto_elm_models[@]} variants (dt-elm-pinn, deep2, deep3, deep4)"
+echo "  DT-PINN (CPU):        ${#dt_pinn_models[@]} (RBF-FD discretization)"
+echo "  ELM baselines (CPU):  ${#elm_baselines[@]} (pielm, elm)"
+echo "  Vanilla PINN (GPU):   ${#pinn_models[@]}"
+echo "  RoPINN (GPU):         1"
+echo "  DAS (GPU):            1"
 echo "  ─────────────────────────────"
-echo "  TOTAL MODELS:           $((${#specto_elm_models[@]} + ${#elm_baselines[@]} + ${#pinn_models[@]} + 2))"
+n_models=$((${#specto_elm_models[@]} + ${#dt_pinn_models[@]} + ${#elm_baselines[@]} + ${#pinn_models[@]} + 2))
+echo "  TOTAL MODELS:         $n_models"
 echo ""
 echo "SEEDS: ${seeds[@]}"
 echo ""
 echo "TOTAL JOBS SUBMITTED: $job_count"
 echo ""
-echo "OUTPUT STRUCTURE:"
+echo "OUTPUT:"
 echo "  Results saved to task-specific CSVs in ./results/by_task/"
-echo "  Each task gets its own CSV file, e.g.:"
-echo "    ./results/by_task/spectral-poisson-square.csv"
-echo "    ./results/by_task/laplace-disk.csv"
-echo "    ./results/by_task/spectral-poisson-cube.csv"
-echo "    ..."
+echo "  Logs saved to ./logs/"
 echo "========================================================================"

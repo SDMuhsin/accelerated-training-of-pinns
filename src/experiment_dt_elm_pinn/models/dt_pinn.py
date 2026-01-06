@@ -1,8 +1,18 @@
 """
 DT-PINN: Discrete-Trained Physics-Informed Neural Network
 
-Uses precomputed RBF-FD sparse operators (L, B) instead of autodiff.
+Uses RBF-FD (Radial Basis Function - Finite Difference) discretization.
+Sparse operators (L, B) replace autodiff for computing spatial derivatives.
 Gradient-based training (L-BFGS or Adam) optimizes network parameters.
+
+Key properties:
+- Works on ANY domain geometry (disk, square, L-shape, etc.)
+- Uses task-provided discrete operators from RBF-FD or similar methods
+- Network predicts u values at collocation points
+- Spatial derivatives computed via sparse matrix-vector products
+
+For tensor-product domains (square, cube), consider SPECTO-ELM which uses
+spectral collocation for potentially higher accuracy.
 """
 
 import numpy as np
