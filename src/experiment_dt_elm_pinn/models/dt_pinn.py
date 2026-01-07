@@ -279,6 +279,8 @@ class DTPINN(BaseModel):
         except ImportError:
             print("CuPy not available, falling back to CPU")
             self.use_cuda = False
+            self.device = torch.device('cpu')
+            self.network = self.network.to(self.device)
             self._setup_cpu_operators_from_scipy(precision)
 
     def _sparse_matmul(self, sparse_mat, tensor, sparse_t=None, use_torch_sparse=None):

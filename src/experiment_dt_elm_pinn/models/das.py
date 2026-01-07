@@ -99,7 +99,10 @@ class DAS(BaseModel):
         flow_epochs: int = 200,
         max_stage: int = 5,
         lr: float = 1e-3,
-        lambda_bd: float = 1.0,
+        # NOTE: lambda_bd=10 is critical for proper BC enforcement.
+        # With lambda_bd=1, PDE loss dominates and BC error remains high (~10%).
+        # See llmdocs/trackers/anomaly_analysis_2026-01-07.md for analysis.
+        lambda_bd: float = 10.0,
         tol: float = 1e-7,
         # DAS-specific options
         quantity_type: str = 'residual',  # 'residual' or 'slope'
@@ -640,7 +643,7 @@ class DAS(BaseModel):
             'flow_epochs': 3000,
             'max_stage': 5,
             'lr': 1e-4,
-            'lambda_bd': 1.0,
+            'lambda_bd': 10.0,
             'tol': 1e-7,
             'quantity_type': 'residual',
             'replace_all': False,
