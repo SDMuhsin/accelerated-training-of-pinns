@@ -58,23 +58,23 @@ specto_elm_models=(
 
 # DT-PINN (CPU, RBF-FD discretization)
 dt_pinn_models=(
-    dt-pinn              # RBF-FD based PINN
+    #dt-pinn              # RBF-FD based PINN
 )
 
 # ELM baselines (CPU, fast)
 elm_baselines=(
-    pielm                # Physics-Informed ELM
-    elm                  # Standard ELM baseline
+    #pielm                # Physics-Informed ELM
+    #elm                  # Standard ELM baseline
 )
 
 # Gradient-based PINN methods (GPU recommended)
 pinn_models=(
-    vanilla-pinn         # Standard PINN with autodiff
+    #vanilla-pinn         # Standard PINN with autodiff
 )
 
 # Advanced PINN methods (GPU required)
 advanced_pinn_models=(
-    ropinn               # Region-Optimized PINN
+    #ropinn               # Region-Optimized PINN
     das                  # Deep Adaptive Sampling
 )
 
