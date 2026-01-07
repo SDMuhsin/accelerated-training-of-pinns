@@ -50,10 +50,10 @@ square_tasks=(
 
 # SPECTO-ELM variants (CPU, very fast, spectral collocation)
 specto_elm_models=(
-    dt-elm-pinn          # Single layer [100]
-    dt-elm-pinn-deep2    # 2 layers with skip connections
-    dt-elm-pinn-deep3    # 3 layers with skip connections
-    dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
+    #dt-elm-pinn          # Single layer [100]
+    #dt-elm-pinn-deep2    # 2 layers with skip connections
+    #dt-elm-pinn-deep3    # 3 layers with skip connections
+    #dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
 )
 
 # DT-PINN (CPU, RBF-FD discretization)
