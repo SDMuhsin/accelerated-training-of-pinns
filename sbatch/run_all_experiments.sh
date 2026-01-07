@@ -27,7 +27,7 @@ square_tasks=(
     poisson-square-sin               # sinusoidal source
 
     # Laplace
-    #laplace-square                   # homogeneous Laplace
+    laplace-square                   # homogeneous Laplace
 
     # Nonlinear Poisson (exp(u) nonlinearity)
     #nonlinear-poisson-square         # standard nonlinear
@@ -35,8 +35,8 @@ square_tasks=(
     #nonlinear-poisson-square-sin     # sin source variant
 
     # Heat equation (time-dependent)
-    #heat-equation                    # standard heat diffusion
-    #heat-fast-decay                  # fast decay variant
+    heat-equation                    # standard heat diffusion
+    heat-fast-decay                  # fast decay variant
 
     # Localized features (challenging for spectral)
     #poisson-peaked                   # peaked Gaussian source
@@ -50,10 +50,10 @@ square_tasks=(
 
 # SPECTO-ELM variants (CPU, very fast, spectral collocation)
 specto_elm_models=(
-    #dt-elm-pinn          # Single layer [100]
-    #dt-elm-pinn-deep2    # 2 layers with skip connections
-    #dt-elm-pinn-deep3    # 3 layers with skip connections
-    #dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
+    dt-elm-pinn          # Single layer [100]
+    dt-elm-pinn-deep2    # 2 layers with skip connections
+    dt-elm-pinn-deep3    # 3 layers with skip connections
+    dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
 )
 
 # DT-PINN (GPU, RBF-FD discretization + CuPy sparse ops)
@@ -63,18 +63,18 @@ dt_pinn_models=(
 
 # ELM baselines (CPU, fast)
 elm_baselines=(
-    #pielm                # Physics-Informed ELM
-    #elm                  # Standard ELM baseline
+    pielm                # Physics-Informed ELM
+    elm                  # Standard ELM baseline
 )
 
 # Gradient-based PINN methods (GPU recommended)
 pinn_models=(
-    #vanilla-pinn         # Standard PINN with autodiff
+    vanilla-pinn         # Standard PINN with autodiff
 )
 
 # Advanced PINN methods (GPU required)
 advanced_pinn_models=(
-    #ropinn               # Region-Optimized PINN
+    ropinn               # Region-Optimized PINN
     das                  # Deep Adaptive Sampling
 )
 
@@ -90,7 +90,7 @@ GPU_TIME="0-06:00:00"    # 6 hours for GPU jobs
 
 # DAS hyperparameters
 DAS_MAX_STAGE=5
-DAS_PDE_EPOCHS=500       # Increased from 200 for better convergence on complex tasks
+DAS_PDE_EPOCHS=1000      # Increased from 500 for complex tasks (sin, peaked, etc.)
 DAS_FLOW_EPOCHS=200
 DAS_N_TRAIN=1000
 
