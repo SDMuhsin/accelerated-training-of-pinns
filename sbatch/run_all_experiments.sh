@@ -56,9 +56,9 @@ specto_elm_models=(
     #dt-elm-pinn-deep4    # 4 layers with skip connections (best for nonlinear)
 )
 
-# DT-PINN (CPU, RBF-FD discretization)
+# DT-PINN (GPU, RBF-FD discretization + CuPy sparse ops)
 dt_pinn_models=(
-    #dt-pinn              # RBF-FD based PINN
+    dt-pinn              # RBF-FD based PINN
 )
 
 # ELM baselines (CPU, fast)
@@ -90,7 +90,7 @@ GPU_TIME="0-06:00:00"    # 6 hours for GPU jobs
 
 # DAS hyperparameters
 DAS_MAX_STAGE=5
-DAS_PDE_EPOCHS=200
+DAS_PDE_EPOCHS=500       # Increased from 200 for better convergence on complex tasks
 DAS_FLOW_EPOCHS=200
 DAS_N_TRAIN=1000
 
@@ -161,11 +161,11 @@ for task in "${square_tasks[@]}"; do
 done
 
 # ============================================================================
-# SECTION 2: DT-PINN JOBS (CPU)
+# SECTION 2: DT-PINN JOBS (GPU)
 # ============================================================================
 echo ""
 echo "=============================================="
-echo "Section 2: DT-PINN Jobs (CPU)"
+echo "Section 2: DT-PINN Jobs (GPU)"
 echo "=============================================="
 
 for task in "${square_tasks[@]}"; do
@@ -173,28 +173,30 @@ for task in "${square_tasks[@]}"; do
 
     for model in "${dt_pinn_models[@]}"; do
         for seed in "${seeds[@]}"; do
-            job_name="${model}_${task}_s${seed}"
+            job_name="${model}_${task}_s${seed}_gpu"
             log_file="./logs/${job_name}"
 
             echo "Submitting: $job_name"
             sbatch \
                 --nodes=1 \
                 --ntasks-per-node=1 \
-                --cpus-per-task=4 \
+                --cpus-per-task=2 \
+                --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 \
                 --mem=16000M \
-                --time=$CPU_TIME \
+                --time=$GPU_TIME \
                 --output=${log_file}-%N-%j.out \
                 --error=${log_file}-%N-%j.err \
                 --wrap="
-                    module load scipy-stack
+                    module load scipy-stack cuda cudnn
                     module load arrow
                     source ./env/bin/activate
                     echo '========================================'
                     echo 'Job: $job_name'
-                    echo 'Model: DT-PINN (RBF-FD)'
+                    echo 'Model: DT-PINN (RBF-FD + GPU)'
                     echo 'Task: $task'
                     echo 'Started: '\$(date)
                     echo '========================================'
+                    nvidia-smi
                     export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
                     python3 -m src.experiment_dt_elm_pinn.train_pinn \
                         --task=$task \
@@ -453,11 +455,11 @@ echo "    - poisson-corner"
 echo ""
 echo "MODELS:"
 echo "  SPECTO-ELM (CPU):     ${#specto_elm_models[@]} variants (dt-elm-pinn, deep2, deep3, deep4)"
-echo "  DT-PINN (CPU):        ${#dt_pinn_models[@]} (RBF-FD discretization)"
+echo "  DT-PINN (GPU):        ${#dt_pinn_models[@]} (RBF-FD discretization + CuPy)"
 echo "  ELM baselines (CPU):  ${#elm_baselines[@]} (pielm, elm)"
 echo "  Vanilla PINN (GPU):   ${#pinn_models[@]}"
 echo "  RoPINN (GPU):         1"
-echo "  DAS (GPU):            1"
+echo "  DAS (GPU):            1 (pde_epochs=$DAS_PDE_EPOCHS)"
 echo "  ─────────────────────────────"
 n_models=$((${#specto_elm_models[@]} + ${#dt_pinn_models[@]} + ${#elm_baselines[@]} + ${#pinn_models[@]} + 2))
 echo "  TOTAL MODELS:         $n_models"
