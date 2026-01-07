@@ -143,8 +143,8 @@ Examples:
                         help='DAS: Quantity for adaptivity (default: residual)')
     parser.add_argument('--das-replace-all', action='store_true',
                         help='DAS: Replace all samples each stage (DAS-R mode)')
-    parser.add_argument('--das-lambda-bd', type=float, default=1.0,
-                        help='DAS: Boundary condition loss weight (default: 1.0)')
+    parser.add_argument('--das-lambda-bd', type=float, default=10.0,
+                        help='DAS: Boundary condition loss weight (default: 10.0)')
     parser.add_argument('--das-tol', type=float, default=1e-7,
                         help='DAS: Convergence tolerance (default: 1e-7)')
 
