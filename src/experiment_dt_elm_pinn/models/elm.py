@@ -50,6 +50,10 @@ class ELM(BaseModel):
         """
         super().__init__(task, **kwargs)
 
+        # ELM only supports 2nd order PDEs (Laplacian)
+        # Analytical derivatives for higher orders are complex
+        self._check_pde_order(task)
+
         self.hidden_sizes = hidden_sizes or [100]
         self.activation = activation
         self.max_iter = max_iter
@@ -62,6 +66,30 @@ class ELM(BaseModel):
         self.b_in = []  # Biases for each layer
         self.W_out = None
         self.device = None
+
+    def _check_pde_order(self, task):
+        """Check that PDE order and type are supported."""
+        pde_order = getattr(task, 'pde_order', 2)
+        if pde_order != 2:
+            raise ValueError(
+                f"ELM only supports 2nd order PDEs (Laplacian).\n"
+                f"Task '{task.name}' requires {pde_order}th order derivatives.\n"
+                f"For higher-order PDEs like biharmonic, use:\n"
+                f"  --model vanilla-pinn (autodiff, any order)\n"
+                f"  --model dt-elm-pinn (spectral, any order on square/cube)"
+            )
+
+        # ELM only supports steady-state elliptic PDEs (Poisson-type)
+        # It cannot handle time-dependent PDEs like heat equation
+        task_name = task.name.lower()
+        if 'heat' in task_name or 'wave' in task_name or 'advection' in task_name:
+            raise ValueError(
+                f"ELM only supports steady-state elliptic PDEs (Poisson/Laplace).\n"
+                f"Task '{task.name}' is time-dependent.\n"
+                f"For time-dependent PDEs, use:\n"
+                f"  --model vanilla-pinn (autodiff)\n"
+                f"  --model dt-pinn (RBF-FD)"
+            )
 
     def _activation_fn(self, x: torch.Tensor) -> torch.Tensor:
         """Apply activation function."""
@@ -218,57 +246,80 @@ class ELM(BaseModel):
         # Compute Laplacian of hidden features on interior
         LapH_interior = self._compute_laplacian(X_interior)  # (N_interior, total_features)
 
-        # For nonlinear Poisson: ∇²u = f + exp(u)
-        # Linearize around current solution: ∇²u - exp(u) = f
-        # Newton: J @ delta_W = -F where J = ∇²H - diag(exp(u)) @ H
-
-        # Initial solve (assume exp(u) ≈ 1)
-        A_pde = LapH_interior
-        A_bc = H_boundary
-        A = torch.cat([A_pde, A_bc], dim=0)
-        b = torch.cat([f_interior + 1.0, g], dim=0)
-
-        # Solve initial system
-        W_out, *_ = torch.linalg.lstsq(A, b.unsqueeze(1))
-        self.W_out = W_out.squeeze()
-
-        # Compute initial u
-        u_interior = H_interior @ self.W_out
-        u_boundary = H_boundary @ self.W_out
+        # Check if task is linear (no exp(u) term)
+        is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         residual_history = []
 
-        # Newton iterations
-        for k in range(self.max_iter):
-            # Compute residuals
-            Lu = LapH_interior @ self.W_out
-            exp_u = torch.exp(u_interior)
-            F_pde = Lu - f_interior - exp_u
-            F_bc = u_boundary - g
+        if is_linear:
+            # Linear Poisson: ∇²u = f
+            # Direct solve: [LapH; H_bc] @ W = [f; g]
+            A = torch.cat([LapH_interior, H_boundary], dim=0)
+            b = torch.cat([f_interior, g], dim=0)
 
+            W_out, *_ = torch.linalg.lstsq(A, b.unsqueeze(1))
+            self.W_out = W_out.squeeze()
+
+            # Compute residual for logging
+            Lu = LapH_interior @ self.W_out
+            u_boundary = H_boundary @ self.W_out
+            F_pde = Lu - f_interior
+            F_bc = u_boundary - g
             residual = torch.sqrt(torch.mean(F_pde**2) + torch.mean(F_bc**2)).item()
             residual_history.append(residual)
 
-            if verbose and (k < 5 or k % 5 == 0):
-                print(f"  Newton iter {k}: residual = {residual:.4e}")
+            if verbose:
+                print(f"  Linear PDE: direct solve, residual = {residual:.4e}")
+        else:
+            # Nonlinear Poisson: ∇²u = f + exp(u)
+            # Linearize around current solution: ∇²u - exp(u) = f
+            # Newton: J @ delta_W = -F where J = ∇²H - diag(exp(u)) @ H
 
-            if residual < self.tol:
-                if verbose:
-                    print(f"  Converged at iteration {k+1}")
-                break
+            # Initial solve (assume exp(u) ≈ 1)
+            A_pde = LapH_interior
+            A_bc = H_boundary
+            A = torch.cat([A_pde, A_bc], dim=0)
+            b = torch.cat([f_interior + 1.0, g], dim=0)
 
-            # Form Jacobian: J = LapH - diag(exp(u)) @ H
-            JH = LapH_interior - exp_u.unsqueeze(1) * H_interior
+            # Solve initial system
+            W_out, *_ = torch.linalg.lstsq(A, b.unsqueeze(1))
+            self.W_out = W_out.squeeze()
 
-            # System: [JH; H_bc] @ delta_W = -[F_pde; F_bc]
-            A = torch.cat([JH, H_boundary], dim=0)
-            F = torch.cat([-F_pde, -F_bc], dim=0)
-
-            delta_W, *_ = torch.linalg.lstsq(A, F.unsqueeze(1))
-            self.W_out = self.W_out + delta_W.squeeze()
-
+            # Compute initial u
             u_interior = H_interior @ self.W_out
             u_boundary = H_boundary @ self.W_out
+
+            # Newton iterations
+            for k in range(self.max_iter):
+                # Compute residuals
+                Lu = LapH_interior @ self.W_out
+                exp_u = torch.exp(torch.clamp(u_interior, max=50.0))  # Clamp to prevent overflow
+                F_pde = Lu - f_interior - exp_u
+                F_bc = u_boundary - g
+
+                residual = torch.sqrt(torch.mean(F_pde**2) + torch.mean(F_bc**2)).item()
+                residual_history.append(residual)
+
+                if verbose and (k < 5 or k % 5 == 0):
+                    print(f"  Newton iter {k}: residual = {residual:.4e}")
+
+                if residual < self.tol:
+                    if verbose:
+                        print(f"  Converged at iteration {k+1}")
+                    break
+
+                # Form Jacobian: J = LapH - diag(exp(u)) @ H
+                JH = LapH_interior - exp_u.unsqueeze(1) * H_interior
+
+                # System: [JH; H_bc] @ delta_W = -[F_pde; F_bc]
+                A = torch.cat([JH, H_boundary], dim=0)
+                F = torch.cat([-F_pde, -F_bc], dim=0)
+
+                delta_W, *_ = torch.linalg.lstsq(A, F.unsqueeze(1))
+                self.W_out = self.W_out + delta_W.squeeze()
+
+                u_interior = H_interior @ self.W_out
+                u_boundary = H_boundary @ self.W_out
 
         train_time = time.perf_counter() - start_time
 

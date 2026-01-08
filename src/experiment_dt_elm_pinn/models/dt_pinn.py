@@ -186,11 +186,28 @@ class DTPINN(BaseModel):
 
         # Identify well-conditioned interior rows (filter out ill-conditioned stencils)
         # This is critical for RBF-FD: near-boundary stencils can have extreme weights
-        L_dense = self.L.toarray()
-        row_max_abs = np.abs(L_dense[:N_interior]).max(axis=1)
-        weight_threshold = 1e4  # Rows with weights larger than this are ill-conditioned
+        # IMPORTANT: Use L_pde (not L) because for biharmonic, L² has much larger weights
+        L_pde_dense = self.L_pde.toarray()
+        row_max_abs = np.abs(L_pde_dense[:N_interior]).max(axis=1)
+        # For 4th order PDEs, use much higher threshold since L² amplifies weights exponentially
+        # L weights can reach 1e19 near boundaries, L² can reach 1e26
+        weight_threshold = 1e4 if self.pde_order == 2 else 1e10
         self.valid_interior_mask = row_max_abs < weight_threshold
         self.N_valid_interior = self.valid_interior_mask.sum()
+
+        if self.N_valid_interior < N_interior * 0.5:
+            import warnings
+            warnings.warn(
+                f"Only {self.N_valid_interior}/{N_interior} interior points have well-conditioned "
+                f"stencils for {self.pde_order}th order PDE. Consider using more interior points "
+                f"or a different method (e.g., dt-elm-pinn for spectral discretization)."
+            )
+        elif self.pde_order == 4:
+            import warnings
+            warnings.warn(
+                f"RBF-FD is not well-suited for 4th order PDEs like biharmonic. "
+                f"Consider using dt-elm-pinn with spectral discretization for better accuracy."
+            )
 
         # Build X_full: [interior, boundary, ghost]
         if self.X_ghost is not None and len(self.X_ghost) > 0:

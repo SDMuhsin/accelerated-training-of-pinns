@@ -161,6 +161,20 @@ class RoPINN(BaseModel):
 
         return laplacian
 
+    def _compute_biharmonic(self, u: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        """
+        Compute biharmonic operator nabla^4 u = nabla^2(nabla^2 u) using autodiff.
+
+        For 2D: nabla^4 u = d^4u/dx^4 + 2*d^4u/dx^2dy^2 + d^4u/dy^4
+        """
+        # Compute Laplacian first
+        laplacian_u = self._compute_laplacian(u, X)
+
+        # Compute Laplacian of the Laplacian
+        biharmonic = self._compute_laplacian(laplacian_u, X)
+
+        return biharmonic
+
     def _compute_robin_bc(self, u: torch.Tensor, X_b: torch.Tensor,
                           alpha: torch.Tensor, beta: torch.Tensor,
                           n: torch.Tensor) -> torch.Tensor:
@@ -245,6 +259,9 @@ class RoPINN(BaseModel):
         # Check if task is linear
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
+        # Check PDE order (2 for Poisson/Laplace, 4 for biharmonic)
+        pde_order = getattr(self.task, 'pde_order', 2)
+
         # Setup L-BFGS optimizer (RoPINN always uses L-BFGS with strong Wolfe)
         optimizer = torch.optim.LBFGS(
             self.network.parameters(),
@@ -288,15 +305,22 @@ class RoPINN(BaseModel):
 
                 # Forward pass on perturbed interior points
                 u_interior = self.network(X_interior_perturbed)
-                laplacian_u = self._compute_laplacian(u_interior, X_interior_perturbed)
+
+                # Compute differential operator based on PDE order
+                if pde_order == 4:
+                    # Biharmonic: nabla^4 u = f
+                    diff_u = self._compute_biharmonic(u_interior, X_interior_perturbed)
+                else:
+                    # Poisson/Laplace: nabla^2 u = f
+                    diff_u = self._compute_laplacian(u_interior, X_interior_perturbed)
 
                 # PDE residual
                 if is_linear:
-                    pde_residual = laplacian_u - f_perturbed
+                    pde_residual = diff_u - f_perturbed
                 else:
                     # Nonlinear Poisson: nabla^2 u - f - exp(u) = 0
                     u_clamped = torch.clamp(u_interior, max=50.0)
-                    pde_residual = laplacian_u - f_perturbed - torch.exp(u_clamped)
+                    pde_residual = diff_u - f_perturbed - torch.exp(u_clamped)
 
                 pde_loss = torch.mean(pde_residual ** 2)
 

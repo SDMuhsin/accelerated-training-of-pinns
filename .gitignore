@@ -68,6 +68,7 @@ Thumbs.db
 # Presentations and documentation (optional, remove if you want to track these)
 presentation/
 llmdocs/
+llmdocs/*
 
 # SCAI specific
 scai/

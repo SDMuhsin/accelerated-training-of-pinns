@@ -265,6 +265,20 @@ class DAS(BaseModel):
 
         return laplacian
 
+    def _compute_biharmonic(self, u: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        """
+        Compute biharmonic operator nabla^4 u = nabla^2(nabla^2 u) using autodiff.
+
+        For 2D: nabla^4 u = d^4u/dx^4 + 2*d^4u/dx^2dy^2 + d^4u/dy^4
+        """
+        # Compute Laplacian first
+        laplacian_u = self._compute_laplacian(u, X)
+
+        # Compute Laplacian of the Laplacian
+        biharmonic = self._compute_laplacian(laplacian_u, X)
+
+        return biharmonic
+
     def _compute_residual(
         self,
         X: torch.Tensor,
@@ -273,14 +287,23 @@ class DAS(BaseModel):
         """
         Compute PDE residual at given points.
 
-        For Poisson: residual = |nabla^2 u + f|^2
-        For nonlinear Poisson: residual = |nabla^2 u + f - exp(u)|^2
+        For Poisson: residual = |nabla^2 u - f|^2
+        For biharmonic: residual = |nabla^4 u - f|^2
+        For nonlinear Poisson: residual = |nabla^2 u - f - exp(u)|^2
         """
         # Always need gradients for Laplacian computation
         X = X.clone().requires_grad_(True)
 
         u = self.net_u(X)
-        laplacian_u = self._compute_laplacian(u, X)
+
+        # Check PDE order (2 for Poisson/Laplace, 4 for biharmonic)
+        pde_order = getattr(self.task, 'pde_order', 2)
+
+        # Compute differential operator based on PDE order
+        if pde_order == 4:
+            diff_u = self._compute_biharmonic(u, X)
+        else:
+            diff_u = self._compute_laplacian(u, X)
 
         # Source term
         f = self.source_func(X).unsqueeze(1)
@@ -289,12 +312,12 @@ class DAS(BaseModel):
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         if is_linear:
-            # Linear Poisson: ∇²u = f, so residual = ∇²u - f
-            residual = (laplacian_u - f) ** 2
+            # Linear PDE: diff_u = f, so residual = diff_u - f
+            residual = (diff_u - f) ** 2
         else:
             # Nonlinear Poisson: ∇²u = f + exp(u), so residual = ∇²u - f - exp(u)
             u_clamped = torch.clamp(u, max=50.0)
-            residual = (laplacian_u - f - torch.exp(u_clamped)) ** 2
+            residual = (diff_u - f - torch.exp(u_clamped)) ** 2
 
         return residual
 
@@ -401,15 +424,27 @@ class DAS(BaseModel):
 
     def _get_boundary_values(self, X_boundary: torch.Tensor) -> torch.Tensor:
         """Get exact boundary values for Dirichlet BCs."""
+        # First try to use task's evaluate_bc method if available
+        if hasattr(self.task, 'evaluate_bc'):
+            X_np = X_boundary.detach().cpu().numpy()
+            g_vals = self.task.evaluate_bc(X_np)
+            return torch.tensor(g_vals, dtype=self.precision, device=self.device).unsqueeze(1)
+
         task_name = self.task.name.lower()
 
-        if 'poisson' in task_name or 'laplace' in task_name:
+        if 'poisson' in task_name or 'laplace' in task_name or 'biharmonic' in task_name:
             # For sin(pi*x)*sin(pi*y), boundary values are 0
             return torch.zeros(X_boundary.shape[0], 1, dtype=self.precision, device=self.device)
         else:
+            # Check if boundary values are constant (avoid RBF on constant data)
+            data = self.task.data
+            if np.allclose(data.g, data.g[0]):
+                # Constant boundary values
+                return torch.full((X_boundary.shape[0], 1), data.g[0],
+                                  dtype=self.precision, device=self.device)
+
             # Interpolate from task's boundary data
             from scipy.interpolate import RBFInterpolator
-            data = self.task.data
             interpolator = RBFInterpolator(data.X_boundary, data.g, kernel='thin_plate_spline')
             X_np = X_boundary.detach().cpu().numpy()
             g_vals = interpolator(X_np)

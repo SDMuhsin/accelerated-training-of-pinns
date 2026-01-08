@@ -62,6 +62,10 @@ class PIELM(BaseModel):
         """
         super().__init__(task, **kwargs)
 
+        # PIELM only supports 2nd order PDEs (Laplacian)
+        # Higher order PDEs (e.g., biharmonic) would require σ''''(z) which is complex
+        self._check_pde_order(task)
+
         self.n_hidden = n_hidden
         self.activation = activation
         self.weight_range = weight_range
@@ -73,6 +77,18 @@ class PIELM(BaseModel):
         self.W = None  # Input weights (2, n_hidden) for 2D
         self.b = None  # Biases (n_hidden,)
         self.beta = None  # Output weights (n_hidden,)
+
+    def _check_pde_order(self, task):
+        """Check that PDE order is supported (2nd order only)."""
+        pde_order = getattr(task, 'pde_order', 2)
+        if pde_order != 2:
+            raise ValueError(
+                f"PIELM only supports 2nd order PDEs (Laplacian).\n"
+                f"Task '{task.name}' requires {pde_order}th order derivatives.\n"
+                f"For higher-order PDEs like biharmonic, use:\n"
+                f"  --model vanilla-pinn (autodiff, any order)\n"
+                f"  --model dt-elm-pinn (spectral, any order on square/cube)"
+            )
 
     def _sigmoid(self, z: np.ndarray) -> np.ndarray:
         """Numerically stable sigmoid."""
