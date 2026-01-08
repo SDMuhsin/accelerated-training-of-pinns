@@ -133,6 +133,20 @@ class VanillaPINN(BaseModel):
 
         return laplacian
 
+    def _compute_biharmonic(self, u: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        """
+        Compute biharmonic operator ∇⁴u = ∇²(∇²u) using automatic differentiation.
+
+        For 2D: ∇⁴u = ∂⁴u/∂x⁴ + 2∂⁴u/∂x²∂y² + ∂⁴u/∂y⁴
+        """
+        # Compute Laplacian first
+        laplacian_u = self._compute_laplacian(u, X)
+
+        # Compute Laplacian of the Laplacian
+        biharmonic = self._compute_laplacian(laplacian_u, X)
+
+        return biharmonic
+
     def _compute_robin_bc(self, u: torch.Tensor, X_b: torch.Tensor,
                           alpha: torch.Tensor, beta: torch.Tensor,
                           n: torch.Tensor) -> torch.Tensor:
@@ -206,23 +220,33 @@ class VanillaPINN(BaseModel):
             torch.cuda.synchronize()
         start_time = time.perf_counter()
 
+        # Check PDE order (2 for Poisson/Laplace, 4 for biharmonic)
+        pde_order = getattr(self.task, 'pde_order', 2)
+
         for epoch in range(1, effective_epochs + 1):
             def closure():
                 optimizer.zero_grad()
 
                 # PDE loss on interior points
                 u_interior = self.network(X_interior)
-                laplacian_u = self._compute_laplacian(u_interior, X_interior)
+
+                # Compute differential operator based on PDE order
+                if pde_order == 4:
+                    # Biharmonic: ∇⁴u = f
+                    diff_u = self._compute_biharmonic(u_interior, X_interior)
+                else:
+                    # Poisson/Laplace: ∇²u = f
+                    diff_u = self._compute_laplacian(u_interior, X_interior)
 
                 # PDE residual depends on whether task is linear or nonlinear
                 if is_linear:
-                    # Linear Poisson: ∇²u - f = 0
-                    pde_residual = laplacian_u - f_interior
+                    # Linear PDE: ∇²u - f = 0 or ∇⁴u - f = 0
+                    pde_residual = diff_u - f_interior
                 else:
                     # Nonlinear Poisson: ∇²u - f - exp(u) = 0
                     # Clamp u to prevent exp overflow (exp(88) ≈ 1e38, exp(100) overflows float32)
                     u_clamped = torch.clamp(u_interior, max=50.0)
-                    pde_residual = laplacian_u - f_interior - torch.exp(u_clamped)
+                    pde_residual = diff_u - f_interior - torch.exp(u_clamped)
                 pde_loss = torch.mean(pde_residual ** 2)
 
                 # BC loss

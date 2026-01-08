@@ -16,6 +16,48 @@ from functools import partial
 from .base import BaseTask, TaskRegistry, TaskData
 from .nonlinear_poisson import NonlinearPoissonTask
 from .heat_equation import HeatEquationTask
+from .biharmonic import BiharmonicSquareTask, BiharmonicSquarePolyTask
+
+# Import challenging PDE tasks (SPECTO-ELM advantages)
+from .challenging_pdes import (
+    HelmholtzSquareTask, HelmholtzHighFreqTask,
+    VariableCoefficientDiffusionTask,
+    ConvectionDiffusionTask, ConvectionDominatedTask,
+    AnisotropicDiffusionTask, StronglyAnisotropicTask,
+    HighFrequencyPoissonTask, VeryHighFrequencyPoissonTask,
+    MixedDerivativeTask,
+    ReactionDiffusionTask,
+)
+
+# Register biharmonic tasks (4th order PDEs)
+TaskRegistry.register('biharmonic-square', BiharmonicSquareTask)
+TaskRegistry.register('biharmonic-square-poly', BiharmonicSquarePolyTask)
+
+# Register challenging PDE tasks where SPECTO-ELM excels
+# Helmholtz (wave equation): ∇²u + k²u = f
+TaskRegistry.register('helmholtz-square', HelmholtzSquareTask)
+TaskRegistry.register('helmholtz-highfreq', HelmholtzHighFreqTask)
+
+# Variable coefficient diffusion: ∇·(a(x,y)∇u) = f
+TaskRegistry.register('variable-coeff-diffusion', VariableCoefficientDiffusionTask)
+
+# Convection-diffusion: ε∇²u + b·∇u = f
+TaskRegistry.register('convection-diffusion', ConvectionDiffusionTask)
+TaskRegistry.register('convection-dominated', ConvectionDominatedTask)
+
+# Anisotropic diffusion: a_xx ∂²u/∂x² + a_yy ∂²u/∂y² = f
+TaskRegistry.register('anisotropic-diffusion', AnisotropicDiffusionTask)
+TaskRegistry.register('strongly-anisotropic', StronglyAnisotropicTask)
+
+# High-frequency Poisson (spectral advantage)
+TaskRegistry.register('poisson-highfreq', HighFrequencyPoissonTask)
+TaskRegistry.register('poisson-veryhighfreq', VeryHighFrequencyPoissonTask)
+
+# Mixed derivatives: ∇²u + c·∂²u/∂x∂y = f
+TaskRegistry.register('mixed-derivative', MixedDerivativeTask)
+
+# Reaction-diffusion: ∇²u + r(x,y)·u = f
+TaskRegistry.register('reaction-diffusion', ReactionDiffusionTask)
 
 # Import RBF-FD tasks (Python-generated operators)
 try:
@@ -200,6 +242,21 @@ __all__ = [
     'TaskData',
     'NonlinearPoissonTask',
     'HeatEquationTask',
+    # Biharmonic (4th order)
+    'BiharmonicSquareTask',
+    'BiharmonicSquarePolyTask',
+    # Challenging PDEs where SPECTO-ELM excels
+    'HelmholtzSquareTask',
+    'HelmholtzHighFreqTask',
+    'VariableCoefficientDiffusionTask',
+    'ConvectionDiffusionTask',
+    'ConvectionDominatedTask',
+    'AnisotropicDiffusionTask',
+    'StronglyAnisotropicTask',
+    'HighFrequencyPoissonTask',
+    'VeryHighFrequencyPoissonTask',
+    'MixedDerivativeTask',
+    'ReactionDiffusionTask',
 ]
 
 if _rbf_fd_available:

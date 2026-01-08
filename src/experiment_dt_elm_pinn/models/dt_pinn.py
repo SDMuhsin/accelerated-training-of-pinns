@@ -104,11 +104,15 @@ class DTPINN(BaseModel):
 
         # Discretized data (built by model, not task)
         self.L = None           # Laplacian operator (scipy sparse)
+        self.L_pde = None       # PDE operator (L for 2nd order, L² for 4th order)
         self.B = None           # Boundary operator (scipy sparse)
         self.X_ghost = None     # Ghost points
         self.f = None           # Source term
         self.g = None           # BC values
         self.u_true = None      # True solution
+
+        # Get PDE order from task (2 for Poisson/Laplace, 4 for biharmonic)
+        self.pde_order = getattr(task, 'pde_order', 2)
 
     def _build_network(self, input_dim: int, precision: torch.dtype) -> nn.Module:
         """Build MLP network."""
@@ -159,6 +163,12 @@ class DTPINN(BaseModel):
         self.L, self.B, self.X_ghost = self.discretizer.build_operators(
             X_interior, X_boundary
         )
+
+        # For 4th order PDEs (biharmonic), compute L² = L @ L
+        if self.pde_order == 4:
+            self.L_pde = self.L @ self.L
+        else:
+            self.L_pde = self.L
 
         # Compute dimensions
         N_interior = X_interior.shape[0]
@@ -231,7 +241,8 @@ class DTPINN(BaseModel):
         from scipy.sparse import coo_matrix, csr_matrix
 
         # Convert to COO format for torch sparse tensor creation
-        L_coo = coo_matrix(self.L, dtype=np.float64)
+        # Use L_pde (L for 2nd order, L² for 4th order biharmonic)
+        L_coo = coo_matrix(self.L_pde, dtype=np.float64)
         B_coo = coo_matrix(self.B, dtype=np.float64)
 
         # Create torch sparse tensors (enables proper autograd for L-BFGS)
@@ -248,7 +259,8 @@ class DTPINN(BaseModel):
         ).coalesce()
 
         # Keep scipy sparse for fallback
-        self.L_sparse = csr_matrix(self.L, dtype=np.float64)
+        # Use L_pde (L for 2nd order, L² for 4th order biharmonic)
+        self.L_sparse = csr_matrix(self.L_pde, dtype=np.float64)
         self.B_sparse = csr_matrix(self.B, dtype=np.float64)
 
     def _setup_cuda_operators_from_scipy(self, precision):
@@ -258,7 +270,8 @@ class DTPINN(BaseModel):
             from cupy.sparse import csr_matrix as cupy_csr
 
             # Convert to CuPy sparse matrices
-            self.L_sparse = cupy_csr(self.L, dtype=np.float64)
+            # Use L_pde (L for 2nd order, L² for 4th order biharmonic)
+            self.L_sparse = cupy_csr(self.L_pde, dtype=np.float64)
             self.B_sparse = cupy_csr(self.B, dtype=np.float64)
 
             # Initialize kernel by doing a dummy multiplication

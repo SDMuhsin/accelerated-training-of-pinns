@@ -182,12 +182,16 @@ class DTELMPINN(BaseModel):
 
         # Discretized data (built by model, not task)
         self.L = None           # Laplacian operator
+        self.L_pde = None       # PDE operator (L for 2nd order, L² for 4th order)
         self.B = None           # Boundary operator
         self.X_interior = None  # Interior points (Chebyshev grid)
         self.X_boundary = None  # Boundary points (Chebyshev grid)
         self.f = None           # Source term at interior+boundary
         self.g = None           # BC values at boundary
         self.u_true = None      # True solution (if available)
+
+        # Get PDE order from task (2 for Laplacian, 4 for biharmonic)
+        self.pde_order = getattr(task, 'pde_order', 2)
 
     def _check_domain_compatibility(self, task):
         """
@@ -244,6 +248,13 @@ class DTELMPINN(BaseModel):
             domain_type=domain_type,
             domain_bounds=domain_bounds
         )
+
+        # For 4th order PDEs (biharmonic), compute L² = L @ L
+        if self.pde_order == 4:
+            # L is sparse, L² is also sparse
+            self.L_pde = self.L @ self.L
+        else:
+            self.L_pde = self.L
 
         # Compute N_interior, N_boundary, N_ib
         N_interior = self.X_interior.shape[0]
@@ -302,8 +313,9 @@ class DTELMPINN(BaseModel):
             self.H = self._activation_fn(X @ W + b)
 
         # Precompute operator products
-        # L @ H gives (N_total, n_features), we need first N_ib rows for PDE
-        LH_full = self.L @ self.H
+        # L_pde @ H gives (N_total, n_features), we need first N_ib rows for PDE
+        # L_pde is L for 2nd order PDEs, L² for 4th order (biharmonic)
+        LH_full = self.L_pde @ self.H
         self.LH = LH_full[:N_ib, :]  # (N_ib, n_features)
         self.BH = self.B @ self.H    # (N_bc, n_features)
 
@@ -316,12 +328,15 @@ class DTELMPINN(BaseModel):
         """
         Train using Newton iteration for nonlinear PDE, or direct solve for linear PDE.
 
+        Supports both 2nd order PDEs (Poisson/Laplace) and 4th order PDEs (biharmonic).
+        For 4th order PDEs, uses L² operator (biharmonic = Laplacian squared).
+
         For nonlinear PDE (∇²u = f + exp(u)):
         - Linearize exp(u) around current solution
         - Solve linear system via lstsq
         - Iterate until convergence
 
-        For linear PDE (∇²u = f):
+        For linear PDE (∇²u = f or ∇⁴u = f):
         - Direct least-squares solve (no Newton iteration)
         """
         if not self._is_setup:
@@ -331,7 +346,7 @@ class DTELMPINN(BaseModel):
         N_ib = self.N_ib
         f = self.f
         g = self.g
-        L = self.L
+        L = self.L_pde  # Use L for 2nd order, L² for 4th order (biharmonic)
         B = self.B
 
         start_time = time.perf_counter()
