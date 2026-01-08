@@ -180,6 +180,10 @@ class DTELMPINN(BaseModel):
         self.LH = None          # Precomputed L @ H
         self.BH = None          # Precomputed B @ H
 
+        # Store random weights for predict() to reuse (fixes RNG state bug)
+        self.W_hidden = []      # List of weight matrices for each layer
+        self.b_hidden = []      # List of bias vectors for each layer
+
         # Discretized data (built by model, not task)
         self.L = None           # Laplacian operator
         self.L_pde = None       # PDE operator (L for 2nd order, L² for 4th order)
@@ -231,7 +235,8 @@ class DTELMPINN(BaseModel):
         4. Builds multi-layer hidden features
         5. Precomputes L @ H and B @ H for efficient training
         """
-        np.random.seed(self.seed)
+        # NOTE: np.random.seed() is called later, right before weight generation.
+        # This avoids interference from task.load_data() which may also call seed().
 
         # Get domain info from task
         domain_type = getattr(self.task, 'domain_type', 'square')
@@ -290,6 +295,14 @@ class DTELMPINN(BaseModel):
         # Build X_full for ELM (no ghost points in spectral)
         X = X_ib
 
+        # Clear stored weights from any previous setup
+        self.W_hidden = []
+        self.b_hidden = []
+
+        # Set random seed right before weight generation
+        # This ensures reproducibility regardless of what task.load_data() did
+        np.random.seed(self.seed)
+
         # Build multi-layer hidden representation
         if self.use_skip_connections:
             H_layers = []
@@ -299,6 +312,9 @@ class DTELMPINN(BaseModel):
             for n_hidden in self.hidden_sizes:
                 W = np.random.randn(input_dim, n_hidden).astype(precision) * np.sqrt(2.0 / input_dim)
                 b = np.random.randn(n_hidden).astype(precision) * 0.1
+                # Store weights for predict() to reuse
+                self.W_hidden.append(W)
+                self.b_hidden.append(b)
                 h = self._activation_fn(h @ W + b)
                 H_layers.append(h)
                 input_dim = n_hidden
@@ -310,6 +326,9 @@ class DTELMPINN(BaseModel):
             n_hidden = self.hidden_sizes[0]
             W = np.random.randn(X.shape[1], n_hidden).astype(precision) * np.sqrt(2.0 / X.shape[1])
             b = np.random.randn(n_hidden).astype(precision) * 0.1
+            # Store weights for predict() to reuse
+            self.W_hidden.append(W)
+            self.b_hidden.append(b)
             self.H = self._activation_fn(X @ W + b)
 
         # Precompute operator products
@@ -489,33 +508,26 @@ class DTELMPINN(BaseModel):
         Make predictions at given points.
 
         Note: For points not in the training set, this requires
-        recomputing hidden features. For best accuracy, use points
-        from the original collocation set.
+        recomputing hidden features using the stored weights from setup().
         """
         if self.W_out is None:
             raise RuntimeError("Model not trained. Call train() first.")
 
-        # Recompute hidden features for new points
-        np.random.seed(self.seed)
-        precision = X.dtype
+        if not self.W_hidden:
+            raise RuntimeError("Model weights not initialized. Call setup() first.")
 
+        # Recompute hidden features using stored weights (not regenerating random weights)
         if self.use_skip_connections:
             H_layers = []
             h = X
-            input_dim = X.shape[1]
 
-            for n_hidden in self.hidden_sizes:
-                W = np.random.randn(input_dim, n_hidden).astype(precision) * np.sqrt(2.0 / input_dim)
-                b = np.random.randn(n_hidden).astype(precision) * 0.1
+            for W, b in zip(self.W_hidden, self.b_hidden):
                 h = self._activation_fn(h @ W + b)
                 H_layers.append(h)
-                input_dim = n_hidden
 
             H = np.hstack(H_layers)
         else:
-            n_hidden = self.hidden_sizes[0]
-            W = np.random.randn(X.shape[1], n_hidden).astype(precision) * np.sqrt(2.0 / X.shape[1])
-            b = np.random.randn(n_hidden).astype(precision) * 0.1
+            W, b = self.W_hidden[0], self.b_hidden[0]
             H = self._activation_fn(X @ W + b)
 
         return H @ self.W_out
