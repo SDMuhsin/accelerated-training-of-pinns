@@ -56,8 +56,8 @@ square_tasks=(
 
 challenging_tasks=(
     # 4th order PDEs (biharmonic) - PIELM completely fails
-    biharmonic-square                # sin solution
-    #biharmonic-square-poly           # polynomial solution
+    #biharmonic-square                # sin solution
+    biharmonic-square-poly           # polynomial solution
 
     # Helmholtz equation: ∇²u + k²u = f
     #helmholtz-square                 # k=1
