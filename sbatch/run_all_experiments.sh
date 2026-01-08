@@ -629,6 +629,168 @@ for task in "${challenging_tasks[@]}"; do
 done
 
 # ============================================================================
+# SECTION 10: CHALLENGING TASKS - VANILLA PINN (GPU)
+# ============================================================================
+echo ""
+echo "=============================================="
+echo "Section 10: Challenging Tasks - Vanilla PINN (GPU)"
+echo "=============================================="
+
+for task in "${challenging_tasks[@]}"; do
+    csv_file="./results/by_task/${task}.csv"
+
+    for model in "${pinn_models[@]}"; do
+        for seed in "${seeds[@]}"; do
+            job_name="${model}_${task}_s${seed}_gpu"
+            log_file="./logs/${job_name}"
+
+            echo "Submitting: $job_name"
+            sbatch \
+                --nodes=1 \
+                --ntasks-per-node=1 \
+                --cpus-per-task=2 \
+                --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 \
+                --mem=16000M \
+                --time=$GPU_TIME \
+                --output=${log_file}-%N-%j.out \
+                --error=${log_file}-%N-%j.err \
+                --wrap="
+                    module load scipy-stack cuda cudnn
+                    module load arrow
+                    source ./env/bin/activate
+                    echo '========================================'
+                    echo 'Job: $job_name'
+                    echo 'Model: Vanilla PINN'
+                    echo 'Task: $task (CHALLENGING)'
+                    echo 'Started: '\$(date)
+                    echo '========================================'
+                    nvidia-smi
+                    export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                    python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                        --task=$task \
+                        --model=$model \
+                        --seed=$seed \
+                        --epochs=$PINN_EPOCHS \
+                        --csv-output=$csv_file \
+                        --verbose
+                    echo '========================================'
+                    echo 'Finished: '\$(date)
+                    echo '========================================'
+                "
+            ((job_count++))
+        done
+    done
+done
+
+# ============================================================================
+# SECTION 11: CHALLENGING TASKS - RoPINN (GPU)
+# ============================================================================
+echo ""
+echo "=============================================="
+echo "Section 11: Challenging Tasks - RoPINN (GPU)"
+echo "=============================================="
+
+for task in "${challenging_tasks[@]}"; do
+    csv_file="./results/by_task/${task}.csv"
+
+    for seed in "${seeds[@]}"; do
+        job_name="ropinn_${task}_s${seed}_gpu"
+        log_file="./logs/${job_name}"
+
+        echo "Submitting: $job_name"
+        sbatch \
+            --nodes=1 \
+            --ntasks-per-node=1 \
+            --cpus-per-task=2 \
+            --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 \
+            --mem=16000M \
+            --time=$GPU_TIME \
+            --output=${log_file}-%N-%j.out \
+            --error=${log_file}-%N-%j.err \
+            --wrap="
+                module load scipy-stack cuda cudnn
+                module load arrow
+                source ./env/bin/activate
+                echo '========================================'
+                echo 'Job: $job_name'
+                echo 'Model: RoPINN (Region-Optimized)'
+                echo 'Task: $task (CHALLENGING)'
+                echo 'Started: '\$(date)
+                echo '========================================'
+                nvidia-smi
+                export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                    --task=$task \
+                    --model=ropinn \
+                    --seed=$seed \
+                    --epochs=$ROPINN_EPOCHS \
+                    --csv-output=$csv_file \
+                    --verbose
+                echo '========================================'
+                echo 'Finished: '\$(date)
+                echo '========================================'
+            "
+        ((job_count++))
+    done
+done
+
+# ============================================================================
+# SECTION 12: CHALLENGING TASKS - DAS (GPU)
+# ============================================================================
+echo ""
+echo "=============================================="
+echo "Section 12: Challenging Tasks - DAS (GPU)"
+echo "=============================================="
+
+for task in "${challenging_tasks[@]}"; do
+    csv_file="./results/by_task/${task}.csv"
+
+    for seed in "${seeds[@]}"; do
+        job_name="das_${task}_s${seed}_gpu"
+        log_file="./logs/${job_name}"
+
+        echo "Submitting: $job_name"
+        sbatch \
+            --nodes=1 \
+            --ntasks-per-node=1 \
+            --cpus-per-task=2 \
+            --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 \
+            --mem=16000M \
+            --time=$GPU_TIME \
+            --output=${log_file}-%N-%j.out \
+            --error=${log_file}-%N-%j.err \
+            --wrap="
+                module load scipy-stack cuda cudnn
+                module load arrow
+                source ./env/bin/activate
+                echo '========================================'
+                echo 'Job: $job_name'
+                echo 'Model: DAS (Deep Adaptive Sampling)'
+                echo 'Task: $task (CHALLENGING)'
+                echo 'Started: '\$(date)
+                echo '========================================'
+                nvidia-smi
+                export PYTHONPATH=\"\$PYTHONPATH:\$(pwd)\"
+                python3 -m src.experiment_dt_elm_pinn.train_pinn \
+                    --task=$task \
+                    --model=das \
+                    --seed=$seed \
+                    --das-max-stage=$DAS_MAX_STAGE \
+                    --das-pde-epochs=$DAS_PDE_EPOCHS \
+                    --das-flow-epochs=$DAS_FLOW_EPOCHS \
+                    --das-n-train=$DAS_N_TRAIN \
+                    --das-quantity=residual \
+                    --csv-output=$csv_file \
+                    --verbose
+                echo '========================================'
+                echo 'Finished: '\$(date)
+                echo '========================================'
+            "
+        ((job_count++))
+    done
+done
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 echo ""
