@@ -79,7 +79,7 @@ class PIELM(BaseModel):
         self.beta = None  # Output weights (n_hidden,)
 
     def _check_pde_order(self, task):
-        """Check that PDE order is supported (2nd order only)."""
+        """Check that PDE order and type are supported."""
         pde_order = getattr(task, 'pde_order', 2)
         if pde_order != 2:
             raise ValueError(
@@ -88,6 +88,19 @@ class PIELM(BaseModel):
                 f"For higher-order PDEs like biharmonic, use:\n"
                 f"  --model vanilla-pinn (autodiff, any order)\n"
                 f"  --model dt-elm-pinn (spectral, any order on square/cube)"
+            )
+
+        # PIELM now supports various PDE types using analytical derivatives
+        # Only truly unsupported types are blocked
+        pde_type = getattr(task, 'pde_type', None)
+        unsupported_types = ['mixed_derivative']  # Requires ∂²u/∂x∂y
+        if pde_type in unsupported_types:
+            raise ValueError(
+                f"PIELM does not support mixed derivative PDEs.\n"
+                f"Task '{task.name}' has pde_type='{pde_type}'.\n"
+                f"For this PDE type, use:\n"
+                f"  --model dt-elm-pinn (spectral operators)\n"
+                f"  --model vanilla-pinn (autodiff)"
             )
 
     def _sigmoid(self, z: np.ndarray) -> np.ndarray:
@@ -172,6 +185,41 @@ class PIELM(BaseModel):
         # ∇²H[i,j] = σ''(z[i,j]) * ||w_j||²
         return sigma_pp * W_norm_sq
 
+    def _activation_first_derivative(self, z: np.ndarray) -> np.ndarray:
+        """First derivative of activation function."""
+        if self.activation == 'sigmoid':
+            return self._sigmoid_derivative(z)
+        elif self.activation == 'tanh':
+            # d(tanh(z))/dz = sech²(z) = 1 - tanh²(z)
+            t = np.tanh(z)
+            return 1 - t**2
+        elif self.activation == 'sin':
+            return np.cos(z)
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
+
+    def _compute_gradient_features(self, X: np.ndarray) -> tuple:
+        """
+        Compute gradient of hidden layer features analytically.
+
+        ∂H_j/∂x = σ'(z_j) * W[0,j]
+        ∂H_j/∂y = σ'(z_j) * W[1,j]
+
+        Args:
+            X: Input points (N, 2)
+
+        Returns:
+            dH_dx, dH_dy: Gradient features (N, n_hidden) each
+        """
+        z = X @ self.W + self.b  # (N, n_hidden)
+        sigma_p = self._activation_first_derivative(z)  # (N, n_hidden)
+
+        # ∂H[i,j]/∂x = σ'(z[i,j]) * W[0,j]
+        dH_dx = sigma_p * self.W[0, :]
+        dH_dy = sigma_p * self.W[1, :]
+
+        return dH_dx, dH_dy
+
     def setup(self):
         """Initialize random hidden layer weights."""
         np.random.seed(self.seed)
@@ -227,6 +275,56 @@ class PIELM(BaseModel):
         H_boundary = self._compute_features(X_boundary)
         LapH_interior = self._compute_laplacian_features(X_interior)
 
+        # Build PDE operator based on type
+        pde_type = getattr(self.task, 'pde_type', None)
+
+        if pde_type == 'helmholtz':
+            # Helmholtz: ∇²u + k²u = f → operator is LapH + k²*H
+            k_squared = getattr(self.task, 'k_squared', 1.0)
+            OpH_interior = LapH_interior + k_squared * H_interior
+            if verbose:
+                print(f"  Helmholtz equation: k² = {k_squared}")
+
+        elif pde_type == 'convection_diffusion':
+            # Convection-diffusion: ε∇²u + b·∇u = f
+            epsilon = getattr(self.task, 'epsilon', 0.1)
+            bx = getattr(self.task, 'bx', 1.0)
+            by = getattr(self.task, 'by', 1.0)
+            dHdx, dHdy = self._compute_gradient_features(X_interior)
+            OpH_interior = epsilon * LapH_interior + bx * dHdx + by * dHdy
+            if verbose:
+                print(f"  Convection-diffusion: ε={epsilon}, b=({bx}, {by})")
+
+        elif pde_type == 'variable_diffusion':
+            # Variable-coefficient: ∇·(a∇u) = a∇²u + ∇a·∇u = f
+            dHdx, dHdy = self._compute_gradient_features(X_interior)
+            a = self.task.diffusion_coeff(X_interior)[:, np.newaxis]
+            da_dx, da_dy = self.task.diffusion_coeff_grad(X_interior)
+            da_dx = da_dx[:, np.newaxis]
+            da_dy = da_dy[:, np.newaxis]
+            OpH_interior = a * LapH_interior + da_dx * dHdx + da_dy * dHdy
+            if verbose:
+                print(f"  Variable-coefficient diffusion")
+
+        elif pde_type == 'reaction_diffusion':
+            # Reaction-diffusion: ∇²u + r(x)u = f
+            r = self.task.reaction_coeff(X_interior)[:, np.newaxis]
+            OpH_interior = LapH_interior + r * H_interior
+            if verbose:
+                print(f"  Reaction-diffusion equation")
+
+        elif pde_type == 'anisotropic_diffusion':
+            # Anisotropic: approximate with average diffusivity
+            a_xx = getattr(self.task, 'a_xx', 1.0)
+            a_yy = getattr(self.task, 'a_yy', 1.0)
+            OpH_interior = ((a_xx + a_yy) / 2.0) * LapH_interior
+            if verbose:
+                print(f"  Anisotropic diffusion (approximate): a_xx={a_xx}, a_yy={a_yy}")
+
+        else:
+            # Default: Poisson/Laplace ∇²u = f
+            OpH_interior = LapH_interior
+
         # Check if this is a nonlinear problem (has exp(u) term)
         # For our nonlinear Poisson: ∇²u = f + exp(u)
         # Query the task to determine if it's linear or nonlinear
@@ -237,7 +335,7 @@ class PIELM(BaseModel):
         if is_nonlinear:
             # Newton iteration for nonlinear PDE
             # Initial solve: assume exp(u) ≈ 1
-            A_init = np.vstack([LapH_interior, H_boundary])
+            A_init = np.vstack([OpH_interior, H_boundary])
             b_init = np.concatenate([f_interior + 1.0, g_boundary])
             self.beta, *_ = np.linalg.lstsq(A_init, b_init, rcond=None)
 
@@ -274,7 +372,7 @@ class PIELM(BaseModel):
                 u_interior = H_interior @ self.beta
         else:
             # Direct solve for linear PDE
-            A = np.vstack([LapH_interior, H_boundary])
+            A = np.vstack([OpH_interior, H_boundary])
             b = np.concatenate([f_interior, g_boundary])
             self.beta, *_ = np.linalg.lstsq(A, b, rcond=None)
 

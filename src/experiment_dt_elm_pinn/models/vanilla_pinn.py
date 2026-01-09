@@ -112,6 +112,19 @@ class VanillaPINN(BaseModel):
 
         self._is_setup = True
 
+    def _compute_gradient(self, u: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        """
+        Compute gradient ∇u using automatic differentiation.
+
+        For 2D: ∇u = (∂u/∂x, ∂u/∂y)
+
+        Returns:
+            Gradient tensor of shape (N, dim)
+        """
+        u_grad = grad(u, X, grad_outputs=torch.ones_like(u),
+                     create_graph=True, retain_graph=True)[0]
+        return u_grad
+
     def _compute_laplacian(self, u: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
         """
         Compute Laplacian ∇²u using automatic differentiation.
@@ -223,6 +236,25 @@ class VanillaPINN(BaseModel):
         # Check PDE order (2 for Poisson/Laplace, 4 for biharmonic)
         pde_order = getattr(self.task, 'pde_order', 2)
 
+        # Check for special PDE types
+        pde_type = getattr(self.task, 'pde_type', None)
+
+        # Helmholtz: ∇²u + k²u = f
+        is_helmholtz = (pde_type == 'helmholtz')
+        if is_helmholtz:
+            k_squared = getattr(self.task, 'k_squared', 1.0)
+            k_squared_tensor = torch.tensor(k_squared, dtype=precision, device=self.device)
+
+        # Convection-diffusion: ε∇²u + b·∇u = f
+        is_convection = (pde_type == 'convection_diffusion')
+        if is_convection:
+            epsilon = getattr(self.task, 'epsilon', 0.1)
+            bx = getattr(self.task, 'bx', 1.0)
+            by = getattr(self.task, 'by', 1.0)
+            epsilon_tensor = torch.tensor(epsilon, dtype=precision, device=self.device)
+            bx_tensor = torch.tensor(bx, dtype=precision, device=self.device)
+            by_tensor = torch.tensor(by, dtype=precision, device=self.device)
+
         for epoch in range(1, effective_epochs + 1):
             def closure():
                 optimizer.zero_grad()
@@ -240,8 +272,17 @@ class VanillaPINN(BaseModel):
 
                 # PDE residual depends on whether task is linear or nonlinear
                 if is_linear:
-                    # Linear PDE: ∇²u - f = 0 or ∇⁴u - f = 0
-                    pde_residual = diff_u - f_interior
+                    if is_helmholtz:
+                        # Helmholtz: ∇²u + k²u - f = 0
+                        pde_residual = diff_u + k_squared_tensor * u_interior - f_interior
+                    elif is_convection:
+                        # Convection-diffusion: ε∇²u + b·∇u - f = 0
+                        grad_u = self._compute_gradient(u_interior, X_interior)
+                        convection = bx_tensor * grad_u[:, 0:1] + by_tensor * grad_u[:, 1:2]
+                        pde_residual = epsilon_tensor * diff_u + convection - f_interior
+                    else:
+                        # Poisson/Laplace: ∇²u - f = 0 or ∇⁴u - f = 0
+                        pde_residual = diff_u - f_interior
                 else:
                     # Nonlinear Poisson: ∇²u - f - exp(u) = 0
                     # Clamp u to prevent exp overflow (exp(88) ≈ 1e38, exp(100) overflows float32)

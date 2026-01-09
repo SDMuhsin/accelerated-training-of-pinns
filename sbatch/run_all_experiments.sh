@@ -60,15 +60,15 @@ challenging_tasks=(
     #biharmonic-square-poly           # polynomial solution
 
     # Helmholtz equation: ∇²u + k²u = f
-    #helmholtz-square                 # k=1
+    helmholtz-square                 # k=1
     #helmholtz-highfreq               # k=5 (more oscillatory)
 
     # Variable coefficient diffusion: ∇·(a(x,y)∇u) = f
-    variable-coeff-diffusion         # spatially varying a(x,y)
+    #variable-coeff-diffusion         # spatially varying a(x,y)
 
     # Convection-diffusion: ε∇²u + b·∇u = f (PIELM can't compute ∇u)
-    convection-diffusion             # ε=0.1, balanced
-    convection-dominated             # ε=0.01, convection dominates
+    #convection-diffusion             # ε=0.1, balanced
+    #convection-dominated             # ε=0.01, convection dominates
 
     # Anisotropic diffusion: a_xx ∂²u/∂x² + a_yy ∂²u/∂y² = f
     #anisotropic-diffusion            # 10:1 anisotropy

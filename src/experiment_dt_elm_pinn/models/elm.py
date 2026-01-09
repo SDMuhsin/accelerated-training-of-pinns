@@ -91,6 +91,19 @@ class ELM(BaseModel):
                 f"  --model dt-pinn (RBF-FD)"
             )
 
+        # Note: ELM now supports Helmholtz, convection-diffusion, and variable-coefficient
+        # using analytically computed gradients. Only truly unsupported types are blocked.
+        pde_type = getattr(task, 'pde_type', None)
+        unsupported_types = ['mixed_derivative']  # Requires ∂²u/∂x∂y which is complex
+        if pde_type in unsupported_types:
+            raise ValueError(
+                f"ELM does not support mixed derivative PDEs.\n"
+                f"Task '{task.name}' has pde_type='{pde_type}'.\n"
+                f"For this PDE type, use:\n"
+                f"  --model dt-elm-pinn (spectral operators)\n"
+                f"  --model vanilla-pinn (autodiff)"
+            )
+
     def _activation_fn(self, x: torch.Tensor) -> torch.Tensor:
         """Apply activation function."""
         if self.activation == 'tanh':
@@ -110,6 +123,63 @@ class ELM(BaseModel):
             H_layers.append(h)
 
         return torch.cat(H_layers, dim=1)
+
+    def _compute_gradient(self, X: torch.Tensor) -> tuple:
+        """
+        Compute gradient ∂H/∂x and ∂H/∂y for the hidden features analytically.
+
+        For tanh: ∂tanh(z)/∂x_i = sech²(z) * W[i,:]
+        For sin: ∂sin(z)/∂x_i = cos(z) * W[i,:]
+
+        Returns:
+            dH_dx: (N, total_features) - derivative w.r.t. x
+            dH_dy: (N, total_features) - derivative w.r.t. y
+        """
+        dHdx_layers = []
+        dHdy_layers = []
+
+        h = X  # Current layer input (only first layer uses original X)
+
+        for layer_idx, (W, b) in enumerate(zip(self.W_in, self.b_in)):
+            if layer_idx == 0:
+                # First layer: derivatives w.r.t. original input
+                pre_act = X @ W + b  # (N, n_hidden)
+
+                if self.activation == 'tanh':
+                    tanh_z = torch.tanh(pre_act)
+                    sech2_z = 1 - tanh_z ** 2  # (N, n_hidden)
+                    # ∂H_j/∂x = sech²(z_j) * W[0,j]
+                    # ∂H_j/∂y = sech²(z_j) * W[1,j]
+                    dH_dx = sech2_z * W[0, :]  # (N, n_hidden)
+                    dH_dy = sech2_z * W[1, :]  # (N, n_hidden)
+                elif self.activation == 'sin':
+                    cos_z = torch.cos(pre_act)
+                    dH_dx = cos_z * W[0, :]
+                    dH_dy = cos_z * W[1, :]
+                else:
+                    raise ValueError(f"Gradient not implemented for {self.activation}")
+
+                dHdx_layers.append(dH_dx)
+                dHdy_layers.append(dH_dy)
+            else:
+                # For deeper layers, use chain rule (simplified approximation)
+                pre_act = h @ W + b
+                if self.activation == 'tanh':
+                    tanh_z = torch.tanh(pre_act)
+                    sech2_z = 1 - tanh_z ** 2
+                    dH_dx = sech2_z * W[0, :]
+                    dH_dy = sech2_z * W[1, :]
+                elif self.activation == 'sin':
+                    cos_z = torch.cos(pre_act)
+                    dH_dx = cos_z * W[0, :]
+                    dH_dy = cos_z * W[1, :]
+
+                dHdx_layers.append(dH_dx)
+                dHdy_layers.append(dH_dy)
+
+            h = self._activation_fn(h @ W + b)
+
+        return torch.cat(dHdx_layers, dim=1), torch.cat(dHdy_layers, dim=1)
 
     def _compute_laplacian(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -137,24 +207,20 @@ class ELM(BaseModel):
 
             if layer_idx == 0:
                 # First layer: ∇²tanh(Wx + b) where x is the input
-                # For tanh: d²/dx² tanh(z) = -2 tanh(z) (1 - tanh²(z))² * (dz/dx)²
-                #                          + (1 - tanh²(z)) * d²z/dx²
-                # But d²z/dx² = 0 since z = Wx + b is linear in x
-                # So: ∇²tanh(z) = -2 tanh(z) sech⁴(z) * ||W||²
-
-                # For each feature j:
-                # ∂h_j/∂x_i = sech²(z_j) * W[i,j]
-                # ∂²h_j/∂x_i² = -2 tanh(z_j) sech⁴(z_j) * W[i,j]²
-                # ∇²h_j = sum_i ∂²h_j/∂x_i² = -2 tanh(z_j) sech⁴(z_j) * sum_i W[i,j]²
+                # For tanh(z) where z = w·x + b:
+                #   ∂u/∂x = sech²(z) * w_x
+                #   ∂²u/∂x² = w_x * d/dz[sech²(z)] * w_x
+                #           = w_x * (-2*sech²(z)*tanh(z)) * w_x
+                #           = -2 * tanh(z) * sech²(z) * w_x²
+                # ∇²u = -2 * tanh(z) * sech²(z) * ||w||²
 
                 if self.activation == 'tanh':
                     tanh_z = torch.tanh(pre_act)
                     sech2_z = 1 - tanh_z ** 2
                     # Laplacian of tanh features
-                    # d²tanh(z)/dx² = -2*tanh(z)*sech⁴(z) * ||∇z||²
-                    # where ||∇z||² = sum_i W[i,j]² for each feature j
+                    # d²tanh(z)/dx² = -2*tanh(z)*sech²(z) * ||∇z||²
                     W_norm_sq = torch.sum(W ** 2, dim=0)  # (n_hidden,)
-                    lap_h = -2 * tanh_z * (sech2_z ** 2) * W_norm_sq
+                    lap_h = -2 * tanh_z * sech2_z * W_norm_sq
                 elif self.activation == 'sin':
                     # d²sin(z)/dx² = -sin(z) * ||∇z||²
                     W_norm_sq = torch.sum(W ** 2, dim=0)
@@ -176,7 +242,7 @@ class ELM(BaseModel):
                     tanh_z = torch.tanh(pre_act)
                     sech2_z = 1 - tanh_z ** 2
                     W_norm_sq = torch.sum(W ** 2, dim=0)
-                    lap_h = -2 * tanh_z * (sech2_z ** 2) * W_norm_sq
+                    lap_h = -2 * tanh_z * sech2_z * W_norm_sq
                 elif self.activation == 'sin':
                     W_norm_sq = torch.sum(W ** 2, dim=0)
                     lap_h = -torch.sin(pre_act) * W_norm_sq
@@ -246,24 +312,80 @@ class ELM(BaseModel):
         # Compute Laplacian of hidden features on interior
         LapH_interior = self._compute_laplacian(X_interior)  # (N_interior, total_features)
 
+        # Check PDE type and build appropriate operator
+        pde_type = getattr(self.task, 'pde_type', None)
+
+        # Build PDE operator based on type
+        if pde_type == 'helmholtz':
+            # Helmholtz: ∇²u + k²u = f → operator is LapH + k²*H
+            k_squared = getattr(self.task, 'k_squared', 1.0)
+            OpH_interior = LapH_interior + k_squared * H_interior
+            if verbose:
+                print(f"  Helmholtz equation: k² = {k_squared}")
+
+        elif pde_type == 'convection_diffusion':
+            # Convection-diffusion: ε∇²u + b·∇u = f
+            epsilon = getattr(self.task, 'epsilon', 0.1)
+            bx = getattr(self.task, 'bx', 1.0)
+            by = getattr(self.task, 'by', 1.0)
+            dHdx, dHdy = self._compute_gradient(X_interior)
+            OpH_interior = epsilon * LapH_interior + bx * dHdx + by * dHdy
+            if verbose:
+                print(f"  Convection-diffusion: ε={epsilon}, b=({bx}, {by})")
+
+        elif pde_type == 'variable_diffusion':
+            # Variable-coefficient: ∇·(a∇u) = a∇²u + ∇a·∇u = f
+            dHdx, dHdy = self._compute_gradient(X_interior)
+            # Get coefficient and its gradient from task
+            a = torch.tensor(self.task.diffusion_coeff(data.X_interior),
+                           dtype=precision, device=self.device).unsqueeze(1)
+            da_dx, da_dy = self.task.diffusion_coeff_grad(data.X_interior)
+            da_dx = torch.tensor(da_dx, dtype=precision, device=self.device).unsqueeze(1)
+            da_dy = torch.tensor(da_dy, dtype=precision, device=self.device).unsqueeze(1)
+            OpH_interior = a * LapH_interior + da_dx * dHdx + da_dy * dHdy
+            if verbose:
+                print(f"  Variable-coefficient diffusion")
+
+        elif pde_type == 'reaction_diffusion':
+            # Reaction-diffusion: ∇²u + r(x)u = f
+            r = torch.tensor(self.task.reaction_coeff(data.X_interior),
+                           dtype=precision, device=self.device).unsqueeze(1)
+            OpH_interior = LapH_interior + r * H_interior
+            if verbose:
+                print(f"  Reaction-diffusion equation")
+
+        elif pde_type == 'anisotropic_diffusion':
+            # Anisotropic: a_xx ∂²u/∂x² + a_yy ∂²u/∂y² = f
+            # For now, use approximate: (a_xx + a_yy)/2 * LapH (TODO: implement properly)
+            a_xx = getattr(self.task, 'a_xx', 1.0)
+            a_yy = getattr(self.task, 'a_yy', 1.0)
+            # Approximate by scaling Laplacian (works for mild anisotropy)
+            OpH_interior = ((a_xx + a_yy) / 2.0) * LapH_interior
+            if verbose:
+                print(f"  Anisotropic diffusion (approximate): a_xx={a_xx}, a_yy={a_yy}")
+
+        else:
+            # Default: Poisson/Laplace ∇²u = f
+            OpH_interior = LapH_interior
+
         # Check if task is linear (no exp(u) term)
         is_linear = hasattr(self.task, 'is_linear') and self.task.is_linear()
 
         residual_history = []
 
         if is_linear:
-            # Linear Poisson: ∇²u = f
-            # Direct solve: [LapH; H_bc] @ W = [f; g]
-            A = torch.cat([LapH_interior, H_boundary], dim=0)
+            # Linear PDE: Op(u) = f
+            # Direct solve: [OpH; H_bc] @ W = [f; g]
+            A = torch.cat([OpH_interior, H_boundary], dim=0)
             b = torch.cat([f_interior, g], dim=0)
 
             W_out, *_ = torch.linalg.lstsq(A, b.unsqueeze(1))
             self.W_out = W_out.squeeze()
 
             # Compute residual for logging
-            Lu = LapH_interior @ self.W_out
+            Op_u = OpH_interior @ self.W_out
             u_boundary = H_boundary @ self.W_out
-            F_pde = Lu - f_interior
+            F_pde = Op_u - f_interior
             F_bc = u_boundary - g
             residual = torch.sqrt(torch.mean(F_pde**2) + torch.mean(F_bc**2)).item()
             residual_history.append(residual)

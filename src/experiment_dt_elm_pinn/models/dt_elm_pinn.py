@@ -17,6 +17,7 @@ It does NOT use operators provided by the task.
 
 import numpy as np
 import scipy.linalg
+import scipy.sparse
 import time
 from typing import Dict, Any, List, Optional
 
@@ -25,8 +26,10 @@ from .base import BaseModel, TrainResult
 # Import discretizer - handle both relative and absolute import
 try:
     from ..discretization import SpectralDiscretizer
+    from ..discretization.spectral import chebyshev_gradient_2d, scale_gradient
 except ImportError:
     from src.experiment_dt_elm_pinn.discretization import SpectralDiscretizer
+    from src.experiment_dt_elm_pinn.discretization.spectral import chebyshev_gradient_2d, scale_gradient
 
 
 def _solve_lstsq_cholesky(A: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -254,11 +257,43 @@ class DTELMPINN(BaseModel):
             domain_bounds=domain_bounds
         )
 
-        # For 4th order PDEs (biharmonic), compute L² = L @ L
+        # Build PDE operator based on equation type
+        pde_type = getattr(self.task, 'pde_type', None)
         if self.pde_order == 4:
-            # L is sparse, L² is also sparse
+            # Biharmonic: ∇⁴u = f → operator is L² (L is sparse, L² is also sparse)
             self.L_pde = self.L @ self.L
+        elif pde_type == 'helmholtz':
+            # Helmholtz: ∇²u + k²u = f → operator is L + k²I
+            k_squared = getattr(self.task, 'k_squared', 1.0)
+            N = self.L.shape[0]
+            self.L_pde = self.L + k_squared * scipy.sparse.eye(N, format='csr')
+        elif pde_type == 'convection_diffusion':
+            # Convection-diffusion: ε∇²u + b·∇u = f → operator is ε*L + bx*Dx + by*Dy
+            epsilon = getattr(self.task, 'epsilon', 0.1)
+            bx = getattr(self.task, 'bx', 1.0)
+            by = getattr(self.task, 'by', 1.0)
+
+            # Build gradient operators on reference domain
+            N_cheb = self.discretizer.N
+            Dx_ref, Dy_ref = chebyshev_gradient_2d(N_cheb, N_cheb)
+
+            # Scale for physical domain
+            x_range = domain_bounds.get('x', (0.0, 1.0))
+            y_range = domain_bounds.get('y', (0.0, 1.0))
+            Dx_scaled = scale_gradient(Dx_ref, x_range)
+            Dy_scaled = scale_gradient(Dy_ref, y_range)
+
+            # Reorder using same permutation as L
+            Dx_reordered = Dx_scaled[perm][:, perm]
+            Dy_reordered = Dy_scaled[perm][:, perm]
+
+            # Build full operator: ε*L + bx*Dx + by*Dy
+            N_total = self.L.shape[0]
+            Dx_ib = scipy.sparse.csr_matrix(Dx_reordered[:N_total, :])
+            Dy_ib = scipy.sparse.csr_matrix(Dy_reordered[:N_total, :])
+            self.L_pde = epsilon * self.L + bx * Dx_ib + by * Dy_ib
         else:
+            # Poisson/Laplace: ∇²u = f → operator is L
             self.L_pde = self.L
 
         # Compute N_interior, N_boundary, N_ib

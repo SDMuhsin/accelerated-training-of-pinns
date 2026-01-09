@@ -128,6 +128,30 @@ def chebyshev_laplacian_3d(Nx: int, Ny: int, Nz: int) -> np.ndarray:
     return L
 
 
+def chebyshev_gradient_2d(Nx: int, Ny: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    2D gradient operators on tensor-product Chebyshev grid.
+
+    Dx = I_y (x) D_x  (derivative in x direction)
+    Dy = D_y (x) I_x  (derivative in y direction)
+
+    Args:
+        Nx, Ny: Points per dimension
+
+    Returns:
+        Dx, Dy: (Nx*Ny) x (Nx*Ny) first derivative matrices
+    """
+    Dx_1d = chebyshev_differentiation_matrix(Nx)
+    Dy_1d = chebyshev_differentiation_matrix(Ny)
+
+    Ix = np.eye(Nx)
+    Iy = np.eye(Ny)
+
+    Dx = np.kron(Iy, Dx_1d)
+    Dy = np.kron(Dy_1d, Ix)
+    return Dx, Dy
+
+
 def chebyshev_grid_2d(Nx: int, Ny: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate 2D Chebyshev tensor-product grid on [-1,1]^2.
@@ -224,6 +248,16 @@ def scale_laplacian(L: np.ndarray, ranges: list) -> np.ndarray:
         import warnings
         warnings.warn("Non-uniform domain scaling: using approximate Laplacian")
         return L * np.power(np.prod(scales), 1/len(scales))
+
+
+def scale_gradient(D: np.ndarray, range_: Tuple[float, float]) -> np.ndarray:
+    """
+    Scale first derivative for domain transformation using chain rule.
+
+    For x: [-1,1] -> [a,b]: d/dx = (2/(b-a)) * d/dx_ref
+    """
+    scale = 2.0 / (range_[1] - range_[0])
+    return D * scale
 
 
 # =============================================================================
