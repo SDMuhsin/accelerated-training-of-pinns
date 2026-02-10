@@ -37,7 +37,7 @@
 # COMMAND LINE ARGUMENTS
 # ============================================================================
 
-ACCOUNT=""
+ACCOUNT="def-seokbum"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -66,11 +66,11 @@ fi
 # Training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
 gradient_methods=(
-    autodiff
-    dtpinn
+    #autodiff
+    #dtpinn
     analytical
-    ropinn
-    sk-pinn
+    #ropinn
+    #sk-pinn
 )
 
 # Network architectures to benchmark
