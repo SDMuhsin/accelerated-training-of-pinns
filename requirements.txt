@@ -1,6 +1,4 @@
 numpy
-matplotlib
 scipy
-cupy
 torch
-cupy
+matplotlib

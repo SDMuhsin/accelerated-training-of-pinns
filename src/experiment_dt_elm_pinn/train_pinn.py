@@ -218,6 +218,10 @@ def build_model_kwargs(args, model_name: str) -> Dict[str, Any]:
         if model_name not in ['dt-elm-pinn-deep2', 'dt-elm-pinn-deep3', 'dt-elm-pinn-deep4']:
             kwargs['hidden_sizes'] = args.hidden_sizes
 
+        # PIELM uses n_hidden (single layer) instead of hidden_sizes
+        if model_name == 'pielm':
+            kwargs['n_hidden'] = args.hidden_sizes[0] if args.hidden_sizes else 100
+
         # Skip connections only for base dt-elm-pinn variants (not deep, they set their own)
         if model_name in ['dt-elm-pinn', 'dt-elm-pinn-cholesky', 'dt-elm-pinn-svd']:
             kwargs['use_skip_connections'] = not args.no_skip_connections
