@@ -66,18 +66,18 @@ fi
 # Training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
 gradient_methods=(
-    #autodiff
-    #dtpinn
+    autodiff
+    dtpinn
     analytical
-    #ropinn
-    #sk-pinn
+    ropinn
+    sk-pinn
 )
 
 # Network architectures to benchmark
 models=(
     mlp
-    #tsa-pinn
-    #pirate-net
+    tsa-pinn
+    pirate-net
 )
 
 # Random seeds for statistical significance (>=3 recommended)
