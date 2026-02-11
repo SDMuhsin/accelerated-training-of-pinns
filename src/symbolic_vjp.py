@@ -130,13 +130,23 @@ class TracedVar:
 # =============================================================================
 # Tracing helpers
 # =============================================================================
-def trace_pde_forward(compute_fn, N_all, tape, sparse=False):
+def trace_pde_forward(compute_fn, N_all, tape, sparse=False, constants=None):
     """Trace compute_pde_terms through TracedVar to build tape.
+
+    Args:
+        compute_fn: PDE forward function (pred, g) -> (continuity, mom_u, mom_v)
+        N_all: grid size (can be None for tracing)
+        tape: list to record operations
+        sparse: if True, use sparse matmul
+        constants: list of constant names for grid_data (default: ['Dx', 'Dy', 'Cs_d_sq'])
 
     Returns (output_vars, input_vars) where:
       - output_vars = (continuity, mom_u, mom_v) TracedVars
       - input_vars = {'u': TracedVar, 'v': TracedVar, 'p': TracedVar}
     """
+    if constants is None:
+        constants = ['Dx', 'Dy', 'Cs_d_sq']
+
     TracedVar._counter = 0
 
     # Create traced input variables
@@ -158,15 +168,9 @@ def trace_pde_forward(compute_fn, N_all, tape, sparse=False):
             raise KeyError(f"Unsupported slice: {key}")
 
     # Create traced grid_data with constant TracedVars for matrices
-    Dx = TracedVar('Dx', tape, is_const=True)
-    Dy = TracedVar('Dy', tape, is_const=True)
-    Cs_d_sq = TracedVar('Cs_d_sq', tape, is_const=True)
-
-    g = {
-        'Dx': Dx, 'Dy': Dy,
-        'Cs_d_sq': Cs_d_sq,
-        'N_all': N_all,
-    }
+    g = {'N_all': N_all}
+    for name in constants:
+        g[name] = TracedVar(name, tape, is_const=True)
 
     pred = FakePred()
     continuity, mom_u, mom_v = compute_fn(pred, g)
@@ -356,15 +360,21 @@ def _build_cadd_vjp(adj_name, entry):
 # =============================================================================
 # Code Emitter — generates optimized PyTorch backward function
 # =============================================================================
-def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False):
+def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False, func_name=None):
     """Generate a PyTorch backward function from symbolic adjoint expressions.
+
+    Args:
+        func_name: name for the generated function (default: 'generated_analytical_grad')
 
     Returns (source_code, compiled_fn).
     """
+    if func_name is None:
+        func_name = 'generated_analytical_grad'
+
     adj = symbolic_backward(tape, output_vars, seed_names)
 
     lines_v2 = []
-    lines_v2.append("def generated_analytical_grad(pred_det, g):")
+    lines_v2.append(f"def {func_name}(pred_det, g):")
     lines_v2.append("    import torch")
     lines_v2.append(f"    u = pred_det[:g['N_all'], 0:1]")
     lines_v2.append(f"    v = pred_det[:g['N_all'], 1:2]")
@@ -433,7 +443,7 @@ def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False):
     # Compile
     namespace = {'torch': torch}
     exec(source, namespace)
-    fn = namespace['generated_analytical_grad']
+    fn = namespace[func_name]
 
     return source, fn
 
@@ -489,24 +499,34 @@ def _emit_forward_op(entry, sparse=False):
 # =============================================================================
 # Public API
 # =============================================================================
-def generate_backward(sparse=False):
+def generate_backward(sparse=False, problem='cavity'):
     """Generate an optimized backward function for the PDE residuals.
 
     Args:
         sparse: if True, generate sparse variant for SK-PINN
+        problem: 'cavity' (NS+Smagorinsky) or 'kovasznay' (constant-viscosity NS)
 
     Returns:
         (source_code, backward_fn) tuple
     """
-    from src.lid_benchmark import compute_pde_terms, compute_pde_terms_sparse
-
-    compute_fn = compute_pde_terms_sparse if sparse else compute_pde_terms
+    if problem == 'kovasznay':
+        from src.lid_benchmark import compute_pde_kovasznay
+        compute_fn = compute_pde_kovasznay
+        constants = ['Dx', 'Dy']
+        func_name = 'generated_kovasznay_grad'
+    else:
+        from src.lid_benchmark import compute_pde_terms, compute_pde_terms_sparse
+        compute_fn = compute_pde_terms_sparse if sparse else compute_pde_terms
+        constants = ['Dx', 'Dy', 'Cs_d_sq']
+        func_name = 'generated_analytical_grad'
 
     tape = []
-    outputs, inputs = trace_pde_forward(compute_fn, None, tape, sparse=sparse)
+    outputs, inputs = trace_pde_forward(compute_fn, None, tape, sparse=sparse,
+                                         constants=constants)
 
     source, fn = emit_backward(
-        tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=sparse
+        tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=sparse,
+        func_name=func_name
     )
 
     return source, fn

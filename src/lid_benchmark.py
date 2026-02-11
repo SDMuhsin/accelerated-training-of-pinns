@@ -53,6 +53,11 @@ U_lid = 1.0
 nu_laminar = U_lid / Re  # 0.001
 Cs = 0.1
 
+# Kovasznay flow constants
+Re_kov = 40.0
+nu_kov = 1.0 / Re_kov  # 0.025
+lambda_kov = Re_kov / 2.0 - math.sqrt(Re_kov**2 / 4.0 + 4.0 * math.pi**2)
+
 LOG_INTERVAL = 5000
 
 mse = nn.MSELoss()
@@ -87,9 +92,12 @@ def _get_generated_backward(sparse=False):
 # =============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Unified benchmark for lid-driven cavity NS+Smagorinsky PINN methods",
+        description="Unified benchmark for PINN methods",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--problem", default="cavity",
+                        choices=["cavity", "kovasznay"],
+                        help="PDE problem to solve")
     parser.add_argument("--method", required=True,
                         choices=["autodiff", "dtpinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage"],
                         help="Training method")
@@ -526,6 +534,214 @@ def compute_pde_terms_sparse(pred, g):
     mom_u = u_conv + dp_dx - visc_u
     mom_v = v_conv + dp_dy - visc_v
     return continuity, mom_u, mom_v
+
+
+# =============================================================================
+# Kovasznay flow — exact solution, PDE forward, grid builders
+# =============================================================================
+def kovasznay_exact(x, y):
+    """Exact Kovasznay solution. x, y are tensors.
+
+    Returns (u, v, p) each with shape matching input.
+    """
+    lam = lambda_kov
+    u = 1.0 - torch.exp(lam * x) * torch.cos(2.0 * math.pi * y)
+    v = (lam / (2.0 * math.pi)) * torch.exp(lam * x) * torch.sin(2.0 * math.pi * y)
+    p = 0.5 * (1.0 - torch.exp(2.0 * lam * x))
+    return u, v, p
+
+
+def compute_pde_kovasznay(pred, g):
+    """Kovasznay PDE residuals via spectral differentiation matrices.
+
+    Standard incompressible NS with constant viscosity nu_kov = 1/Re_kov.
+    No Smagorinsky model.
+    """
+    u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+
+    du_dx = g['Dx'] @ u;  du_dy = g['Dy'] @ u
+    dv_dx = g['Dx'] @ v;  dv_dy = g['Dy'] @ v
+    dp_dx = g['Dx'] @ p;  dp_dy = g['Dy'] @ p
+
+    # Second derivatives for viscous term (constant viscosity)
+    d2u_dx2 = g['Dx'] @ du_dx;  d2u_dy2 = g['Dy'] @ du_dy
+    d2v_dx2 = g['Dx'] @ dv_dx;  d2v_dy2 = g['Dy'] @ dv_dy
+
+    # Continuity: du/dx + dv/dy = 0
+    continuity = du_dx + dv_dy
+
+    # Momentum-u: u*du/dx + v*du/dy + dp/dx - nu*(d2u/dx2 + d2u/dy2) = 0
+    mom_u = u * du_dx + v * du_dy + dp_dx - nu_kov * (d2u_dx2 + d2u_dy2)
+
+    # Momentum-v: u*dv/dx + v*dv/dy + dp/dy - nu*(d2v/dx2 + d2v/dy2) = 0
+    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu_kov * (d2v_dx2 + d2v_dy2)
+
+    return continuity, mom_u, mom_v
+
+
+def build_grid_data_kovasznay(N_grid, device):
+    """Build Chebyshev grid + spectral differentiation matrices for Kovasznay flow.
+
+    Domain: [-0.5, 1.0] x [-0.5, 1.5] (Lx=1.5, Ly=2.0).
+    Non-square domain requires separate Dx/Dy scaling.
+    All boundaries: Dirichlet BCs from exact solution.
+    """
+    Lx, Ly = 1.5, 2.0
+    x0, y0 = -0.5, -0.5
+
+    D1d = chebyshev_diff_matrix(N_grid)
+    # Scale for non-square domain: D_phys = D_ref * (2/L)
+    Dx_1d = D1d * (2.0 / Lx)
+    Dy_1d = D1d * (2.0 / Ly)
+
+    I_mat = np.eye(N_grid)
+    Dx_np = np.kron(I_mat, Dx_1d)
+    Dy_np = np.kron(Dy_1d, I_mat)
+
+    x_ref = chebyshev_points(N_grid)
+    x_phys = x0 + Lx * 0.5 * (x_ref + 1.0)  # map [-1,1] -> [x0, x0+Lx]
+    y_phys = y0 + Ly * 0.5 * (x_ref + 1.0)   # map [-1,1] -> [y0, y0+Ly]
+    xx, yy = np.meshgrid(x_phys, y_phys, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = ((xc < x0 + eps) | (xc > x0 + Lx - eps) |
+                   (yc < y0 + eps) | (yc > y0 + Ly - eps))
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    N_all = len(xy_grid)
+    N_bc = len(bc_idx)
+    M = len(interior_idx)
+
+    Dx = torch.tensor(Dx_np, dtype=torch.float32, device=device)
+    Dy = torch.tensor(Dy_np, dtype=torch.float32, device=device)
+    DxT = Dx.T.contiguous()
+    DyT = Dy.T.contiguous()
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_bc = xy_all[bc_idx]
+
+    interior_mask = torch.zeros(N_all, 1, device=device)
+    interior_mask[interior_idx] = 1.0
+
+    # Exact BC values
+    x_bc = xy_bc[:, 0:1]
+    y_bc = xy_bc[:, 1:2]
+    u_ex, v_ex, p_ex = kovasznay_exact(x_bc, y_bc)
+    bc_target = torch.cat([u_ex, v_ex, p_ex], dim=1)  # (N_bc, 3)
+
+    # Pressure reference at domain center
+    x_center = torch.tensor([[x0 + Lx / 2, y0 + Ly / 2]], dtype=torch.float32, device=device)
+    u_ctr, v_ctr, p_ctr = kovasznay_exact(x_center[:, 0:1], x_center[:, 1:2])
+    p_center_exact = p_ctr.item()
+
+    # Batched input: all grid + BC points + center
+    xy_batched = torch.cat([xy_all, xy_bc, x_center], dim=0)
+    off_bc = N_all
+    off_center = N_all + N_bc
+
+    return {
+        'Dx': Dx, 'Dy': Dy, 'DxT': DxT, 'DyT': DyT,
+        'xy_all': xy_all, 'xy_bc': xy_bc, 'xy_batched': xy_batched,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'interior_mask': interior_mask,
+        'bc_target': bc_target, 'p_center_exact': p_center_exact,
+        'N_all': N_all, 'N_bc': N_bc, 'M': M,
+        'off_bc': off_bc, 'off_center': off_center,
+        'N_grid': N_grid, 'Lx': Lx, 'Ly': Ly,
+    }
+
+
+def build_collocation_points_kovasznay(N_grid, device):
+    """Build Chebyshev collocation points for Kovasznay autograd method."""
+    Lx, Ly = 1.5, 2.0
+    x0, y0 = -0.5, -0.5
+
+    x_ref = chebyshev_points(N_grid)
+    x_phys = x0 + Lx * 0.5 * (x_ref + 1.0)
+    y_phys = y0 + Ly * 0.5 * (x_ref + 1.0)
+    xx, yy = np.meshgrid(x_phys, y_phys, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = ((xc < x0 + eps) | (xc > x0 + Lx - eps) |
+                   (yc < y0 + eps) | (yc > y0 + Ly - eps))
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    xy_int = torch.tensor(xy_grid[interior_idx], dtype=torch.float32, device=device)
+    xy_bc = torch.tensor(xy_grid[bc_idx], dtype=torch.float32, device=device)
+
+    # Exact BC values
+    u_ex, v_ex, p_ex = kovasznay_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([u_ex, v_ex, p_ex], dim=1)
+
+    # Center point
+    x_center = torch.tensor([[-0.5 + Lx / 2, -0.5 + Ly / 2]], dtype=torch.float32, device=device)
+    _, _, p_ctr = kovasznay_exact(x_center[:, 0:1], x_center[:, 1:2])
+    p_center_exact = p_ctr.item()
+
+    return {
+        'xy_interior': xy_int,
+        'xy_bc': xy_bc,
+        'bc_target': bc_target,
+        'xy_center': x_center,
+        'p_center_exact': p_center_exact,
+        'N_interior': len(interior_idx),
+        'N_bc': len(bc_idx),
+        'N_grid': N_grid,
+    }
+
+
+def pde_residuals_kovasznay_autodiff(model, xy):
+    """Kovasznay PDE residuals via autograd. xy must have requires_grad=True."""
+    pred = model(xy)
+    u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+
+    grad_u = gradients(u, xy)
+    grad_v = gradients(v, xy)
+    grad_p = gradients(p, xy)
+    du_dx, du_dy = grad_u[:, 0:1], grad_u[:, 1:2]
+    dv_dx, dv_dy = grad_v[:, 0:1], grad_v[:, 1:2]
+    dp_dx, dp_dy = grad_p[:, 0:1], grad_p[:, 1:2]
+
+    # Second derivatives
+    grad_du_dx = gradients(du_dx, xy)
+    grad_du_dy = gradients(du_dy, xy)
+    grad_dv_dx = gradients(dv_dx, xy)
+    grad_dv_dy = gradients(dv_dy, xy)
+    d2u_dx2 = grad_du_dx[:, 0:1]
+    d2u_dy2 = grad_du_dy[:, 1:2]
+    d2v_dx2 = grad_dv_dx[:, 0:1]
+    d2v_dy2 = grad_dv_dy[:, 1:2]
+
+    continuity = du_dx + dv_dy
+    mom_u = u * du_dx + v * du_dy + dp_dx - nu_kov * (d2u_dx2 + d2u_dy2)
+    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu_kov * (d2v_dx2 + d2v_dy2)
+
+    return continuity, mom_u, mom_v
+
+
+# Lazy-initialized generated backward for Kovasznay
+_generated_kovasznay_backward = None
+
+def _get_generated_backward_kovasznay():
+    """Lazily generate and cache backward function for Kovasznay PDE."""
+    global _generated_kovasznay_backward
+    if _generated_kovasznay_backward is None:
+        from src.symbolic_vjp import trace_pde_forward, emit_backward
+        tape = []
+        outputs, inputs = trace_pde_forward(
+            compute_pde_kovasznay, None, tape, sparse=False,
+            constants=['Dx', 'Dy'])
+        _, _generated_kovasznay_backward = emit_backward(
+            tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=False,
+            func_name='generated_kovasznay_grad')
+    return _generated_kovasznay_backward
 
 
 # =============================================================================
@@ -1464,7 +1680,7 @@ def train_pielm(seed, grid_size):
 # CSV output with file locking
 # =============================================================================
 CSV_COLUMNS = [
-    'timestamp', 'method', 'model', 'optimizer', 'lr', 'epochs', 'seed', 'grid_size',
+    'timestamp', 'problem', 'method', 'model', 'optimizer', 'lr', 'epochs', 'seed', 'grid_size',
     'technique', 'tag',
     'train_time_s', 'train_time_min', 'peak_gpu_memory_mb', 'gpu_memory_reserved_mb',
     'ms_per_epoch', 'n_params',
@@ -1545,6 +1761,567 @@ def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
 
 
 # =============================================================================
+# Kovasznay training methods
+# =============================================================================
+
+# --- Method: sage (Kovasznay) ---
+def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+    """SAGE: auto-generated backward for Kovasznay flow."""
+    g = build_grid_data_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    generated_backward = _get_generated_backward_kovasznay()
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_bc = pred_batch[g['off_bc']:g['off_center']]
+            pred_c = pred_batch[g['off_center']:]
+
+            grad_pde = generated_backward(pred_pde, g)
+
+            N_bc = g['N_bc']
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / N_bc
+
+            grad_center = torch.zeros(1, 3, device=device)
+            grad_center[:, 2:3] = 2.0 * (pred_c[:, 2:3] - g['p_center_exact'])
+
+            upstream = torch.cat([grad_pde, grad_bc, grad_center], dim=0)
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            with torch.no_grad():
+                c, mu, mv = compute_pde_kovasznay(pred_pde, g)
+                ii = g['interior_idx']
+                lv = (c[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                final_loss = lv.item()
+            print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: dtpinn (Kovasznay) ---
+def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+    """Standard DT-PINN for Kovasznay flow: spectral matrices, autograd backward."""
+    g = build_grid_data_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred = compiled_model(g['xy_all'])
+        continuity, mom_u, mom_v = compute_pde_kovasznay(pred, g)
+        ii = g['interior_idx']
+        loss_pde = mse(continuity[ii], torch.zeros_like(continuity[ii])) + \
+                   mse(mom_u[ii], torch.zeros_like(mom_u[ii])) + \
+                   mse(mom_v[ii], torch.zeros_like(mom_v[ii]))
+
+        pred_bc = compiled_model(g['xy_bc'])
+        loss_bc = mse(pred_bc, g['bc_target'])
+
+        xy_center = g['xy_batched'][g['off_center']:]
+        pred_c = compiled_model(xy_center)
+        p_target = torch.tensor([[g['p_center_exact']]], dtype=torch.float32, device=device)
+        loss_p = mse(pred_c[:, 2:3], p_target)
+
+        loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: autodiff (Kovasznay) ---
+def train_autodiff_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+    """Plain autodiff PINN for Kovasznay flow."""
+    coll = build_collocation_points_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    if technique == "compile":
+        model = torch.compile(model, mode='reduce-overhead')
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    xy_int = coll['xy_interior'].clone().requires_grad_(True)
+    xy_bc = coll['xy_bc']
+    bc_target = coll['bc_target']
+    xy_center = coll['xy_center']
+    p_center_exact = coll['p_center_exact']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        continuity, mom_u, mom_v = pde_residuals_kovasznay_autodiff(model, xy_int)
+        loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                   mse(mom_u, torch.zeros_like(mom_u)) + \
+                   mse(mom_v, torch.zeros_like(mom_v))
+
+        pred_bc = model(xy_bc)
+        loss_bc = mse(pred_bc, bc_target)
+
+        pred_c = model(xy_center)
+        p_target = torch.tensor([[p_center_exact]], dtype=torch.float32, device=device)
+        loss_p = mse(pred_c[:, 2:3], p_target)
+
+        loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    return base_model, train_time, final_loss
+
+
+# --- Method: ropinn (Kovasznay) ---
+def train_ropinn_kovasznay(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp"):
+    """RoPINN: region-optimized PINN with trust region calibration for Kovasznay flow."""
+    coll = build_collocation_points_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    if technique == "compile":
+        model = torch.compile(model, mode='reduce-overhead')
+
+    xy_int_base = coll['xy_interior']
+    xy_bc = coll['xy_bc']
+    bc_target = coll['bc_target']
+    xy_center = coll['xy_center']
+    p_center_exact = coll['p_center_exact']
+
+    # Kovasznay domain bounds for clamping
+    x_lo, x_hi = -0.5, 1.0
+    y_lo, y_hi = -0.5, 1.5
+
+    gradient_list = []
+    gradient_variance = 1.0
+    final_loss = float('nan')
+
+    if optimizer_type == "lbfgs":
+        optimizer = torch.optim.LBFGS(model.parameters(), line_search_fn='strong_wolfe')
+        gradient_list_overall = []
+        gradient_list_temp = []
+
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for epoch in range(n_epochs):
+            current_region = np.clip(
+                ROPINN_INITIAL_REGION / gradient_variance,
+                a_min=0, a_max=ROPINN_REGION_MAX
+            )
+
+            def closure():
+                optimizer.zero_grad()
+                perturbation = torch.rand_like(xy_int_base) * current_region
+                xy_perturbed = xy_int_base + perturbation
+                # Clamp to Kovasznay domain
+                xy_perturbed[:, 0].clamp_(x_lo, x_hi)
+                xy_perturbed[:, 1].clamp_(y_lo, y_hi)
+                xy_perturbed = xy_perturbed.detach().requires_grad_(True)
+
+                continuity, mom_u, mom_v = pde_residuals_kovasznay_autodiff(model, xy_perturbed)
+                loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                           mse(mom_u, torch.zeros_like(mom_u)) + \
+                           mse(mom_v, torch.zeros_like(mom_v))
+
+                pred_bc = model(xy_bc)
+                loss_bc = mse(pred_bc, bc_target)
+
+                pred_c = model(xy_center)
+                p_target = torch.tensor([[p_center_exact]], dtype=torch.float32, device=device)
+                loss_p = mse(pred_c[:, 2:3], p_target)
+
+                loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+                loss.backward()
+
+                grads = []
+                for p in model.parameters():
+                    if p.grad is not None:
+                        grads.append(p.grad.view(-1))
+                flat_grad = torch.cat(grads).cpu().numpy()
+                gradient_list_temp.append(flat_grad)
+
+                return loss
+
+            loss = optimizer.step(closure)
+            final_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
+
+            if gradient_list_temp:
+                avg_gradient = np.mean(np.array(gradient_list_temp), axis=0)
+                gradient_list_overall.append(avg_gradient)
+                gradient_list_overall = gradient_list_overall[-ROPINN_PAST_ITERATIONS:]
+                gradient_variance = compute_gradient_variance(gradient_list_overall)
+                gradient_list_temp.clear()
+
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
+                      f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+
+    else:  # adam
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for epoch in range(n_epochs):
+            optimizer.zero_grad()
+
+            current_region = np.clip(
+                ROPINN_INITIAL_REGION / gradient_variance,
+                a_min=0, a_max=ROPINN_REGION_MAX
+            )
+
+            perturbation = torch.rand_like(xy_int_base) * current_region
+            xy_perturbed = xy_int_base + perturbation
+            # Clamp to Kovasznay domain
+            xy_perturbed[:, 0].clamp_(x_lo, x_hi)
+            xy_perturbed[:, 1].clamp_(y_lo, y_hi)
+            xy_perturbed = xy_perturbed.detach().requires_grad_(True)
+
+            continuity, mom_u, mom_v = pde_residuals_kovasznay_autodiff(model, xy_perturbed)
+            loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                       mse(mom_u, torch.zeros_like(mom_u)) + \
+                       mse(mom_v, torch.zeros_like(mom_v))
+
+            pred_bc = model(xy_bc)
+            loss_bc = mse(pred_bc, bc_target)
+
+            pred_c = model(xy_center)
+            p_target = torch.tensor([[p_center_exact]], dtype=torch.float32, device=device)
+            loss_p = mse(pred_c[:, 2:3], p_target)
+
+            loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+            loss.backward()
+            optimizer.step()
+
+            final_loss = loss.item()
+
+            # Gradient tracking for trust region calibration
+            grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.view(-1))
+            flat_grad = torch.cat(grads).cpu().numpy()
+            gradient_list.append(flat_grad)
+            gradient_list = gradient_list[-ROPINN_PAST_ITERATIONS:]
+            gradient_variance = compute_gradient_variance(gradient_list)
+
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
+                      f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    return base_model, train_time, final_loss
+
+
+# --- SK-PINN support for Kovasznay ---
+def build_sk_data_kovasznay(N_grid, device):
+    """Build SK-PINN RKPM differentiation matrices for Kovasznay flow.
+
+    Uniform grid on [-0.5, 1.0] x [-0.5, 1.5] (non-square: Lx=1.5, Ly=2.0).
+    No Smagorinsky model — no Cs_d_sq or d_wall.
+    """
+    Lx, Ly = 1.5, 2.0
+    x0, y0 = -0.5, -0.5
+
+    dx = Lx / (N_grid - 1)
+    dy = Ly / (N_grid - 1)
+    h = min(dx, dy) * 1.4
+    radius = 2.0 * h
+    dxdy = dx * dy
+
+    # Uniform grid on non-square domain
+    x = np.linspace(x0, x0 + Lx, N_grid)
+    y = np.linspace(y0, y0 + Ly, N_grid)
+    xx, yy = np.meshgrid(x, y, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+    N_all = len(xy_grid)
+
+    print(f"  SK-PINN Kovasznay: building RKPM matrices for {N_grid}x{N_grid} uniform grid...")
+    print(f"  Lx={Lx}, Ly={Ly}, dx={dx:.6f}, dy={dy:.6f}, h={h:.6f}, radius={radius:.6f}")
+
+    # Neighbor search + kernel + RKPM correction
+    neighborhoods, distances, distance_vectors = _sk_find_neighborhoods(xy_grid, radius)
+    kernel = _sk_sph_kernel(distances, h)
+    C = _sk_compute_C(distance_vectors, kernel.unsqueeze(-1), dxdy, order=2)
+
+    # Assemble sparse Dx, Dy matrices (COO format)
+    kernel_np = kernel.numpy()
+    C_np = C.numpy()
+    nb_np = neighborhoods.numpy()
+
+    rows, cols, dx_vals, dy_vals = [], [], [], []
+    for i in range(N_all):
+        for j_idx in range(nb_np.shape[1]):
+            j = nb_np[i, j_idx]
+            if j == -1:
+                break
+            w = kernel_np[i, j_idx]
+            dx_val = C_np[i, j_idx, 0] * w
+            dy_val = C_np[i, j_idx, 1] * w
+            if dx_val != 0 or dy_val != 0:
+                rows.append(i)
+                cols.append(j)
+                dx_vals.append(dx_val)
+                dy_vals.append(dy_val)
+
+    nnz = len(rows)
+    indices = torch.tensor([rows, cols], dtype=torch.long)
+    Dx = torch.sparse_coo_tensor(
+        indices, torch.tensor(dx_vals, dtype=torch.float32), (N_all, N_all)
+    ).to(device).coalesce()
+    Dy = torch.sparse_coo_tensor(
+        indices, torch.tensor(dy_vals, dtype=torch.float32), (N_all, N_all)
+    ).to(device).coalesce()
+
+    print(f"  SK-PINN Kovasznay: sparse Dx/Dy nnz={nnz}/{N_all*N_all} "
+          f"({100*nnz/(N_all*N_all):.2f}% dense)")
+
+    # Boundary classification
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = ((xc < x0 + eps) | (xc > x0 + Lx - eps) |
+                   (yc < y0 + eps) | (yc > y0 + Ly - eps))
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    N_bc = len(bc_idx)
+    M = len(interior_idx)
+
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_bc = xy_all[bc_idx]
+
+    # Exact BC values from Kovasznay solution
+    u_ex, v_ex, p_ex = kovasznay_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([u_ex, v_ex, p_ex], dim=1)
+
+    # Pressure reference at domain center
+    xy_center = torch.tensor([[x0 + Lx / 2, y0 + Ly / 2]], dtype=torch.float32, device=device)
+    _, _, p_ctr = kovasznay_exact(xy_center[:, 0:1], xy_center[:, 1:2])
+    p_center_exact = p_ctr.item()
+
+    interior_mask = torch.zeros(N_all, 1, device=device)
+    interior_mask[interior_idx] = 1.0
+
+    print(f"  SK-PINN Kovasznay: N_all={N_all}, interior={M}, bc={N_bc}")
+
+    return {
+        'Dx': Dx, 'Dy': Dy,
+        'sparse': True,
+        'xy_all': xy_all, 'xy_bc': xy_bc, 'bc_target': bc_target,
+        'xy_center': xy_center, 'p_center_exact': p_center_exact,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'interior_mask': interior_mask,
+        'N_all': N_all, 'N_bc': N_bc, 'M': M, 'N_grid': N_grid,
+    }
+
+
+def compute_pde_kovasznay_sparse(pred, g):
+    """Kovasznay PDE residuals via sparse RKPM differentiation matrices.
+
+    Constant viscosity NS (no Smagorinsky).
+    """
+    Dx, Dy = g['Dx'], g['Dy']
+    u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+
+    du_dx = torch.sparse.mm(Dx, u);  du_dy = torch.sparse.mm(Dy, u)
+    dv_dx = torch.sparse.mm(Dx, v);  dv_dy = torch.sparse.mm(Dy, v)
+    dp_dx = torch.sparse.mm(Dx, p);  dp_dy = torch.sparse.mm(Dy, p)
+
+    # Second derivatives for viscous term
+    d2u_dx2 = torch.sparse.mm(Dx, du_dx);  d2u_dy2 = torch.sparse.mm(Dy, du_dy)
+    d2v_dx2 = torch.sparse.mm(Dx, dv_dx);  d2v_dy2 = torch.sparse.mm(Dy, dv_dy)
+
+    # Continuity
+    continuity = du_dx + dv_dy
+
+    # Momentum (constant viscosity)
+    mom_u = u * du_dx + v * du_dy + dp_dx - nu_kov * (d2u_dx2 + d2u_dy2)
+    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu_kov * (d2v_dx2 + d2v_dy2)
+
+    return continuity, mom_u, mom_v
+
+
+def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
+    """SK-PINN for Kovasznay flow: sparse RKPM matrices, autograd backward.
+
+    Uses weight decay to prevent model from learning beyond RKPM resolution.
+    """
+    g = grid_data
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred = model(g['xy_all'])
+        continuity, mom_u, mom_v = compute_pde_kovasznay_sparse(pred, g)
+        ii = g['interior_idx']
+        loss_pde = mse(continuity[ii], torch.zeros_like(continuity[ii])) + \
+                   mse(mom_u[ii], torch.zeros_like(mom_u[ii])) + \
+                   mse(mom_v[ii], torch.zeros_like(mom_v[ii]))
+
+        pred_bc = model(g['xy_bc'])
+        loss_bc = mse(pred_bc, g['bc_target'])
+
+        pred_c = model(g['xy_center'])
+        p_target = torch.tensor([[g['p_center_exact']]], dtype=torch.float32, device=device)
+        loss_p = mse(pred_c[:, 2:3], p_target)
+
+        loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# =============================================================================
+# Kovasznay evaluation
+# =============================================================================
+def evaluate_kovasznay(model, device):
+    """Evaluate Kovasznay flow on 51x51 uniform grid: PDE residuals + solution error."""
+    Lx, Ly = 1.5, 2.0
+    x0, y0 = -0.5, -0.5
+    nx, ny = 51, 51
+    x = np.linspace(x0, x0 + Lx, nx)
+    y = np.linspace(y0, y0 + Ly, ny)
+    X, Y = np.meshgrid(x, y)
+    xy_eval = np.column_stack([X.ravel(), Y.ravel()])
+    xy_t = torch.tensor(xy_eval, dtype=torch.float32, device=device, requires_grad=True)
+
+    model.eval()
+    pred = model(xy_t)
+    u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
+
+    # PDE residuals via autograd
+    grad_u = gradients(u, xy_t); grad_v = gradients(v, xy_t); grad_p = gradients(p, xy_t)
+    du_dx, du_dy = grad_u[:, 0:1], grad_u[:, 1:2]
+    dv_dx, dv_dy = grad_v[:, 0:1], grad_v[:, 1:2]
+    dp_dx, dp_dy = grad_p[:, 0:1], grad_p[:, 1:2]
+
+    grad_du_dx = gradients(du_dx, xy_t); grad_du_dy = gradients(du_dy, xy_t)
+    grad_dv_dx = gradients(dv_dx, xy_t); grad_dv_dy = gradients(dv_dy, xy_t)
+    d2u_dx2 = grad_du_dx[:, 0:1]; d2u_dy2 = grad_du_dy[:, 1:2]
+    d2v_dx2 = grad_dv_dx[:, 0:1]; d2v_dy2 = grad_dv_dy[:, 1:2]
+
+    continuity = du_dx + dv_dy
+    mom_u = u * du_dx + v * du_dy + dp_dx - nu_kov * (d2u_dx2 + d2u_dy2)
+    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu_kov * (d2v_dx2 + d2v_dy2)
+
+    cont_np = continuity.detach().cpu().numpy().flatten()
+    mom_u_np = mom_u.detach().cpu().numpy().flatten()
+    mom_v_np = mom_v.detach().cpu().numpy().flatten()
+
+    pde_rms = float(np.sqrt(np.mean(cont_np**2 + mom_u_np**2 + mom_v_np**2)))
+    cont_rms = float(np.sqrt(np.mean(cont_np**2)))
+    mom_rms = float(np.sqrt(np.mean(mom_u_np**2 + mom_v_np**2)))
+
+    # Solution error vs exact
+    x_coords = xy_t[:, 0:1].detach()
+    y_coords = xy_t[:, 1:2].detach()
+    u_ex, v_ex, p_ex = kovasznay_exact(x_coords, y_coords)
+
+    u_err = (u.detach() - u_ex).cpu().numpy().flatten()
+    v_err = (v.detach() - v_ex).cpu().numpy().flatten()
+    p_err = (p.detach() - p_ex).cpu().numpy().flatten()
+    u_rms_err = float(np.sqrt(np.mean(u_err**2)))
+    v_rms_err = float(np.sqrt(np.mean(v_err**2)))
+    p_rms_err = float(np.sqrt(np.mean(p_err**2)))
+
+    model.train()
+    return {
+        'pde_rms': pde_rms, 'continuity_rms': cont_rms, 'momentum_rms': mom_rms,
+        'u_rms_error': u_rms_err, 'v_rms_error': v_rms_err, 'p_rms_error': p_rms_err,
+    }
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -1552,17 +2329,33 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Per-method default grid sizes
-    if args.grid_size is None:
-        method_defaults = {
-            'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
-            'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
-        }
-        args.grid_size = method_defaults[args.method]
+    is_kovasznay = (args.problem == "kovasznay")
 
+    # Validate problem + method combinations
+    if is_kovasznay and args.method not in ("sage", "dtpinn", "autodiff", "ropinn", "sk-pinn"):
+        print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn methods, "
+              f"not '{args.method}'")
+        sys.exit(1)
+
+    # Per-method default grid sizes (problem-aware)
+    if args.grid_size is None:
+        if is_kovasznay:
+            if args.method == 'sk-pinn':
+                args.grid_size = 150
+            else:
+                args.grid_size = 30
+        else:
+            method_defaults = {
+                'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
+                'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
+            }
+            args.grid_size = method_defaults[args.method]
+
+    problem_label = "Kovasznay Flow (Re=40)" if is_kovasznay else "Lid-Driven Cavity NS+Smagorinsky"
     print("=" * 70)
-    print("UNIFIED BENCHMARK: Lid-Driven Cavity NS+Smagorinsky")
+    print(f"UNIFIED BENCHMARK: {problem_label}")
     print("=" * 70)
+    print(f"Problem:   {args.problem}")
     print(f"Method:    {args.method}")
     print(f"Model:     {args.model}")
     print(f"Optimizer: {args.optimizer}")
@@ -1607,50 +2400,78 @@ def main():
             torch.cuda.reset_peak_memory_stats()
 
         # ---- Train ----
-        if args.method == "autodiff":
-            model, train_time, final_loss = train_autodiff(
-                args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                args.model)
+        if is_kovasznay:
+            # Kovasznay problem dispatch
+            if args.method == "sage":
+                model, train_time, final_loss = train_sage_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+            elif args.method == "dtpinn":
+                model, train_time, final_loss = train_dtpinn_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+            elif args.method == "autodiff":
+                model, train_time, final_loss = train_autodiff_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+            elif args.method == "ropinn":
+                model, train_time, final_loss = train_ropinn_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
+                    args.grid_size, args.model)
+            elif args.method == "sk-pinn":
+                g = build_sk_data_kovasznay(args.grid_size, device)
+                model, train_time, final_loss = train_sk_pinn_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size,
+                    args.model, g)
             n_params = sum(p.numel() for p in model.parameters())
+        else:
+            # Cavity problem dispatch (original)
+            if args.method == "autodiff":
+                model, train_time, final_loss = train_autodiff(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+                n_params = sum(p.numel() for p in model.parameters())
 
-        elif args.method == "dtpinn":
-            model, train_time, final_loss = train_dtpinn(
-                args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                args.model)
-            n_params = sum(p.numel() for p in model.parameters())
+            elif args.method == "dtpinn":
+                model, train_time, final_loss = train_dtpinn(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+                n_params = sum(p.numel() for p in model.parameters())
 
-        elif args.method == "analytical":
-            model, train_time, final_loss = train_analytical(
-                args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                args.model)
-            n_params = sum(p.numel() for p in model.parameters())
+            elif args.method == "analytical":
+                model, train_time, final_loss = train_analytical(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+                n_params = sum(p.numel() for p in model.parameters())
 
-        elif args.method == "ropinn":
-            model, train_time, final_loss = train_ropinn(
-                args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
-                args.grid_size, args.model)
-            n_params = sum(p.numel() for p in model.parameters())
+            elif args.method == "ropinn":
+                model, train_time, final_loss = train_ropinn(
+                    args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
+                    args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
 
-        elif args.method == "pielm":
-            model, train_time, final_loss = train_pielm(args.seed, args.grid_size)
-            n_params = model.n_hidden * 3  # output weights only (hidden frozen)
+            elif args.method == "pielm":
+                model, train_time, final_loss = train_pielm(args.seed, args.grid_size)
+                n_params = model.n_hidden * 3  # output weights only (hidden frozen)
 
-        elif args.method == "sk-pinn":
-            g = build_sk_data(args.grid_size, device)
-            model, train_time, final_loss = train_sk_pinn(
-                args.seed, device, args.epochs, args.lr, args.grid_size,
-                args.model, g)
-            n_params = sum(p.numel() for p in model.parameters())
+            elif args.method == "sk-pinn":
+                g = build_sk_data(args.grid_size, device)
+                model, train_time, final_loss = train_sk_pinn(
+                    args.seed, device, args.epochs, args.lr, args.grid_size,
+                    args.model, g)
+                n_params = sum(p.numel() for p in model.parameters())
 
-        elif args.method == "sage":
-            model, train_time, final_loss = train_sage(
-                args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                args.model)
-            n_params = sum(p.numel() for p in model.parameters())
+            elif args.method == "sage":
+                model, train_time, final_loss = train_sage(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model)
+                n_params = sum(p.numel() for p in model.parameters())
 
         # ---- Evaluate ----
         print("\nEvaluating on 51x51 uniform grid...")
-        if args.method == "pielm":
+        if is_kovasznay:
+            metrics = evaluate_kovasznay(model, device)
+        elif args.method == "pielm":
             metrics = evaluate_pielm(model)
         else:
             metrics = evaluate_model(model, device)
@@ -1685,12 +2506,17 @@ def main():
     print(f"PDE RMS:         {metrics['pde_rms']:.6f}")
     print(f"Continuity RMS:  {metrics['continuity_rms']:.6f}")
     print(f"Momentum RMS:    {metrics['momentum_rms']:.6f}")
+    if is_kovasznay and 'u_rms_error' in metrics:
+        print(f"u RMS error:     {metrics['u_rms_error']:.6f}")
+        print(f"v RMS error:     {metrics['v_rms_error']:.6f}")
+        print(f"p RMS error:     {metrics['p_rms_error']:.6f}")
     print(f"Final loss:      {final_loss}")
     print("=" * 70)
 
     # ---- Write CSV row ----
     row = {
         'timestamp': datetime.now().isoformat(),
+        'problem': args.problem,
         'method': args.method,
         'model': args.model if args.method != "pielm" else "pielm",
         'optimizer': args.optimizer if args.method != "pielm" else "direct",
