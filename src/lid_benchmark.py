@@ -120,6 +120,10 @@ def parse_args():
                         help="Path to CSV output file")
     parser.add_argument("--tag", default="",
                         help="Optional string tag for this run")
+    parser.add_argument("--track", action="store_true",
+                        help="Enable per-epoch tracking for ablation studies")
+    parser.add_argument("--track-interval", type=int, default=100,
+                        help="Epoch interval for tracking evaluations")
     return parser.parse_args()
 
 
@@ -983,11 +987,83 @@ def evaluate_pielm(pielm_model):
 
 
 # =============================================================================
+# Training tracker for ablation studies
+# =============================================================================
+
+TRACKING_COLUMNS = [
+    'problem', 'method', 'model', 'optimizer', 'lr', 'seed', 'grid_size',
+    'technique', 'tag', 'epoch', 'train_loss',
+    'pde_rms', 'continuity_rms', 'momentum_rms',
+    'u_rms_error', 'v_rms_error', 'p_rms_error',
+]
+
+
+class TrainingTracker:
+    """Periodically evaluates model during training and writes per-epoch stats to CSV."""
+
+    def __init__(self, args, device):
+        self.interval = args.track_interval
+        self.is_kovasznay = (args.problem == "kovasznay")
+        self.device = device
+        tag_part = f"_{args.tag}" if args.tag else ""
+        self.csv_path = (f"results/tracking_{args.problem}_{args.method}"
+                         f"_{args.model}_s{args.seed}{tag_part}.csv")
+        self.metadata = {
+            'problem': args.problem,
+            'method': args.method,
+            'model': args.model if args.method != "pielm" else "pielm",
+            'optimizer': args.optimizer,
+            'lr': args.lr,
+            'seed': args.seed,
+            'grid_size': args.grid_size,
+            'technique': args.technique,
+            'tag': args.tag,
+        }
+        self._initialized = False
+
+    def _init_csv(self):
+        """Write CSV header on first call."""
+        os.makedirs(os.path.dirname(self.csv_path) or '.', exist_ok=True)
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=TRACKING_COLUMNS)
+            writer.writeheader()
+        self._initialized = True
+
+    def step(self, epoch, train_loss, model):
+        """Call every epoch. At self.interval boundaries, evaluate and log."""
+        if (epoch + 1) % self.interval != 0:
+            return
+        if not self._initialized:
+            self._init_csv()
+
+        # Unwrap compiled model if needed
+        base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        if self.is_kovasznay:
+            metrics = evaluate_kovasznay(base_model, self.device)
+        else:
+            metrics = evaluate_model(base_model, self.device)
+
+        row = dict(self.metadata)
+        row['epoch'] = epoch + 1
+        row['train_loss'] = round(train_loss, 8) if not math.isnan(train_loss) else 'NaN'
+        row['pde_rms'] = round(metrics['pde_rms'], 6)
+        row['continuity_rms'] = round(metrics['continuity_rms'], 6)
+        row['momentum_rms'] = round(metrics['momentum_rms'], 6)
+        row['u_rms_error'] = round(metrics['u_rms_error'], 6) if 'u_rms_error' in metrics else ''
+        row['v_rms_error'] = round(metrics['v_rms_error'], 6) if 'v_rms_error' in metrics else ''
+        row['p_rms_error'] = round(metrics['p_rms_error'], 6) if 'p_rms_error' in metrics else ''
+
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=TRACKING_COLUMNS)
+            writer.writerow(row)
+
+
+# =============================================================================
 # TRAINING METHODS
 # =============================================================================
 
 # --- Method: autodiff ---
-def train_autodiff(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+def train_autodiff(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
     """Plain autodiff PINN: autograd derivatives, separate forward passes."""
     coll = build_collocation_points(grid_size, device)
 
@@ -1054,6 +1130,8 @@ def train_autodiff(seed, device, n_epochs, lr, technique, grid_size, model_name=
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1065,7 +1143,7 @@ def train_autodiff(seed, device, n_epochs, lr, technique, grid_size, model_name=
 
 
 # --- Method: dtpinn ---
-def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None):
+def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None, tracker=None):
     """Standard DT-PINN: spectral matrices, separate forward passes, autograd backward."""
     g = grid_data or build_grid_data(grid_size, device)
 
@@ -1135,6 +1213,8 @@ def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="m
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1143,7 +1223,7 @@ def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="m
 
 
 # --- Method: analytical ---
-def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None):
+def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None, tracker=None):
     """Analytical Jacobian: batched forward, analytical backward."""
     g = grid_data or build_grid_data(grid_size, device)
 
@@ -1225,7 +1305,8 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
                 reg.backward()
             optimizer.step()
 
-        if (epoch + 1) % LOG_INTERVAL == 0:
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
             with torch.no_grad():
                 u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
                 du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
@@ -1243,7 +1324,10 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
                 ii = g['interior_idx']
                 lv = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
                 final_loss = lv.item()
-            print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1252,7 +1336,7 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
 
 
 # --- Method: sage (Symbolic Analytical Gradient Engine) ---
-def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
     """SAGE: auto-generated backward via symbolic VJP engine."""
     g = build_grid_data(grid_size, device)
 
@@ -1301,7 +1385,8 @@ def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp
             reg.backward()
         optimizer.step()
 
-        if (epoch + 1) % LOG_INTERVAL == 0:
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
             with torch.no_grad():
                 u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
                 du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
@@ -1319,7 +1404,10 @@ def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp
                 ii = g['interior_idx']
                 lv = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
                 final_loss = lv.item()
-            print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1515,7 +1603,7 @@ def _train_analytical_cuda_graph(model, optimizer, g, n_epochs, device):
 
 
 # --- Method: ropinn ---
-def train_ropinn(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp"):
+def train_ropinn(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp", tracker=None):
     """RoPINN: region-optimized PINN with trust region calibration."""
     coll = build_collocation_points(grid_size, device)
 
@@ -1595,6 +1683,8 @@ def train_ropinn(seed, device, n_epochs, lr, optimizer_type, technique, grid_siz
             if (epoch + 1) % LOG_INTERVAL == 0:
                 print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
                       f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
 
     else:  # adam
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -1649,6 +1739,8 @@ def train_ropinn(seed, device, n_epochs, lr, optimizer_type, technique, grid_siz
             if (epoch + 1) % LOG_INTERVAL == 0:
                 print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
                       f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1707,7 +1799,7 @@ def append_csv_row(csv_path, row_dict):
 
 
 # --- Method: sk-pinn ---
-def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
+def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
     """SK-PINN: sparse RKPM differentiation matrices, autograd backward.
 
     Uses weight decay to prevent the model from learning high-frequency features
@@ -1753,6 +1845,8 @@ def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1765,7 +1859,7 @@ def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
 # =============================================================================
 
 # --- Method: sage (Kovasznay) ---
-def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
     """SAGE: auto-generated backward for Kovasznay flow."""
     g = build_grid_data_kovasznay(grid_size, device)
 
@@ -1810,13 +1904,17 @@ def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model
             reg.backward()
         optimizer.step()
 
-        if (epoch + 1) % LOG_INTERVAL == 0:
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
             with torch.no_grad():
                 c, mu, mv = compute_pde_kovasznay(pred_pde, g)
                 ii = g['interior_idx']
                 lv = (c[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
                 final_loss = lv.item()
-            print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1825,7 +1923,7 @@ def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model
 
 
 # --- Method: dtpinn (Kovasznay) ---
-def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
     """Standard DT-PINN for Kovasznay flow: spectral matrices, autograd backward."""
     g = build_grid_data_kovasznay(grid_size, device)
 
@@ -1870,6 +1968,8 @@ def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, mod
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1878,7 +1978,7 @@ def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, mod
 
 
 # --- Method: autodiff (Kovasznay) ---
-def train_autodiff_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+def train_autodiff_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
     """Plain autodiff PINN for Kovasznay flow."""
     coll = build_collocation_points_kovasznay(grid_size, device)
 
@@ -1924,6 +2024,8 @@ def train_autodiff_kovasznay(seed, device, n_epochs, lr, technique, grid_size, m
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -1934,7 +2036,7 @@ def train_autodiff_kovasznay(seed, device, n_epochs, lr, technique, grid_size, m
 
 
 # --- Method: ropinn (Kovasznay) ---
-def train_ropinn_kovasznay(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp"):
+def train_ropinn_kovasznay(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp", tracker=None):
     """RoPINN: region-optimized PINN with trust region calibration for Kovasznay flow."""
     coll = build_collocation_points_kovasznay(grid_size, device)
 
@@ -2020,6 +2122,8 @@ def train_ropinn_kovasznay(seed, device, n_epochs, lr, optimizer_type, technique
             if (epoch + 1) % LOG_INTERVAL == 0:
                 print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
                       f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
 
     else:  # adam
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -2075,6 +2179,8 @@ def train_ropinn_kovasznay(seed, device, n_epochs, lr, optimizer_type, technique
             if (epoch + 1) % LOG_INTERVAL == 0:
                 print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
                       f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -2213,7 +2319,7 @@ def compute_pde_kovasznay_sparse(pred, g):
     return continuity, mom_u, mom_v
 
 
-def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data):
+def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
     """SK-PINN for Kovasznay flow: sparse RKPM matrices, autograd backward.
 
     Uses weight decay to prevent model from learning beyond RKPM resolution.
@@ -2254,6 +2360,8 @@ def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, g
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
             print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -2370,6 +2478,8 @@ def main():
     print(f"PyTorch:   {torch.__version__}")
     print(f"Tag:       {args.tag or '(none)'}")
     print(f"Output:    {args.output_csv}")
+    if args.track:
+        print(f"Tracking:  every {args.track_interval} epochs")
     print("=" * 70)
 
     # Validate technique + method combinations
@@ -2385,6 +2495,11 @@ def main():
     # Set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    # Create tracker if --track enabled
+    tracker = TrainingTracker(args, device) if args.track else None
+    if tracker:
+        print(f"Tracking to: {tracker.csv_path}")
 
     # Track status
     status = "OK"
@@ -2405,49 +2520,49 @@ def main():
             if args.method == "sage":
                 model, train_time, final_loss = train_sage_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
             elif args.method == "dtpinn":
                 model, train_time, final_loss = train_dtpinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
             elif args.method == "autodiff":
                 model, train_time, final_loss = train_autodiff_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
             elif args.method == "ropinn":
                 model, train_time, final_loss = train_ropinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
-                    args.grid_size, args.model)
+                    args.grid_size, args.model, tracker=tracker)
             elif args.method == "sk-pinn":
                 g = build_sk_data_kovasznay(args.grid_size, device)
                 model, train_time, final_loss = train_sk_pinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
-                    args.model, g)
+                    args.model, g, tracker=tracker)
             n_params = sum(p.numel() for p in model.parameters())
         else:
             # Cavity problem dispatch (original)
             if args.method == "autodiff":
                 model, train_time, final_loss = train_autodiff(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "dtpinn":
                 model, train_time, final_loss = train_dtpinn(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "analytical":
                 model, train_time, final_loss = train_analytical(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "ropinn":
                 model, train_time, final_loss = train_ropinn(
                     args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
-                    args.grid_size, args.model)
+                    args.grid_size, args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "pielm":
@@ -2458,13 +2573,13 @@ def main():
                 g = build_sk_data(args.grid_size, device)
                 model, train_time, final_loss = train_sk_pinn(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
-                    args.model, g)
+                    args.model, g, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "sage":
                 model, train_time, final_loss = train_sage(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
-                    args.model)
+                    args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
         # ---- Evaluate ----
@@ -2544,6 +2659,8 @@ def main():
 
     append_csv_row(args.output_csv, row)
     print(f"\nResults appended to {args.output_csv}")
+    if tracker:
+        print(f"Tracking data saved to {tracker.csv_path}")
 
 
 if __name__ == "__main__":
