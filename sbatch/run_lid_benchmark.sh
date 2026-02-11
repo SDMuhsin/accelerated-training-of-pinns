@@ -10,7 +10,8 @@
 # Methods and their characteristics:
 #   - autodiff:    Plain autograd PINN (Chebyshev N=50)
 #   - dtpinn:      DT-PINN, spectral matrices (Chebyshev N=50)
-#   - analytical:  Analytical Jacobian backward (Chebyshev N=50)   [OUR METHOD]
+#   - analytical:  Analytical Jacobian backward (Chebyshev N=50)
+#   - sage:        SAGE auto-generated backward (Chebyshev N=50)   [OUR METHOD]
 #   - ropinn:      RoPINN, region-optimized (Chebyshev N=50)
 #   - sk-pinn:     SK-PINN, sparse RKPM matrices (uniform N=200)
 #   - pielm:       PIELM extreme learning machine (own architecture, no --model)
@@ -66,11 +67,12 @@ fi
 # Training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
 gradient_methods=(
-    autodiff
-    dtpinn
-    analytical
-    ropinn
-    sk-pinn
+    #autodiff
+    #dtpinn
+    #analytical
+    sage
+    #ropinn
+    #sk-pinn
 )
 
 # Network architectures to benchmark
@@ -108,7 +110,8 @@ OUTPUT_CSV="results/lid_benchmark_results.csv"
 
 # GPU jobs: all gradient-based methods + sk-pinn
 # Timing at 30K epochs (MLP / TSA-PINN):
-#   analytical:  ~3 min / ~7 min       (fastest)
+#   sage:        ~2.4 min / ~7 min      (fastest, auto-generated backward)
+#   analytical:  ~2.6 min / ~7 min
 #   dtpinn:      ~11 min / ~15 min
 #   autodiff:    ~22 min / ~48 min
 #   ropinn:      ~23 min / ~25 min
@@ -153,7 +156,7 @@ job_count=0
 # ============================================================================
 # All gradient methods use GPU and support all three model architectures.
 # Grid size is determined automatically per method:
-#   Chebyshev methods (autodiff, dtpinn, analytical, ropinn): N=50
+#   Chebyshev methods (autodiff, dtpinn, analytical, sage, ropinn): N=50
 #   SK-PINN: N=200 (sparse RKPM)
 
 echo "=============================================="

@@ -57,6 +57,30 @@ LOG_INTERVAL = 5000
 
 mse = nn.MSELoss()
 
+# Lazy-initialized generated backward functions from symbolic VJP engine
+_generated_dense_backward = None
+_generated_sparse_backward = None
+
+def _get_generated_backward(sparse=False):
+    """Lazily generate and cache backward functions from symbolic VJP engine."""
+    global _generated_dense_backward, _generated_sparse_backward
+    if sparse:
+        if _generated_sparse_backward is None:
+            from src.symbolic_vjp import TracedVar, trace_pde_forward, emit_backward
+            tape = []
+            outputs, inputs = trace_pde_forward(compute_pde_terms_sparse, None, tape, sparse=True)
+            _, _generated_sparse_backward = emit_backward(
+                tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=True)
+        return _generated_sparse_backward
+    else:
+        if _generated_dense_backward is None:
+            from src.symbolic_vjp import TracedVar, trace_pde_forward, emit_backward
+            tape = []
+            outputs, inputs = trace_pde_forward(compute_pde_terms, None, tape, sparse=False)
+            _, _generated_dense_backward = emit_backward(
+                tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=False)
+        return _generated_dense_backward
+
 
 # =============================================================================
 # Argument parsing
@@ -67,7 +91,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--method", required=True,
-                        choices=["autodiff", "dtpinn", "analytical", "ropinn", "pielm", "sk-pinn"],
+                        choices=["autodiff", "dtpinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage"],
                         help="Training method")
     parser.add_argument("--model", default="mlp", choices=["mlp", "tsa-pinn", "pirate-net"],
                         help="Network architecture (ignored for pielm)")
@@ -1011,6 +1035,82 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
     return model, train_time, final_loss
 
 
+# --- Method: sage (Symbolic Analytical Gradient Engine) ---
+def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp"):
+    """SAGE: auto-generated backward via symbolic VJP engine."""
+    g = build_grid_data(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    # Pre-generate the backward function (one-time cost)
+    generated_backward = _get_generated_backward(sparse=False)
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_l = pred_batch[g['off_lid']:g['off_wall']]
+            pred_w = pred_batch[g['off_wall']:g['off_center']]
+            pred_c = pred_batch[g['off_center']:]
+            grad_pde = generated_backward(pred_pde, g)
+            N_lid, N_wall = g['N_lid'], g['N_wall']
+            grad_lid = torch.zeros(N_lid, 3, device=device)
+            grad_lid[:, 0:1] = 2.0 * (pred_l[:, 0:1] - 1.0) / N_lid
+            grad_lid[:, 1:2] = 2.0 * pred_l[:, 1:2] / N_lid
+            grad_wall = torch.zeros(N_wall, 3, device=device)
+            grad_wall[:, 0:1] = 2.0 * pred_w[:, 0:1] / N_wall
+            grad_wall[:, 1:2] = 2.0 * pred_w[:, 1:2] / N_wall
+            grad_center = torch.zeros(1, 3, device=device)
+            grad_center[:, 2:3] = 2.0 * pred_c[:, 2:3]
+            upstream = torch.cat([grad_pde, grad_lid, grad_wall, grad_center], dim=0)
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            with torch.no_grad():
+                u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
+                du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
+                dv_dx = g['Dx'] @ v; dv_dy = g['Dy'] @ v
+                Sxx, Syy = du_dx, dv_dy
+                Sxy = 0.5 * (du_dy + dv_dx)
+                S_mag = torch.sqrt(2.0*(Sxx**2+Syy**2+2.0*Sxy**2)+1e-12)
+                nu_eff_val = nu_laminar + g['Cs_d_sq'] * S_mag
+                cont = du_dx + dv_dy
+                dp_dx = g['Dx'] @ p; dp_dy = g['Dy'] @ p
+                visc_u = g['Dx']@(nu_eff_val*du_dx) + g['Dy']@(nu_eff_val*du_dy)
+                visc_v = g['Dx']@(nu_eff_val*dv_dx) + g['Dy']@(nu_eff_val*dv_dy)
+                mu = u*du_dx + v*du_dy + dp_dx - visc_u
+                mv = u*dv_dx + v*dv_dy + dp_dy - visc_v
+                ii = g['interior_idx']
+                lv = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                final_loss = lv.item()
+            print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
 def _train_analytical_cuda_graph(model, optimizer, g, n_epochs, device):
     """Analytical Jacobian with CUDA graph capture."""
     # Warmup (must match graph structure exactly)
@@ -1456,7 +1556,7 @@ def main():
     if args.grid_size is None:
         method_defaults = {
             'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
-            'ropinn': 50, 'pielm': 50, 'sk-pinn': 200,
+            'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
         }
         args.grid_size = method_defaults[args.method]
 
@@ -1540,6 +1640,12 @@ def main():
             model, train_time, final_loss = train_sk_pinn(
                 args.seed, device, args.epochs, args.lr, args.grid_size,
                 args.model, g)
+            n_params = sum(p.numel() for p in model.parameters())
+
+        elif args.method == "sage":
+            model, train_time, final_loss = train_sage(
+                args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                args.model)
             n_params = sum(p.numel() for p in model.parameters())
 
         # ---- Evaluate ----
