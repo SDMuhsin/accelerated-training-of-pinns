@@ -130,41 +130,42 @@ class TracedVar:
 # =============================================================================
 # Tracing helpers
 # =============================================================================
-def trace_pde_forward(compute_fn, N_all, tape, sparse=False, constants=None):
+def trace_pde_forward(compute_fn, N_all, tape, sparse=False, constants=None,
+                      input_names=None):
     """Trace compute_pde_terms through TracedVar to build tape.
 
     Args:
-        compute_fn: PDE forward function (pred, g) -> (continuity, mom_u, mom_v)
+        compute_fn: PDE forward function (pred, g) -> tuple of TracedVars
         N_all: grid size (can be None for tracing)
         tape: list to record operations
         sparse: if True, use sparse matmul
         constants: list of constant names for grid_data (default: ['Dx', 'Dy', 'Cs_d_sq'])
+        input_names: list of input variable names (default: ['u', 'v', 'p'])
 
     Returns (output_vars, input_vars) where:
-      - output_vars = (continuity, mom_u, mom_v) TracedVars
-      - input_vars = {'u': TracedVar, 'v': TracedVar, 'p': TracedVar}
+      - output_vars = tuple of TracedVars (one per PDE equation)
+      - input_vars = dict mapping name -> TracedVar
     """
     if constants is None:
         constants = ['Dx', 'Dy', 'Cs_d_sq']
+    if input_names is None:
+        input_names = ['u', 'v', 'p']
 
     TracedVar._counter = 0
 
-    # Create traced input variables
-    u = TracedVar('u', tape)
-    v = TracedVar('v', tape)
-    p = TracedVar('p', tape)
+    # Create traced input variables dynamically
+    input_vars = {}
+    for name in input_names:
+        input_vars[name] = TracedVar(name, tape)
 
     # Create a fake pred object that supports slicing
     class FakePred:
         def __getitem__(self, key):
             if isinstance(key, tuple) and len(key) == 2:
                 _, col = key
-                if col == slice(0, 1):
-                    return u
-                elif col == slice(1, 2):
-                    return v
-                elif col == slice(2, 3):
-                    return p
+                for i, name in enumerate(input_names):
+                    if col == slice(i, i + 1):
+                        return input_vars[name]
             raise KeyError(f"Unsupported slice: {key}")
 
     # Create traced grid_data with constant TracedVars for matrices
@@ -173,9 +174,9 @@ def trace_pde_forward(compute_fn, N_all, tape, sparse=False, constants=None):
         g[name] = TracedVar(name, tape, is_const=True)
 
     pred = FakePred()
-    continuity, mom_u, mom_v = compute_fn(pred, g)
+    outputs = compute_fn(pred, g)
 
-    return (continuity, mom_u, mom_v), {'u': u, 'v': v, 'p': p}
+    return outputs, input_vars
 
 
 # =============================================================================
@@ -360,25 +361,49 @@ def _build_cadd_vjp(adj_name, entry):
 # =============================================================================
 # Code Emitter — generates optimized PyTorch backward function
 # =============================================================================
-def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False, func_name=None):
+def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False,
+                  func_name=None, input_names=None):
     """Generate a PyTorch backward function from symbolic adjoint expressions.
 
     Args:
         func_name: name for the generated function (default: 'generated_analytical_grad')
+        input_names: list of input variable names (default: ['u', 'v', 'p'])
 
     Returns (source_code, compiled_fn).
     """
     if func_name is None:
         func_name = 'generated_analytical_grad'
+    if input_names is None:
+        input_names = ['u', 'v', 'p']
 
     adj = symbolic_backward(tape, output_vars, seed_names)
+
+    # Find constant TracedVars used in add/sub/mul/smul ops (not matmul/const_mul
+    # which already reference g['name'] directly).
+    const_vars_in_add = set()
+    for entry in tape:
+        op = entry[0]
+        if op in ('add', 'sub'):
+            a, b = entry[1], entry[2]
+            if isinstance(a, TracedVar) and a.is_const:
+                const_vars_in_add.add(a.name)
+            if isinstance(b, TracedVar) and b.is_const:
+                const_vars_in_add.add(b.name)
+        elif op == 'mul':
+            a, b = entry[1], entry[2]
+            if isinstance(a, TracedVar) and a.is_const:
+                const_vars_in_add.add(a.name)
+            if isinstance(b, TracedVar) and b.is_const:
+                const_vars_in_add.add(b.name)
 
     lines_v2 = []
     lines_v2.append(f"def {func_name}(pred_det, g):")
     lines_v2.append("    import torch")
-    lines_v2.append(f"    u = pred_det[:g['N_all'], 0:1]")
-    lines_v2.append(f"    v = pred_det[:g['N_all'], 1:2]")
-    lines_v2.append(f"    p = pred_det[:g['N_all'], 2:3]")
+    for i, name in enumerate(input_names):
+        lines_v2.append(f"    {name} = pred_det[:g['N_all'], {i}:{i+1}]")
+    # Extract constant TracedVars that appear in add/sub/mul ops
+    for cname in sorted(const_vars_in_add):
+        lines_v2.append(f"    {cname} = g['{cname}']")
     lines_v2.append("")
 
     # Emit ALL forward ops
@@ -393,17 +418,15 @@ def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False, func_
     lines_v2.append("    scale = 2.0 / M")
     lines_v2.append("    mask = g['interior_mask']")
 
-    # Map output var names to PDE residual names
+    # Map output var names to seed names
     out_names = [ov.name for ov in output_vars]
-    pde_names = ['continuity', 'mom_u', 'mom_v']
-    for oname, pname, sname in zip(out_names, pde_names, seed_names):
+    for oname, sname in zip(out_names, seed_names):
         lines_v2.append(f"    {sname} = {oname} * scale * mask")
 
     lines_v2.append("")
     lines_v2.append("    # Backward pass — adjoint accumulation")
 
     # Emit adjoint computations in reverse tape order
-    # First, compute all adj_ variables for tape outputs
     emitted_adj = set()
     for entry in reversed(tape):
         out = entry[-1]
@@ -422,10 +445,11 @@ def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False, func_
             for e in exprs[1:]:
                 lines_v2.append(f"    {adj_name} = {adj_name} + {e}")
 
-    # Also emit adj for u, v, p
+    # Accumulate final gradients for input variables
     lines_v2.append("")
-    lines_v2.append("    # Accumulate final gradients for u, v, p")
-    for var_name in ['u', 'v', 'p']:
+    comment_vars = ", ".join(input_names)
+    lines_v2.append(f"    # Accumulate final gradients for {comment_vars}")
+    for var_name in input_names:
         if var_name in adj:
             exprs = adj[var_name]
             adj_name = f"adj_{var_name}"
@@ -436,7 +460,8 @@ def emit_backward(tape, output_vars, seed_names, input_vars, sparse=False, func_
             lines_v2.append(f"    adj_{var_name} = torch.zeros_like({var_name})")
 
     lines_v2.append("")
-    lines_v2.append("    return torch.cat([adj_u, adj_v, adj_p], dim=1)")
+    cat_args = ", ".join(f"adj_{name}" for name in input_names)
+    lines_v2.append(f"    return torch.cat([{cat_args}], dim=1)")
 
     source = "\n".join(lines_v2)
 
@@ -509,24 +534,36 @@ def generate_backward(sparse=False, problem='cavity'):
     Returns:
         (source_code, backward_fn) tuple
     """
-    if problem == 'kovasznay':
+    if problem == 'elasticity':
+        from src.lid_benchmark import compute_pde_elasticity, compute_pde_elasticity_sparse
+        compute_fn = compute_pde_elasticity_sparse if sparse else compute_pde_elasticity
+        constants = ['Dx', 'Dy', 'fx', 'fy']
+        input_names = ['ux', 'uy']
+        seed_names = ['deq_x', 'deq_y']
+        func_name = 'generated_elasticity_grad'
+    elif problem == 'kovasznay':
         from src.lid_benchmark import compute_pde_kovasznay
         compute_fn = compute_pde_kovasznay
         constants = ['Dx', 'Dy']
+        input_names = ['u', 'v', 'p']
+        seed_names = ['dc', 'dmu', 'dmv']
         func_name = 'generated_kovasznay_grad'
     else:
         from src.lid_benchmark import compute_pde_terms, compute_pde_terms_sparse
         compute_fn = compute_pde_terms_sparse if sparse else compute_pde_terms
         constants = ['Dx', 'Dy', 'Cs_d_sq']
+        input_names = ['u', 'v', 'p']
+        seed_names = ['dc', 'dmu', 'dmv']
         func_name = 'generated_analytical_grad'
 
     tape = []
     outputs, inputs = trace_pde_forward(compute_fn, None, tape, sparse=sparse,
-                                         constants=constants)
+                                         constants=constants,
+                                         input_names=input_names)
 
     source, fn = emit_backward(
-        tape, list(outputs), ['dc', 'dmu', 'dmv'], inputs, sparse=sparse,
-        func_name=func_name
+        tape, list(outputs), seed_names, inputs, sparse=sparse,
+        func_name=func_name, input_names=input_names
     )
 
     return source, fn

@@ -77,7 +77,7 @@ class PirateNet_Cavity(nn.Module):
     Parameters: 20,983 (vs MLP 21,187 / TSA-PINN 21,571).
     """
 
-    def __init__(self, hidden_dim=38, num_blocks=4):
+    def __init__(self, hidden_dim=38, num_blocks=4, output_dim=3):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -102,7 +102,7 @@ class PirateNet_Cavity(nn.Module):
         ])
 
         # Output layer
-        self.output_layer = nn.Linear(hidden_dim, 3)
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
         nn.init.xavier_normal_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
 

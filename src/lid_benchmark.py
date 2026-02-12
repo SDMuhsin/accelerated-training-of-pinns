@@ -58,6 +58,11 @@ Re_kov = 40.0
 nu_kov = 1.0 / Re_kov  # 0.025
 lambda_kov = Re_kov / 2.0 - math.sqrt(Re_kov**2 / 4.0 + 4.0 * math.pi**2)
 
+# Elasticity constants (Lamé parameters)
+lam_e = 1.0   # Lamé first parameter λ
+mu_e = 0.5    # Shear modulus μ
+Q_e = 4.0     # Load parameter for manufactured solution
+
 LOG_INTERVAL = 5000
 
 mse = nn.MSELoss()
@@ -96,7 +101,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--problem", default="cavity",
-                        choices=["cavity", "kovasznay"],
+                        choices=["cavity", "kovasznay", "elasticity"],
                         help="PDE problem to solve")
     parser.add_argument("--method", required=True,
                         choices=["autodiff", "dtpinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage"],
@@ -132,28 +137,28 @@ def parse_args():
 # =============================================================================
 class PINN_Cavity(nn.Module):
     """6-layer/64-unit tanh MLP. Output: (u, v, p). 21,827 params."""
-    def __init__(self):
+    def __init__(self, output_dim=3):
         super().__init__()
         layers = [nn.Linear(2, 64), nn.Tanh()]
         for _ in range(5):
             layers.extend([nn.Linear(64, 64), nn.Tanh()])
-        layers.append(nn.Linear(64, 3))
+        layers.append(nn.Linear(64, output_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
 
 
-def make_model(model_name):
+def make_model(model_name, output_dim=3):
     """Factory function: create a model by name."""
     if model_name == "mlp":
-        return PINN_Cavity()
+        return PINN_Cavity(output_dim=output_dim)
     elif model_name == "tsa-pinn":
         from src.experiment_dt_elm_pinn.models.tsa_pinn import TSA_PINN_Cavity
-        return TSA_PINN_Cavity(initial_freq=1.0)
+        return TSA_PINN_Cavity(initial_freq=1.0, output_dim=output_dim)
     elif model_name == "pirate-net":
         from src.experiment_dt_elm_pinn.models.pirate_net import PirateNet_Cavity
-        return PirateNet_Cavity()
+        return PirateNet_Cavity(output_dim=output_dim)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -1004,6 +1009,7 @@ class TrainingTracker:
     def __init__(self, args, device):
         self.interval = args.track_interval
         self.is_kovasznay = (args.problem == "kovasznay")
+        self.is_elasticity = (args.problem == "elasticity")
         self.device = device
         tag_part = f"_{args.tag}" if args.tag else ""
         self.csv_path = (f"results/tracking_{args.problem}_{args.method}"
@@ -1038,7 +1044,9 @@ class TrainingTracker:
 
         # Unwrap compiled model if needed
         base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-        if self.is_kovasznay:
+        if self.is_elasticity:
+            metrics = evaluate_elasticity(base_model, self.device)
+        elif self.is_kovasznay:
             metrics = evaluate_kovasznay(base_model, self.device)
         else:
             metrics = evaluate_model(base_model, self.device)
@@ -1049,9 +1057,9 @@ class TrainingTracker:
         row['pde_rms'] = round(metrics['pde_rms'], 6)
         row['continuity_rms'] = round(metrics['continuity_rms'], 6)
         row['momentum_rms'] = round(metrics['momentum_rms'], 6)
-        row['u_rms_error'] = round(metrics['u_rms_error'], 6) if 'u_rms_error' in metrics else ''
-        row['v_rms_error'] = round(metrics['v_rms_error'], 6) if 'v_rms_error' in metrics else ''
-        row['p_rms_error'] = round(metrics['p_rms_error'], 6) if 'p_rms_error' in metrics else ''
+        row['u_rms_error'] = round(metrics['u_rms_error'], 6) if 'u_rms_error' in metrics and not math.isnan(metrics.get('u_rms_error', float('nan'))) else ''
+        row['v_rms_error'] = round(metrics['v_rms_error'], 6) if 'v_rms_error' in metrics and not math.isnan(metrics.get('v_rms_error', float('nan'))) else ''
+        row['p_rms_error'] = round(metrics['p_rms_error'], 6) if 'p_rms_error' in metrics and not math.isnan(metrics.get('p_rms_error', float('nan'))) else ''
 
         with open(self.csv_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=TRACKING_COLUMNS)
@@ -2430,6 +2438,766 @@ def evaluate_kovasznay(model, device):
 
 
 # =============================================================================
+# 2D Linear Elasticity (Navier-Cauchy, displacement formulation)
+# =============================================================================
+# Manufactured exact solution on [0,1]² (DeepXDE benchmark):
+#   ux(x,y) = cos(2πx)·sin(πy)
+#   uy(x,y) = sin(πx)·Q·y⁴/4
+#
+# Navier-Cauchy equations:
+#   (λ+2μ)·∂²ux/∂x² + μ·∂²ux/∂y² + (λ+μ)·∂²uy/∂x∂y + fx = 0
+#   μ·∂²uy/∂x² + (λ+2μ)·∂²uy/∂y² + (λ+μ)·∂²ux/∂x∂y + fy = 0
+
+def elasticity_exact(x, y):
+    """Exact manufactured solution for 2D linear elasticity.
+
+    Args:
+        x, y: tensors of coordinates on [0,1]²
+
+    Returns:
+        (ux, uy) displacement tensors
+    """
+    ux = torch.cos(2.0 * math.pi * x) * torch.sin(math.pi * y)
+    uy = torch.sin(math.pi * x) * Q_e * y ** 4 / 4.0
+    return ux, uy
+
+
+def elasticity_body_forces(x, y):
+    """Analytically derived body forces for the manufactured solution.
+
+    fx = -[(λ+2μ)·ux_xx + μ·ux_yy + (λ+μ)·uy_xy]
+    fy = -[μ·uy_xx + (λ+2μ)·uy_yy + (λ+μ)·ux_xy]
+    """
+    pi = math.pi
+    # Second derivatives of ux = cos(2πx)·sin(πy)
+    ux_xx = -(2 * pi) ** 2 * torch.cos(2 * pi * x) * torch.sin(pi * y)
+    ux_yy = -(pi ** 2) * torch.cos(2 * pi * x) * torch.sin(pi * y)
+    # Cross derivative of ux
+    ux_xy = -2 * pi ** 2 * torch.sin(2 * pi * x) * torch.cos(pi * y)
+
+    # Second derivatives of uy = sin(πx)·Q·y⁴/4
+    uy_xx = -(pi ** 2) * torch.sin(pi * x) * Q_e * y ** 4 / 4.0
+    uy_yy = torch.sin(pi * x) * Q_e * 3.0 * y ** 2
+    # Cross derivative of uy
+    uy_xy = pi * torch.cos(pi * x) * Q_e * y ** 3
+
+    fx = -((lam_e + 2 * mu_e) * ux_xx + mu_e * ux_yy + (lam_e + mu_e) * uy_xy)
+    fy = -(mu_e * uy_xx + (lam_e + 2 * mu_e) * uy_yy + (lam_e + mu_e) * ux_xy)
+    return fx, fy
+
+
+def compute_pde_elasticity(pred, g):
+    """Elasticity PDE residuals via spectral differentiation matrices.
+
+    Navier-Cauchy equations with body forces.
+    Returns (eq_x, eq_y) — 2 residual terms.
+    """
+    ux, uy = pred[:, 0:1], pred[:, 1:2]
+
+    # First derivatives (for cross derivatives)
+    dux_dx = g['Dx'] @ ux
+    dux_dy = g['Dy'] @ ux
+    duy_dx = g['Dx'] @ uy
+    duy_dy = g['Dy'] @ uy
+
+    # Second derivatives
+    d2ux_dx2 = g['Dx'] @ dux_dx
+    d2ux_dy2 = g['Dy'] @ dux_dy
+    d2uy_dx2 = g['Dx'] @ duy_dx
+    d2uy_dy2 = g['Dy'] @ duy_dy
+
+    # Cross derivatives via Dy(dux/dx) and Dx(duy/dy)
+    d2uy_dxdy = g['Dy'] @ duy_dx
+    d2ux_dxdy = g['Dy'] @ dux_dx
+
+    # Navier-Cauchy equations + body forces
+    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
+            + (lam_e + mu_e) * d2uy_dxdy + g['fx'])
+    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
+            + (lam_e + mu_e) * d2ux_dxdy + g['fy'])
+
+    return eq_x, eq_y
+
+
+def compute_pde_elasticity_sparse(pred, g):
+    """Elasticity PDE residuals via sparse RKPM differentiation matrices."""
+    Dx, Dy = g['Dx'], g['Dy']
+    ux, uy = pred[:, 0:1], pred[:, 1:2]
+
+    dux_dx = torch.sparse.mm(Dx, ux)
+    dux_dy = torch.sparse.mm(Dy, ux)
+    duy_dx = torch.sparse.mm(Dx, uy)
+    duy_dy = torch.sparse.mm(Dy, uy)
+
+    d2ux_dx2 = torch.sparse.mm(Dx, dux_dx)
+    d2ux_dy2 = torch.sparse.mm(Dy, dux_dy)
+    d2uy_dx2 = torch.sparse.mm(Dx, duy_dx)
+    d2uy_dy2 = torch.sparse.mm(Dy, duy_dy)
+
+    d2uy_dxdy = torch.sparse.mm(Dy, duy_dx)
+    d2ux_dxdy = torch.sparse.mm(Dy, dux_dx)
+
+    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
+            + (lam_e + mu_e) * d2uy_dxdy + g['fx'])
+    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
+            + (lam_e + mu_e) * d2ux_dxdy + g['fy'])
+
+    return eq_x, eq_y
+
+
+def pde_residuals_elasticity_autodiff(model, xy):
+    """Elasticity PDE residuals via autograd. xy must have requires_grad=True."""
+    pred = model(xy)
+    ux, uy = pred[:, 0:1], pred[:, 1:2]
+
+    grad_ux = gradients(ux, xy)
+    grad_uy = gradients(uy, xy)
+    dux_dx, dux_dy = grad_ux[:, 0:1], grad_ux[:, 1:2]
+    duy_dx, duy_dy = grad_uy[:, 0:1], grad_uy[:, 1:2]
+
+    # Second derivatives
+    grad_dux_dx = gradients(dux_dx, xy)
+    grad_dux_dy = gradients(dux_dy, xy)
+    grad_duy_dx = gradients(duy_dx, xy)
+    grad_duy_dy = gradients(duy_dy, xy)
+    d2ux_dx2 = grad_dux_dx[:, 0:1]
+    d2ux_dy2 = grad_dux_dy[:, 1:2]
+    d2uy_dx2 = grad_duy_dx[:, 0:1]
+    d2uy_dy2 = grad_duy_dy[:, 1:2]
+
+    # Cross derivatives
+    d2uy_dxdy = grad_duy_dx[:, 1:2]
+    d2ux_dxdy = grad_dux_dx[:, 1:2]
+
+    # Body forces at collocation points
+    x_coord, y_coord = xy[:, 0:1], xy[:, 1:2]
+    fx, fy = elasticity_body_forces(x_coord, y_coord)
+
+    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
+            + (lam_e + mu_e) * d2uy_dxdy + fx)
+    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
+            + (lam_e + mu_e) * d2ux_dxdy + fy)
+
+    return eq_x, eq_y
+
+
+def build_grid_data_elasticity(N_grid, device):
+    """Build Chebyshev grid + spectral differentiation matrices for elasticity.
+
+    Domain: [0,1]² (unit square). Lx=Ly=1.0.
+    All boundaries: Dirichlet BCs from exact solution.
+    """
+    D1d = chebyshev_diff_matrix(N_grid) * 2.0  # scale for [0,1]
+    I_mat = np.eye(N_grid)
+    Dx_np = np.kron(I_mat, D1d)
+    Dy_np = np.kron(D1d, I_mat)
+
+    x_ref = chebyshev_points(N_grid)
+    x_phys = 0.5 * (x_ref + 1.0)
+    xx, yy = np.meshgrid(x_phys, x_phys, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = (xc < eps) | (xc > 1 - eps) | (yc < eps) | (yc > 1 - eps)
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    N_all = len(xy_grid)
+    N_bc = len(bc_idx)
+    M = len(interior_idx)
+
+    Dx = torch.tensor(Dx_np, dtype=torch.float32, device=device)
+    Dy = torch.tensor(Dy_np, dtype=torch.float32, device=device)
+    DxT = Dx.T.contiguous()
+    DyT = Dy.T.contiguous()
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_bc = xy_all[bc_idx]
+
+    interior_mask = torch.zeros(N_all, 1, device=device)
+    interior_mask[interior_idx] = 1.0
+
+    # Precompute body forces at all grid points (constant, stored in grid_data)
+    fx_all, fy_all = elasticity_body_forces(xy_all[:, 0:1], xy_all[:, 1:2])
+
+    # Exact BC values (2 displacements)
+    ux_ex, uy_ex = elasticity_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([ux_ex, uy_ex], dim=1)  # (N_bc, 2)
+
+    # Batched input: all grid + BC points
+    xy_batched = torch.cat([xy_all, xy_bc], dim=0)
+    off_bc = N_all
+
+    return {
+        'Dx': Dx, 'Dy': Dy, 'DxT': DxT, 'DyT': DyT,
+        'xy_all': xy_all, 'xy_bc': xy_bc, 'xy_batched': xy_batched,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'interior_mask': interior_mask,
+        'fx': fx_all, 'fy': fy_all,
+        'bc_target': bc_target,
+        'N_all': N_all, 'N_bc': N_bc, 'M': M,
+        'off_bc': off_bc,
+        'N_grid': N_grid,
+    }
+
+
+def build_collocation_points_elasticity(N_grid, device):
+    """Build Chebyshev collocation points for elasticity autograd methods."""
+    x_ref = chebyshev_points(N_grid)
+    x_phys = 0.5 * (x_ref + 1.0)
+    xx, yy = np.meshgrid(x_phys, x_phys, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = (xc < eps) | (xc > 1 - eps) | (yc < eps) | (yc > 1 - eps)
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    xy_int = torch.tensor(xy_grid[interior_idx], dtype=torch.float32, device=device)
+    xy_bc = torch.tensor(xy_grid[bc_idx], dtype=torch.float32, device=device)
+
+    # Exact BC values (2 displacements)
+    ux_ex, uy_ex = elasticity_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([ux_ex, uy_ex], dim=1)  # (N_bc, 2)
+
+    return {
+        'xy_interior': xy_int,
+        'xy_bc': xy_bc,
+        'bc_target': bc_target,
+        'N_interior': len(interior_idx),
+        'N_bc': len(bc_idx),
+        'N_grid': N_grid,
+    }
+
+
+def build_sk_data_elasticity(N_grid, device):
+    """Build SK-PINN RKPM differentiation matrices for elasticity.
+
+    Uniform grid on [0,1]² (unit square).
+    """
+    Lx, Ly = 1.0, 1.0
+    x0, y0 = 0.0, 0.0
+
+    dx = Lx / (N_grid - 1)
+    dy = Ly / (N_grid - 1)
+    h = min(dx, dy) * 1.4
+    radius = 2.0 * h
+    dxdy = dx * dy
+
+    x = np.linspace(x0, x0 + Lx, N_grid)
+    y = np.linspace(y0, y0 + Ly, N_grid)
+    xx, yy = np.meshgrid(x, y, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+    N_all = len(xy_grid)
+
+    print(f"  SK-PINN Elasticity: building RKPM matrices for {N_grid}x{N_grid} uniform grid...")
+    print(f"  dx={dx:.6f}, dy={dy:.6f}, h={h:.6f}, radius={radius:.6f}")
+
+    neighborhoods, distances, distance_vectors = _sk_find_neighborhoods(xy_grid, radius)
+    kernel = _sk_sph_kernel(distances, h)
+    C = _sk_compute_C(distance_vectors, kernel.unsqueeze(-1), dxdy, order=2)
+
+    kernel_np = kernel.numpy()
+    C_np = C.numpy()
+    nb_np = neighborhoods.numpy()
+
+    rows, cols, dx_vals, dy_vals = [], [], [], []
+    for i in range(N_all):
+        for j_idx in range(nb_np.shape[1]):
+            j = nb_np[i, j_idx]
+            if j == -1:
+                break
+            w = kernel_np[i, j_idx]
+            dx_val = C_np[i, j_idx, 0] * w
+            dy_val = C_np[i, j_idx, 1] * w
+            if dx_val != 0 or dy_val != 0:
+                rows.append(i)
+                cols.append(j)
+                dx_vals.append(dx_val)
+                dy_vals.append(dy_val)
+
+    nnz = len(rows)
+    indices = torch.tensor([rows, cols], dtype=torch.long)
+    Dx = torch.sparse_coo_tensor(
+        indices, torch.tensor(dx_vals, dtype=torch.float32), (N_all, N_all)
+    ).to(device).coalesce()
+    Dy = torch.sparse_coo_tensor(
+        indices, torch.tensor(dy_vals, dtype=torch.float32), (N_all, N_all)
+    ).to(device).coalesce()
+
+    print(f"  SK-PINN Elasticity: sparse Dx/Dy nnz={nnz}/{N_all*N_all} "
+          f"({100*nnz/(N_all*N_all):.2f}% dense)")
+
+    # Boundary classification
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = (xc < eps) | (xc > 1 - eps) | (yc < eps) | (yc > 1 - eps)
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    N_bc = len(bc_idx)
+    M = len(interior_idx)
+
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_bc = xy_all[bc_idx]
+
+    # Body forces at all grid points
+    fx_all, fy_all = elasticity_body_forces(xy_all[:, 0:1], xy_all[:, 1:2])
+
+    # Exact BC values
+    ux_ex, uy_ex = elasticity_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([ux_ex, uy_ex], dim=1)
+
+    interior_mask = torch.zeros(N_all, 1, device=device)
+    interior_mask[interior_idx] = 1.0
+
+    print(f"  SK-PINN Elasticity: N_all={N_all}, interior={M}, bc={N_bc}")
+
+    return {
+        'Dx': Dx, 'Dy': Dy,
+        'sparse': True,
+        'xy_all': xy_all, 'xy_bc': xy_bc, 'bc_target': bc_target,
+        'fx': fx_all, 'fy': fy_all,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'interior_mask': interior_mask,
+        'N_all': N_all, 'N_bc': N_bc, 'M': M, 'N_grid': N_grid,
+    }
+
+
+# Lazy-initialized generated backward for Elasticity
+_generated_elasticity_backward = None
+
+def _get_generated_backward_elasticity():
+    """Lazily generate and cache backward function for Elasticity PDE."""
+    global _generated_elasticity_backward
+    if _generated_elasticity_backward is None:
+        from src.symbolic_vjp import trace_pde_forward, emit_backward
+        tape = []
+        outputs, inputs = trace_pde_forward(
+            compute_pde_elasticity, None, tape, sparse=False,
+            constants=['Dx', 'Dy', 'fx', 'fy'],
+            input_names=['ux', 'uy'])
+        _, _generated_elasticity_backward = emit_backward(
+            tape, list(outputs), ['deq_x', 'deq_y'], inputs, sparse=False,
+            func_name='generated_elasticity_grad',
+            input_names=['ux', 'uy'])
+    return _generated_elasticity_backward
+
+
+# --- Method: sage (Elasticity) ---
+def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """SAGE: auto-generated backward for elasticity."""
+    g = build_grid_data_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    generated_backward = _get_generated_backward_elasticity()
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_bc = pred_batch[g['off_bc']:g['off_bc'] + g['N_bc']]
+
+            grad_pde = generated_backward(pred_pde, g)
+
+            N_bc = g['N_bc']
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / N_bc
+
+            upstream = torch.cat([grad_pde, grad_bc], dim=0)
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
+            with torch.no_grad():
+                eq_x, eq_y = compute_pde_elasticity(pred_pde, g)
+                ii = g['interior_idx']
+                lv = (eq_x[ii]**2).mean() + (eq_y[ii]**2).mean()
+                final_loss = lv.item()
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: dtpinn (Elasticity) ---
+def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Standard DT-PINN for elasticity: spectral matrices, autograd backward."""
+    g = build_grid_data_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred = compiled_model(g['xy_all'])
+        eq_x, eq_y = compute_pde_elasticity(pred, g)
+        ii = g['interior_idx']
+        loss_pde = mse(eq_x[ii], torch.zeros_like(eq_x[ii])) + \
+                   mse(eq_y[ii], torch.zeros_like(eq_y[ii]))
+
+        pred_bc = compiled_model(g['xy_bc'])
+        loss_bc = mse(pred_bc, g['bc_target'])
+
+        loss = loss_pde + loss_bc + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: autodiff (Elasticity) ---
+def train_autodiff_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Plain autodiff PINN for elasticity."""
+    coll = build_collocation_points_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+
+    if technique == "compile":
+        model = torch.compile(model, mode='reduce-overhead')
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    xy_int = coll['xy_interior'].clone().requires_grad_(True)
+    xy_bc = coll['xy_bc']
+    bc_target = coll['bc_target']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        eq_x, eq_y = pde_residuals_elasticity_autodiff(model, xy_int)
+        loss_pde = mse(eq_x, torch.zeros_like(eq_x)) + \
+                   mse(eq_y, torch.zeros_like(eq_y))
+
+        pred_bc = model(xy_bc)
+        loss_bc = mse(pred_bc, bc_target)
+
+        loss = loss_pde + loss_bc + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    return base_model, train_time, final_loss
+
+
+# --- Method: ropinn (Elasticity) ---
+def train_ropinn_elasticity(seed, device, n_epochs, lr, optimizer_type, technique, grid_size, model_name="mlp", tracker=None):
+    """RoPINN: region-optimized PINN with trust region calibration for elasticity."""
+    coll = build_collocation_points_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+
+    if technique == "compile":
+        model = torch.compile(model, mode='reduce-overhead')
+
+    xy_int_base = coll['xy_interior']
+    xy_bc = coll['xy_bc']
+    bc_target = coll['bc_target']
+
+    # Elasticity domain bounds for clamping [0,1]²
+    x_lo, x_hi = 0.0, 1.0
+    y_lo, y_hi = 0.0, 1.0
+
+    gradient_list = []
+    gradient_variance = 1.0
+    final_loss = float('nan')
+
+    if optimizer_type == "lbfgs":
+        optimizer = torch.optim.LBFGS(model.parameters(), line_search_fn='strong_wolfe')
+        gradient_list_overall = []
+        gradient_list_temp = []
+
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for epoch in range(n_epochs):
+            current_region = np.clip(
+                ROPINN_INITIAL_REGION / gradient_variance,
+                a_min=0, a_max=ROPINN_REGION_MAX
+            )
+
+            def closure():
+                optimizer.zero_grad()
+                perturbation = torch.rand_like(xy_int_base) * current_region
+                xy_perturbed = xy_int_base + perturbation
+                xy_perturbed[:, 0].clamp_(x_lo, x_hi)
+                xy_perturbed[:, 1].clamp_(y_lo, y_hi)
+                xy_perturbed = xy_perturbed.detach().requires_grad_(True)
+
+                eq_x, eq_y = pde_residuals_elasticity_autodiff(model, xy_perturbed)
+                loss_pde = mse(eq_x, torch.zeros_like(eq_x)) + \
+                           mse(eq_y, torch.zeros_like(eq_y))
+
+                pred_bc = model(xy_bc)
+                loss_bc = mse(pred_bc, bc_target)
+
+                loss = loss_pde + loss_bc + model_reg_loss(model)
+                loss.backward()
+
+                grads = []
+                for p in model.parameters():
+                    if p.grad is not None:
+                        grads.append(p.grad.view(-1))
+                flat_grad = torch.cat(grads).cpu().numpy()
+                gradient_list_temp.append(flat_grad)
+
+                return loss
+
+            loss = optimizer.step(closure)
+            final_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
+
+            if gradient_list_temp:
+                avg_gradient = np.mean(np.array(gradient_list_temp), axis=0)
+                gradient_list_overall.append(avg_gradient)
+                gradient_list_overall = gradient_list_overall[-ROPINN_PAST_ITERATIONS:]
+                gradient_variance = compute_gradient_variance(gradient_list_overall)
+                gradient_list_temp.clear()
+
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
+                      f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
+
+    else:  # adam
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        for epoch in range(n_epochs):
+            optimizer.zero_grad()
+
+            current_region = np.clip(
+                ROPINN_INITIAL_REGION / gradient_variance,
+                a_min=0, a_max=ROPINN_REGION_MAX
+            )
+
+            perturbation = torch.rand_like(xy_int_base) * current_region
+            xy_perturbed = xy_int_base + perturbation
+            xy_perturbed[:, 0].clamp_(x_lo, x_hi)
+            xy_perturbed[:, 1].clamp_(y_lo, y_hi)
+            xy_perturbed = xy_perturbed.detach().requires_grad_(True)
+
+            eq_x, eq_y = pde_residuals_elasticity_autodiff(model, xy_perturbed)
+            loss_pde = mse(eq_x, torch.zeros_like(eq_x)) + \
+                       mse(eq_y, torch.zeros_like(eq_y))
+
+            pred_bc = model(xy_bc)
+            loss_bc = mse(pred_bc, bc_target)
+
+            loss = loss_pde + loss_bc + model_reg_loss(model)
+            loss.backward()
+            optimizer.step()
+
+            final_loss = loss.item()
+
+            # Gradient tracking for trust region calibration
+            grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.view(-1))
+            flat_grad = torch.cat(grads).cpu().numpy()
+            gradient_list.append(flat_grad)
+            gradient_list = gradient_list[-ROPINN_PAST_ITERATIONS:]
+            gradient_variance = compute_gradient_variance(gradient_list)
+
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}, "
+                      f"region={current_region:.2e}, grad_var={gradient_variance:.4f}")
+            if tracker is not None:
+                tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    return base_model, train_time, final_loss
+
+
+# --- Method: sk-pinn (Elasticity) ---
+def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
+    """SK-PINN for elasticity: sparse RKPM matrices, autograd backward."""
+    g = grid_data
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred = model(g['xy_all'])
+        eq_x, eq_y = compute_pde_elasticity_sparse(pred, g)
+        ii = g['interior_idx']
+        loss_pde = mse(eq_x[ii], torch.zeros_like(eq_x[ii])) + \
+                   mse(eq_y[ii], torch.zeros_like(eq_y[ii]))
+
+        pred_bc = model(g['xy_bc'])
+        loss_bc = mse(pred_bc, g['bc_target'])
+
+        loss = loss_pde + loss_bc + model_reg_loss(model)
+        loss.backward()
+        optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# =============================================================================
+# Elasticity evaluation
+# =============================================================================
+def evaluate_elasticity(model, device):
+    """Evaluate elasticity on 51x51 uniform grid: PDE residuals + solution error."""
+    nx, ny = 51, 51
+    x = np.linspace(0, 1, nx)
+    y = np.linspace(0, 1, ny)
+    X, Y = np.meshgrid(x, y)
+    xy_eval = np.column_stack([X.ravel(), Y.ravel()])
+    xy_t = torch.tensor(xy_eval, dtype=torch.float32, device=device, requires_grad=True)
+
+    model.eval()
+    pred = model(xy_t)
+    ux, uy = pred[:, 0:1], pred[:, 1:2]
+
+    # PDE residuals via autograd
+    grad_ux = gradients(ux, xy_t)
+    grad_uy = gradients(uy, xy_t)
+    dux_dx, dux_dy = grad_ux[:, 0:1], grad_ux[:, 1:2]
+    duy_dx, duy_dy = grad_uy[:, 0:1], grad_uy[:, 1:2]
+
+    grad_dux_dx = gradients(dux_dx, xy_t)
+    grad_dux_dy = gradients(dux_dy, xy_t)
+    grad_duy_dx = gradients(duy_dx, xy_t)
+    grad_duy_dy = gradients(duy_dy, xy_t)
+    d2ux_dx2 = grad_dux_dx[:, 0:1]
+    d2ux_dy2 = grad_dux_dy[:, 1:2]
+    d2uy_dx2 = grad_duy_dx[:, 0:1]
+    d2uy_dy2 = grad_duy_dy[:, 1:2]
+
+    d2uy_dxdy = grad_duy_dx[:, 1:2]
+    d2ux_dxdy = grad_dux_dx[:, 1:2]
+
+    # Body forces at eval points
+    x_coord, y_coord = xy_t[:, 0:1].detach(), xy_t[:, 1:2].detach()
+    fx, fy = elasticity_body_forces(x_coord, y_coord)
+
+    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
+            + (lam_e + mu_e) * d2uy_dxdy + fx)
+    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
+            + (lam_e + mu_e) * d2ux_dxdy + fy)
+
+    eq_x_np = eq_x.detach().cpu().numpy().flatten()
+    eq_y_np = eq_y.detach().cpu().numpy().flatten()
+
+    pde_rms = float(np.sqrt(np.mean(eq_x_np**2 + eq_y_np**2)))
+    eq_x_rms = float(np.sqrt(np.mean(eq_x_np**2)))
+    eq_y_rms = float(np.sqrt(np.mean(eq_y_np**2)))
+
+    # Solution error vs exact
+    ux_ex, uy_ex = elasticity_exact(x_coord, y_coord)
+
+    ux_err = (ux.detach() - ux_ex).cpu().numpy().flatten()
+    uy_err = (uy.detach() - uy_ex).cpu().numpy().flatten()
+    ux_rms_err = float(np.sqrt(np.mean(ux_err**2)))
+    uy_rms_err = float(np.sqrt(np.mean(uy_err**2)))
+
+    model.train()
+    return {
+        'pde_rms': pde_rms, 'continuity_rms': eq_x_rms, 'momentum_rms': eq_y_rms,
+        'u_rms_error': ux_rms_err, 'v_rms_error': uy_rms_err, 'p_rms_error': float('nan'),
+    }
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -2438,10 +3206,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     is_kovasznay = (args.problem == "kovasznay")
+    is_elasticity = (args.problem == "elasticity")
 
     # Validate problem + method combinations
     if is_kovasznay and args.method not in ("sage", "dtpinn", "autodiff", "ropinn", "sk-pinn"):
         print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn methods, "
+              f"not '{args.method}'")
+        sys.exit(1)
+    if is_elasticity and args.method not in ("sage", "dtpinn", "autodiff", "ropinn", "sk-pinn"):
+        print(f"ERROR: Elasticity problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn methods, "
               f"not '{args.method}'")
         sys.exit(1)
 
@@ -2452,6 +3225,11 @@ def main():
                 args.grid_size = 150
             else:
                 args.grid_size = 30
+        elif is_elasticity:
+            if args.method == 'sk-pinn':
+                args.grid_size = 100
+            else:
+                args.grid_size = 30
         else:
             method_defaults = {
                 'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
@@ -2459,7 +3237,12 @@ def main():
             }
             args.grid_size = method_defaults[args.method]
 
-    problem_label = "Kovasznay Flow (Re=40)" if is_kovasznay else "Lid-Driven Cavity NS+Smagorinsky"
+    problem_labels = {
+        'kovasznay': "Kovasznay Flow (Re=40)",
+        'elasticity': "2D Linear Elasticity (Navier-Cauchy)",
+        'cavity': "Lid-Driven Cavity NS+Smagorinsky",
+    }
+    problem_label = problem_labels[args.problem]
     print("=" * 70)
     print(f"UNIFIED BENCHMARK: {problem_label}")
     print("=" * 70)
@@ -2515,7 +3298,31 @@ def main():
             torch.cuda.reset_peak_memory_stats()
 
         # ---- Train ----
-        if is_kovasznay:
+        if is_elasticity:
+            # Elasticity problem dispatch
+            if args.method == "sage":
+                model, train_time, final_loss = train_sage_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "dtpinn":
+                model, train_time, final_loss = train_dtpinn_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "autodiff":
+                model, train_time, final_loss = train_autodiff_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "ropinn":
+                model, train_time, final_loss = train_ropinn_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.optimizer, args.technique,
+                    args.grid_size, args.model, tracker=tracker)
+            elif args.method == "sk-pinn":
+                g = build_sk_data_elasticity(args.grid_size, device)
+                model, train_time, final_loss = train_sk_pinn_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size,
+                    args.model, g, tracker=tracker)
+            n_params = sum(p.numel() for p in model.parameters())
+        elif is_kovasznay:
             # Kovasznay problem dispatch
             if args.method == "sage":
                 model, train_time, final_loss = train_sage_kovasznay(
@@ -2584,7 +3391,9 @@ def main():
 
         # ---- Evaluate ----
         print("\nEvaluating on 51x51 uniform grid...")
-        if is_kovasznay:
+        if is_elasticity:
+            metrics = evaluate_elasticity(model, device)
+        elif is_kovasznay:
             metrics = evaluate_kovasznay(model, device)
         elif args.method == "pielm":
             metrics = evaluate_pielm(model)
@@ -2621,7 +3430,7 @@ def main():
     print(f"PDE RMS:         {metrics['pde_rms']:.6f}")
     print(f"Continuity RMS:  {metrics['continuity_rms']:.6f}")
     print(f"Momentum RMS:    {metrics['momentum_rms']:.6f}")
-    if is_kovasznay and 'u_rms_error' in metrics:
+    if (is_kovasznay or is_elasticity) and 'u_rms_error' in metrics:
         print(f"u RMS error:     {metrics['u_rms_error']:.6f}")
         print(f"v RMS error:     {metrics['v_rms_error']:.6f}")
         print(f"p RMS error:     {metrics['p_rms_error']:.6f}")

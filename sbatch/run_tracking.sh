@@ -269,11 +269,84 @@ for method in "${kovasznay_methods[@]}"; do
 done
 
 # ============================================================================
+# SECTION 3: ELASTICITY - GRADIENT-BASED METHODS (GPU)
+# ============================================================================
+
+# Elasticity training methods
+elasticity_methods=(
+    #autodiff
+    #dtpinn
+    #sage
+    #ropinn
+    #sk-pinn
+)
+
+echo ""
+echo "=============================================="
+echo "Section 3: Elasticity - Gradient-Based Methods (GPU)"
+echo "=============================================="
+
+for method in "${elasticity_methods[@]}"; do
+    for model in "${models[@]}"; do
+        for seed in "${seeds[@]}"; do
+            job_name="trk_ela_${method}_${model}_s${seed}"
+            log_file="./logs/${job_name}"
+
+            echo "Submitting: $job_name"
+            sbatch \
+                $ACCOUNT_FLAG \
+                --nodes=1 \
+                --ntasks-per-node=1 \
+                --cpus-per-task=$GPU_CPUS \
+                --gpus=$GPU_TYPE \
+                --mem=$GPU_MEM \
+                --time=$GPU_TIME \
+                --job-name=$job_name \
+                --output=${log_file}-%N-%j.out \
+                --error=${log_file}-%N-%j.err \
+                --wrap="
+                    module load scipy-stack cuda cudnn
+                    module load arrow
+                    source ./env/bin/activate
+                    echo '========================================'
+                    echo 'Job: $job_name'
+                    echo 'Problem: elasticity'
+                    echo 'Method: $method'
+                    echo 'Model: $model'
+                    echo 'Seed: $seed'
+                    echo 'Track interval: $TRACK_INTERVAL'
+                    echo 'Started: '\$(date)
+                    echo '========================================'
+                    nvidia-smi
+                    python3 -u src/lid_benchmark.py \
+                        --problem=elasticity \
+                        --method=$method \
+                        --model=$model \
+                        --optimizer=$OPTIMIZER \
+                        --lr=$LR \
+                        --epochs=$EPOCHS \
+                        --seed=$seed \
+                        --technique=$TECHNIQUE \
+                        --output-csv=$OUTPUT_CSV \
+                        --tag=$TAG \
+                        --track \
+                        --track-interval=$TRACK_INTERVAL
+                    echo '========================================'
+                    echo 'Finished: '\$(date)
+                    echo '========================================'
+                "
+            ((job_count++))
+        done
+    done
+done
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 
 n_cavity_jobs=$((${#cavity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 n_kovasznay_jobs=$((${#kovasznay_methods[@]} * ${#models[@]} * ${#seeds[@]}))
+n_elasticity_jobs=$((${#elasticity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 
 echo ""
 echo "========================================================================"
@@ -292,10 +365,16 @@ for method in "${kovasznay_methods[@]}"; do
 done
 echo "  Total: $n_kovasznay_jobs jobs"
 echo ""
+echo "ELASTICITY - GRADIENT-BASED (GPU):"
+for method in "${elasticity_methods[@]}"; do
+    echo "  - $method  x  ${#models[@]} models  x  ${#seeds[@]} seeds  =  $((${#models[@]} * ${#seeds[@]})) jobs"
+done
+echo "  Total: $n_elasticity_jobs jobs"
+echo ""
 echo "TOTAL JOBS: $job_count"
 echo ""
 echo "Track interval:  $TRACK_INTERVAL epochs"
 echo "Summary CSV:     ./$OUTPUT_CSV"
 echo "Tracking CSVs:   ./results/tracking_*.csv"
-echo "Logs:            ./logs/trk_cav_*  ./logs/trk_kov_*"
+echo "Logs:            ./logs/trk_cav_*  ./logs/trk_kov_*  ./logs/trk_ela_*"
 echo "========================================================================"

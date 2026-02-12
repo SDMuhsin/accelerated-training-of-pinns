@@ -26,7 +26,7 @@ class TSA_PINN_Cavity(nn.Module):
     Extra params: 6 layers * 64 frequencies = 384 (~1.8% overhead).
     """
 
-    def __init__(self, initial_freq=1.0):
+    def __init__(self, initial_freq=1.0, output_dim=3):
         super().__init__()
         hidden = 64
         n_hidden = 6
@@ -48,8 +48,8 @@ class TSA_PINN_Cavity(nn.Module):
             in_dim = hidden
 
         # Output layer (standard linear, no activation)
-        self.output_weight = nn.Parameter(torch.empty(hidden, 3))
-        self.output_bias = nn.Parameter(torch.zeros(1, 3))
+        self.output_weight = nn.Parameter(torch.empty(hidden, output_dim))
+        self.output_bias = nn.Parameter(torch.zeros(1, output_dim))
         nn.init.xavier_normal_(self.output_weight)
 
     def forward(self, x):

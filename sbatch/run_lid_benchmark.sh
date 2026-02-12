@@ -77,22 +77,22 @@ fi
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
 cavity_methods=(
-    autodiff
-    dtpinn
-    analytical
-    sage
-    ropinn
-    sk-pinn
+    #autodiff
+    #dtpinn
+    #analytical
+    #sage
+    #ropinn
+    #sk-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
 # No analytical or pielm for Kovasznay.
 kovasznay_methods=(
-    autodiff
-    dtpinn
-    sage
-    ropinn
-    sk-pinn
+    #autodiff
+    #dtpinn
+    #sage
+    #ropinn
+    #sk-pinn
 )
 
 # Network architectures to benchmark
@@ -356,12 +356,87 @@ for method in "${kovasznay_methods[@]}"; do
 done
 
 # ============================================================================
+# SECTION 4: ELASTICITY - GRADIENT-BASED METHODS (GPU)
+# ============================================================================
+# 2D Linear Elasticity (Navier-Cauchy, manufactured solution on [0,1]²).
+# 2 outputs (displacements ux, uy), no pressure, no Smagorinsky.
+# Grid size is determined automatically per method:
+#   Chebyshev methods (autodiff, dtpinn, sage, ropinn): N=30
+#   SK-PINN: N=100 (sparse RKPM)
+
+# Elasticity training methods
+elasticity_methods=(
+    autodiff
+    dtpinn
+    sage
+    ropinn
+    sk-pinn
+)
+
+echo ""
+echo "=============================================="
+echo "Section 4: Elasticity - Gradient-Based Methods (GPU)"
+echo "=============================================="
+
+for method in "${elasticity_methods[@]}"; do
+    for model in "${models[@]}"; do
+        for seed in "${seeds[@]}"; do
+            job_name="ela_${method}_${model}_s${seed}"
+            log_file="./logs/${job_name}"
+
+            echo "Submitting: $job_name"
+            sbatch \
+                $ACCOUNT_FLAG \
+                --nodes=1 \
+                --ntasks-per-node=1 \
+                --cpus-per-task=$GPU_CPUS \
+                --gpus=$GPU_TYPE \
+                --mem=$GPU_MEM \
+                --time=$GPU_TIME \
+                --job-name=$job_name \
+                --output=${log_file}-%N-%j.out \
+                --error=${log_file}-%N-%j.err \
+                --wrap="
+                    module load scipy-stack cuda cudnn
+                    module load arrow
+                    source ./env/bin/activate
+                    echo '========================================'
+                    echo 'Job: $job_name'
+                    echo 'Problem: elasticity'
+                    echo 'Method: $method'
+                    echo 'Model: $model'
+                    echo 'Seed: $seed'
+                    echo 'Started: '\$(date)
+                    echo '========================================'
+                    nvidia-smi
+                    python3 -u src/lid_benchmark.py \
+                        --problem=elasticity \
+                        --method=$method \
+                        --model=$model \
+                        --optimizer=$OPTIMIZER \
+                        --lr=$LR \
+                        --epochs=$EPOCHS \
+                        --seed=$seed \
+                        --technique=$TECHNIQUE \
+                        --output-csv=$OUTPUT_CSV \
+                        --tag=$TAG
+                    echo '========================================'
+                    echo 'Finished: '\$(date)
+                    echo '========================================'
+                "
+            ((job_count++))
+        done
+    done
+done
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 
 n_cavity_jobs=$((${#cavity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 n_pielm_jobs=${#seeds[@]}
 n_kovasznay_jobs=$((${#kovasznay_methods[@]} * ${#models[@]} * ${#seeds[@]}))
+n_elasticity_jobs=$((${#elasticity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 
 echo ""
 echo "========================================================================"
@@ -383,8 +458,14 @@ for method in "${kovasznay_methods[@]}"; do
 done
 echo "  Total: $n_kovasznay_jobs jobs"
 echo ""
+echo "ELASTICITY - GRADIENT-BASED (GPU):"
+for method in "${elasticity_methods[@]}"; do
+    echo "  - $method  x  ${#models[@]} models  x  ${#seeds[@]} seeds  =  $((${#models[@]} * ${#seeds[@]})) jobs"
+done
+echo "  Total: $n_elasticity_jobs jobs"
+echo ""
 echo "TOTAL JOBS: $job_count"
 echo ""
 echo "Results:  ./$OUTPUT_CSV"
-echo "Logs:     ./logs/cav_*  ./logs/kov_*"
+echo "Logs:     ./logs/cav_*  ./logs/kov_*  ./logs/ela_*"
 echo "========================================================================"
