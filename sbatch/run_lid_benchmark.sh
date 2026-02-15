@@ -81,22 +81,22 @@ fi
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
 cavity_methods=(
-    #autodiff
-    #dtpinn
-    #analytical
-    #sage
-    #ropinn
-    #sk-pinn
+    autodiff
+    dtpinn
+    analytical
+    sage
+    ropinn
+    sk-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
 # No analytical or pielm for Kovasznay.
 kovasznay_methods=(
-    #autodiff
-    #dtpinn
-    #sage
-    #ropinn
-    #sk-pinn
+    autodiff
+    dtpinn
+    sage
+    ropinn
+    sk-pinn
 )
 
 # Network architectures to benchmark
