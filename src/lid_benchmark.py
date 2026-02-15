@@ -2489,26 +2489,21 @@ def elasticity_body_forces(x, y):
 def compute_pde_elasticity(pred, g):
     """Elasticity PDE residuals via spectral differentiation matrices.
 
-    Navier-Cauchy equations with body forces.
+    Uses precomputed D² matrices (Dxx, Dyy, Dxy) for single-matmul second
+    derivatives, avoiding chained Dx@Dx@u which amplifies float32 error.
     Returns (eq_x, eq_y) — 2 residual terms.
     """
     ux, uy = pred[:, 0:1], pred[:, 1:2]
 
-    # First derivatives (for cross derivatives)
-    dux_dx = g['Dx'] @ ux
-    dux_dy = g['Dy'] @ ux
-    duy_dx = g['Dx'] @ uy
-    duy_dy = g['Dy'] @ uy
+    # Second derivatives via precomputed D² (single matmul, not chained)
+    d2ux_dx2 = g['Dxx'] @ ux
+    d2ux_dy2 = g['Dyy'] @ ux
+    d2uy_dx2 = g['Dxx'] @ uy
+    d2uy_dy2 = g['Dyy'] @ uy
 
-    # Second derivatives
-    d2ux_dx2 = g['Dx'] @ dux_dx
-    d2ux_dy2 = g['Dy'] @ dux_dy
-    d2uy_dx2 = g['Dx'] @ duy_dx
-    d2uy_dy2 = g['Dy'] @ duy_dy
-
-    # Cross derivatives via Dy(dux/dx) and Dx(duy/dy)
-    d2uy_dxdy = g['Dy'] @ duy_dx
-    d2ux_dxdy = g['Dy'] @ dux_dx
+    # Cross derivatives via precomputed Dxy = Dy @ Dx
+    d2uy_dxdy = g['Dxy'] @ uy
+    d2ux_dxdy = g['Dxy'] @ ux
 
     # Navier-Cauchy equations + body forces
     eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
@@ -2585,12 +2580,19 @@ def build_grid_data_elasticity(N_grid, device):
     """Build Chebyshev grid + spectral differentiation matrices for elasticity.
 
     Domain: [0,1]² (unit square). Lx=Ly=1.0.
-    All boundaries: Dirichlet BCs from exact solution.
+    Precomputes D², D_xy second-derivative matrices in float64 for accuracy.
     """
     D1d = chebyshev_diff_matrix(N_grid) * 2.0  # scale for [0,1]
     I_mat = np.eye(N_grid)
     Dx_np = np.kron(I_mat, D1d)
     Dy_np = np.kron(D1d, I_mat)
+
+    # Precompute second-derivative matrices in float64 for numerical accuracy.
+    # Chained float32 matmuls (Dx @ Dx @ u) amplify rounding error ~900x vs
+    # single matmuls with precomputed D² matrices.
+    Dxx_np = Dx_np @ Dx_np   # d²/dx²
+    Dyy_np = Dy_np @ Dy_np   # d²/dy²
+    Dxy_np = Dy_np @ Dx_np   # d²/dxdy (= Dy applied to d/dx)
 
     x_ref = chebyshev_points(N_grid)
     x_phys = 0.5 * (x_ref + 1.0)
@@ -2612,6 +2614,14 @@ def build_grid_data_elasticity(N_grid, device):
     Dy = torch.tensor(Dy_np, dtype=torch.float32, device=device)
     DxT = Dx.T.contiguous()
     DyT = Dy.T.contiguous()
+
+    Dxx = torch.tensor(Dxx_np, dtype=torch.float32, device=device)
+    Dyy = torch.tensor(Dyy_np, dtype=torch.float32, device=device)
+    Dxy = torch.tensor(Dxy_np, dtype=torch.float32, device=device)
+    DxxT = Dxx.T.contiguous()
+    DyyT = Dyy.T.contiguous()
+    DxyT = Dxy.T.contiguous()
+
     xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
     xy_bc = xy_all[bc_idx]
 
@@ -2631,6 +2641,8 @@ def build_grid_data_elasticity(N_grid, device):
 
     return {
         'Dx': Dx, 'Dy': Dy, 'DxT': DxT, 'DyT': DyT,
+        'Dxx': Dxx, 'Dyy': Dyy, 'Dxy': Dxy,
+        'DxxT': DxxT, 'DyyT': DyyT, 'DxyT': DxyT,
         'xy_all': xy_all, 'xy_bc': xy_bc, 'xy_batched': xy_batched,
         'interior_idx': interior_idx, 'bc_idx': bc_idx,
         'interior_mask': interior_mask,
@@ -2779,7 +2791,7 @@ def _get_generated_backward_elasticity():
         tape = []
         outputs, inputs = trace_pde_forward(
             compute_pde_elasticity, None, tape, sparse=False,
-            constants=['Dx', 'Dy', 'fx', 'fy'],
+            constants=['Dxx', 'Dyy', 'Dxy', 'fx', 'fy'],
             input_names=['ux', 'uy'])
         _, _generated_elasticity_backward = emit_backward(
             tape, list(outputs), ['deq_x', 'deq_y'], inputs, sparse=False,
@@ -2821,7 +2833,8 @@ def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, mode
             grad_pde = generated_backward(pred_pde, g)
 
             N_bc = g['N_bc']
-            grad_bc = 2.0 * (pred_bc - g['bc_target']) / N_bc
+            n_out = pred_bc.shape[1]  # output_dim (2 for elasticity)
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / (N_bc * n_out)
 
             upstream = torch.cat([grad_pde, grad_bc], dim=0)
         pred_batch.backward(gradient=upstream)

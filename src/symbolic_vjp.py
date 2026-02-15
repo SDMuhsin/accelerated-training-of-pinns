@@ -296,9 +296,9 @@ def symbolic_backward(tape, output_vars, seed_names):
 def _build_matmul_vjp(adj_name, entry):
     """matmul: y = A @ x → adj_x = A^T @ adj"""
     _, A, x, out = entry
-    # Determine which matrix (Dx or Dy) and use precomputed transpose
-    a_name = A.name  # 'Dx' or 'Dy'
-    t_name = a_name.replace('Dx', 'DxT').replace('Dy', 'DyT')
+    # Use precomputed transpose: 'Dx' → 'DxT', 'Dxx' → 'DxxT', etc.
+    a_name = A.name
+    t_name = a_name + 'T'
     return [(x, f"g['{t_name}'] @ {adj_name}")]
 
 
@@ -537,7 +537,7 @@ def generate_backward(sparse=False, problem='cavity'):
     if problem == 'elasticity':
         from src.lid_benchmark import compute_pde_elasticity, compute_pde_elasticity_sparse
         compute_fn = compute_pde_elasticity_sparse if sparse else compute_pde_elasticity
-        constants = ['Dx', 'Dy', 'fx', 'fy']
+        constants = ['Dxx', 'Dyy', 'Dxy', 'fx', 'fy'] if not sparse else ['Dx', 'Dy', 'fx', 'fy']
         input_names = ['ux', 'uy']
         seed_names = ['deq_x', 'deq_y']
         func_name = 'generated_elasticity_grad'
