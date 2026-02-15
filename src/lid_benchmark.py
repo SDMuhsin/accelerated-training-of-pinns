@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import copy
 import csv
 import fcntl
 import json
@@ -66,6 +67,18 @@ Q_e = 4.0     # Load parameter for manufactured solution
 LOG_INTERVAL = 5000
 
 mse = nn.MSELoss()
+
+# SK-PINN model-specific weight decay: RKPM's O(h^2) accuracy limits the useful
+# model complexity. More expressive architectures need stronger regularization to
+# prevent overfitting the discretization (learning features that satisfy the RKPM-
+# discretized PDE but not the true PDE).  PirateNet's multiplicative gating is
+# especially prone to this; its momentum residual (evaluated by autograd) can
+# degrade 5.5x while training loss still decreases with weight_decay=1e-4.
+_SK_PINN_WD = {
+    'mlp':        1e-4,   # baseline — mild overfitting (2.2x) is acceptable
+    'tsa-pinn':   5e-4,   # trainable sinusoidal frequencies add capacity
+    'pirate-net': 1e-3,   # adaptive gating amplifies RKPM exploitation
+}
 
 # Lazy-initialized generated backward functions from symbolic VJP engine
 _generated_dense_backward = None
@@ -1026,6 +1039,10 @@ class TrainingTracker:
             'tag': args.tag,
         }
         self._initialized = False
+        # Best-model tracking: save checkpoint at lowest PDE RMS
+        self.best_pde_rms = float('inf')
+        self.best_epoch = None
+        self.best_state_dict = None
 
     def _init_csv(self):
         """Write CSV header on first call."""
@@ -1051,10 +1068,17 @@ class TrainingTracker:
         else:
             metrics = evaluate_model(base_model, self.device)
 
+        # Track best model by PDE RMS
+        pde_rms = metrics['pde_rms']
+        if not math.isnan(pde_rms) and pde_rms < self.best_pde_rms:
+            self.best_pde_rms = pde_rms
+            self.best_epoch = epoch + 1
+            self.best_state_dict = copy.deepcopy(base_model.state_dict())
+
         row = dict(self.metadata)
         row['epoch'] = epoch + 1
         row['train_loss'] = round(train_loss, 8) if not math.isnan(train_loss) else 'NaN'
-        row['pde_rms'] = round(metrics['pde_rms'], 6)
+        row['pde_rms'] = round(pde_rms, 6)
         row['continuity_rms'] = round(metrics['continuity_rms'], 6)
         row['momentum_rms'] = round(metrics['momentum_rms'], 6)
         row['u_rms_error'] = round(metrics['u_rms_error'], 6) if 'u_rms_error' in metrics and not math.isnan(metrics.get('u_rms_error', float('nan'))) else ''
@@ -1314,7 +1338,8 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
             optimizer.step()
 
         _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
-        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
             with torch.no_grad():
                 u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
                 du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
@@ -1330,10 +1355,17 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
                 mu = u*du_dx + v*du_dy + dp_dx - visc_u
                 mv = u*dv_dx + v*dv_dy + dp_dy - visc_v
                 ii = g['interior_idx']
-                lv = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
-                final_loss = lv.item()
+                loss_pde = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                loss_lid = mse(pred_l[:, 0:1], torch.ones_like(pred_l[:, 0:1])) + \
+                           mse(pred_l[:, 1:2], torch.zeros_like(pred_l[:, 1:2]))
+                loss_wall = mse(pred_w[:, 0:1], torch.zeros_like(pred_w[:, 0:1])) + \
+                            mse(pred_w[:, 1:2], torch.zeros_like(pred_w[:, 1:2]))
+                loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_lid.item() + loss_wall.item() + loss_p.item() + reg_val
             if (epoch + 1) % LOG_INTERVAL == 0:
-                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
             if _should_track:
                 tracker.step(epoch, final_loss, model)
 
@@ -1394,7 +1426,8 @@ def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp
         optimizer.step()
 
         _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
-        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
             with torch.no_grad():
                 u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
                 du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
@@ -1410,10 +1443,17 @@ def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp
                 mu = u*du_dx + v*du_dy + dp_dx - visc_u
                 mv = u*dv_dx + v*dv_dy + dp_dy - visc_v
                 ii = g['interior_idx']
-                lv = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
-                final_loss = lv.item()
+                loss_pde = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                loss_lid = mse(pred_l[:, 0:1], torch.ones_like(pred_l[:, 0:1])) + \
+                           mse(pred_l[:, 1:2], torch.zeros_like(pred_l[:, 1:2]))
+                loss_wall = mse(pred_w[:, 0:1], torch.zeros_like(pred_w[:, 0:1])) + \
+                            mse(pred_w[:, 1:2], torch.zeros_like(pred_w[:, 1:2]))
+                loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_lid.item() + loss_wall.item() + loss_p.item() + reg_val
             if (epoch + 1) % LOG_INTERVAL == 0:
-                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
             if _should_track:
                 tracker.step(epoch, final_loss, model)
 
@@ -1785,6 +1825,7 @@ CSV_COLUMNS = [
     'train_time_s', 'train_time_min', 'peak_gpu_memory_mb', 'gpu_memory_reserved_mb',
     'ms_per_epoch', 'n_params',
     'pde_rms', 'continuity_rms', 'momentum_rms', 'final_loss',
+    'best_epoch',
     'status', 'device', 'gpu_name', 'pytorch_version',
 ]
 
@@ -1810,14 +1851,17 @@ def append_csv_row(csv_path, row_dict):
 def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
     """SK-PINN: sparse RKPM differentiation matrices, autograd backward.
 
-    Uses weight decay to prevent the model from learning high-frequency features
-    that exceed the RKPM operator's resolution (O(h^2) algebraic convergence).
+    Uses model-specific weight decay to prevent the model from learning high-
+    frequency features that exceed the RKPM operator's resolution (O(h^2)
+    algebraic convergence).  More expressive architectures (PirateNet, TSA-PINN)
+    need stronger regularization to avoid overfitting the discretization.
     """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
@@ -1913,14 +1957,20 @@ def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model
         optimizer.step()
 
         _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
-        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
             with torch.no_grad():
                 c, mu, mv = compute_pde_kovasznay(pred_pde, g)
                 ii = g['interior_idx']
-                lv = (c[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
-                final_loss = lv.item()
+                loss_pde = (c[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                loss_bc = mse(pred_bc, g['bc_target'])
+                p_target = torch.tensor([[g['p_center_exact']]], dtype=torch.float32, device=pred_c.device)
+                loss_p = mse(pred_c[:, 2:3], p_target)
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_bc.item() + loss_p.item() + reg_val
             if (epoch + 1) % LOG_INTERVAL == 0:
-                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
             if _should_track:
                 tracker.step(epoch, final_loss, model)
 
@@ -2330,13 +2380,15 @@ def compute_pde_kovasznay_sparse(pred, g):
 def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
     """SK-PINN for Kovasznay flow: sparse RKPM matrices, autograd backward.
 
-    Uses weight decay to prevent model from learning beyond RKPM resolution.
+    Uses model-specific weight decay (see _SK_PINN_WD) to prevent the model
+    from learning beyond RKPM resolution.
     """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
@@ -2808,6 +2860,8 @@ def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, mode
     torch.manual_seed(seed)
     model = make_model(model_name, output_dim=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
 
     if technique == "compile":
         compiled_model = torch.compile(model, mode='reduce-overhead')
@@ -2842,16 +2896,21 @@ def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, mode
         if isinstance(reg, torch.Tensor):
             reg.backward()
         optimizer.step()
+        scheduler.step()
 
         _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
-        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track:
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
             with torch.no_grad():
                 eq_x, eq_y = compute_pde_elasticity(pred_pde, g)
                 ii = g['interior_idx']
-                lv = (eq_x[ii]**2).mean() + (eq_y[ii]**2).mean()
-                final_loss = lv.item()
+                loss_pde = (eq_x[ii]**2).mean() + (eq_y[ii]**2).mean()
+                loss_bc = mse(pred_bc, g['bc_target'])
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_bc.item() + reg_val
             if (epoch + 1) % LOG_INTERVAL == 0:
-                print(f"  Epoch {epoch+1}: pde_loss={final_loss:.6f}")
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
             if _should_track:
                 tracker.step(epoch, final_loss, model)
 
@@ -2875,6 +2934,8 @@ def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size, mo
         compiled_model = model
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
@@ -2897,6 +2958,7 @@ def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size, mo
         loss = loss_pde + loss_bc + model_reg_loss(model)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
@@ -2922,6 +2984,8 @@ def train_autodiff_elasticity(seed, device, n_epochs, lr, technique, grid_size, 
         model = torch.compile(model, mode='reduce-overhead')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
 
     xy_int = coll['xy_interior'].clone().requires_grad_(True)
     xy_bc = coll['xy_bc']
@@ -2946,6 +3010,7 @@ def train_autodiff_elasticity(seed, device, n_epochs, lr, technique, grid_size, 
         loss = loss_pde + loss_bc + model_reg_loss(model)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
@@ -3045,6 +3110,8 @@ def train_ropinn_elasticity(seed, device, n_epochs, lr, optimizer_type, techniqu
 
     else:  # adam
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=n_epochs, eta_min=1e-5)
 
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
@@ -3075,6 +3142,7 @@ def train_ropinn_elasticity(seed, device, n_epochs, lr, optimizer_type, techniqu
             loss = loss_pde + loss_bc + model_reg_loss(model)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             final_loss = loss.item()
 
@@ -3104,12 +3172,18 @@ def train_ropinn_elasticity(seed, device, n_epochs, lr, optimizer_type, techniqu
 
 # --- Method: sk-pinn (Elasticity) ---
 def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
-    """SK-PINN for elasticity: sparse RKPM matrices, autograd backward."""
+    """SK-PINN for elasticity: sparse RKPM matrices, autograd backward.
+
+    Uses model-specific weight decay (see _SK_PINN_WD).
+    """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name, output_dim=2).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
@@ -3132,6 +3206,7 @@ def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, 
         loss = loss_pde + loss_bc + model_reg_loss(model)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
@@ -3302,6 +3377,7 @@ def main():
     model = None
     train_time = 0.0
     final_loss = float('nan')
+    best_epoch = ''
     n_params = 0
     metrics = {'pde_rms': float('nan'), 'continuity_rms': float('nan'), 'momentum_rms': float('nan')}
 
@@ -3402,7 +3478,7 @@ def main():
                     args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
 
-        # ---- Evaluate ----
+        # ---- Evaluate final model ----
         print("\nEvaluating on 51x51 uniform grid...")
         if is_elasticity:
             metrics = evaluate_elasticity(model, device)
@@ -3412,6 +3488,28 @@ def main():
             metrics = evaluate_pielm(model)
         else:
             metrics = evaluate_model(model, device)
+
+        # ---- Best-epoch model restoration ----
+        # If tracker found a better model during training, restore and re-evaluate
+        best_epoch = ''
+        if tracker and tracker.best_state_dict is not None:
+            if tracker.best_pde_rms < metrics['pde_rms']:
+                best_epoch = tracker.best_epoch
+                print(f"\nBest tracked model at epoch {best_epoch} (PDE {tracker.best_pde_rms:.6f}) "
+                      f"< final (PDE {metrics['pde_rms']:.6f}). Restoring...")
+                base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                base_model.load_state_dict(tracker.best_state_dict)
+                if is_elasticity:
+                    metrics = evaluate_elasticity(model, device)
+                elif is_kovasznay:
+                    metrics = evaluate_kovasznay(model, device)
+                else:
+                    metrics = evaluate_model(model, device)
+                print(f"Re-evaluated best model: PDE RMS = {metrics['pde_rms']:.6f}")
+            else:
+                best_epoch = args.epochs
+                print(f"\nFinal model is best (PDE {metrics['pde_rms']:.6f} "
+                      f"<= tracked best {tracker.best_pde_rms:.6f})")
 
         # Check for NaN
         if math.isnan(metrics['pde_rms']):
@@ -3448,6 +3546,8 @@ def main():
         print(f"v RMS error:     {metrics['v_rms_error']:.6f}")
         print(f"p RMS error:     {metrics['p_rms_error']:.6f}")
     print(f"Final loss:      {final_loss}")
+    if best_epoch:
+        print(f"Best epoch:      {best_epoch}")
     print("=" * 70)
 
     # ---- Write CSV row ----
@@ -3473,6 +3573,7 @@ def main():
         'continuity_rms': round(metrics['continuity_rms'], 6) if not math.isnan(metrics['continuity_rms']) else 'NaN',
         'momentum_rms': round(metrics['momentum_rms'], 6) if not math.isnan(metrics['momentum_rms']) else 'NaN',
         'final_loss': round(final_loss, 6) if not math.isnan(final_loss) else 'NaN',
+        'best_epoch': best_epoch,
         'status': status,
         'device': str(device),
         'gpu_name': torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu',

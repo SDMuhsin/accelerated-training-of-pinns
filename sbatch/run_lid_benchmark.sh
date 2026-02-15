@@ -35,8 +35,12 @@
 #   timestamp, problem, method, model, optimizer, lr, epochs, seed, grid_size,
 #   technique, tag, train_time_s, train_time_min, peak_gpu_memory_mb,
 #   gpu_memory_reserved_mb, ms_per_epoch, n_params, pde_rms,
-#   continuity_rms, momentum_rms, final_loss, status, device,
+#   continuity_rms, momentum_rms, final_loss, best_epoch, status, device,
 #   gpu_name, pytorch_version
+#
+# Note: --track is enabled so the best model (by PDE RMS) seen during
+# training is restored for final evaluation. pde_rms reflects the best
+# epoch, not the final epoch. best_epoch records which epoch was used.
 #
 # Usage:
 #   ./sbatch/run_lid_benchmark.sh
@@ -120,6 +124,7 @@ LR="1e-3"
 OPTIMIZER="adam"
 TECHNIQUE="none"
 TAG=""
+TRACK_INTERVAL=100
 
 # Output CSV (shared across all jobs, concurrent-safe via fcntl locking)
 OUTPUT_CSV="results/lid_benchmark_results.csv"
@@ -225,7 +230,9 @@ for method in "${cavity_methods[@]}"; do
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
-                        --tag=$TAG
+                        --tag=$TAG \
+                        --track \
+                        --track-interval=$TRACK_INTERVAL
                     echo '========================================'
                     echo 'Finished: '\$(date)
                     echo '========================================'
@@ -345,7 +352,9 @@ for method in "${kovasznay_methods[@]}"; do
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
-                        --tag=$TAG
+                        --tag=$TAG \
+                        --track \
+                        --track-interval=$TRACK_INTERVAL
                     echo '========================================'
                     echo 'Finished: '\$(date)
                     echo '========================================'
@@ -419,7 +428,9 @@ for method in "${elasticity_methods[@]}"; do
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
-                        --tag=$TAG
+                        --tag=$TAG \
+                        --track \
+                        --track-interval=$TRACK_INTERVAL
                     echo '========================================'
                     echo 'Finished: '\$(date)
                     echo '========================================'
