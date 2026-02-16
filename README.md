@@ -1,67 +1,139 @@
-# Accelerated Training of Physics Informed Neural Networks (PINNs) using Meshless Discretizations
+# SAGE: Symbolic Analytical Gradient Engine for Accelerating Physics-Informed Neural Network Training
 
-This repository material contains the code for running and replicating our experiments for vanilla-PINNs and DT-PINNs.
+> **Paper Status:** Currently under review at *Springer Applied Intelligence*. For the BibTeX citation or a copy of the paper, please contact **sdmuhsin@gmail.com**.
 
-## Introduction
+SAGE is a tracing-based reverse-mode automatic differentiation engine that generates optimized backward functions for PDE residual computations in Physics-Informed Neural Networks (PINNs). It traces the forward PDE residual symbolically, walks the resulting tape in reverse applying vector-Jacobian product (VJP) rules, and emits an explicit backward function that eliminates AD graph construction and traversal at every training step.
 
-Physics-informed neural networks (PINNs) are neural networks trained by using physical laws in the form of partial differential equations (PDEs) as soft constraints. We present a new technique for the accelerated training of PINNs that combines modern scientific computing techniques with machine learning: discretely-trained PINNs (DT-PINNs). The repeated computation of the partial derivative terms in the PINN loss functions via automatic differentiation during training is known to be computationally expensive, especially for higher-order derivatives. DT-PINNs are trained by replacing these exact spatial derivatives with high-order accurate numerical discretizations computed using meshless radial basis function-finite differences (RBF-FD) and applied via sparse-matrix vector multiplication. While in principle any high-order discretization may be used, the use of RBF-FD allows for DT-PINNs to be trained even on point cloud samples placed on irregular domain geometries. Additionally, though traditional PINNs (vanilla-PINNs) are typically stored and trained in 32-bit floating-point (fp32) on the GPU, we show that for DT-PINNs, using fp64 on the GPU leads to significantly faster training times than fp32 vanilla-PINNs with comparable accuracy. We demonstrate the efficiency and accuracy of DT-PINNs via a series of experiments. First, we explore the effect of network depth on both numerical and automatic differentiation of a neural network with random weights and show that RBF-FD approximations of third-order accuracy and above are more efficient while being sufficiently accurate. We then compare the DT-PINNs to vanilla-PINNs on both linear and nonlinear Poisson equations and show that DT-PINNs achieve similar losses with 2-4x faster training times on a consumer GPU. Finally, we also demonstrate that similar results can be obtained for the PINN solution to the heat equation (a space-time problem) by discretizing the spatial derivatives using RBF-FD and using automatic differentiation for the temporal derivative. Our results show that fp64 DT-PINNs offer a superior cost-accuracy profile to fp32 vanilla-PINNs, opening the door to a new paradigm of leveraging scientific computing techniques to support machine learning.
+## Key Results
+
+| Problem | SAGE Speedup vs AutoDiff | Accuracy |
+|---------|--------------------------|----------|
+| Lid-Driven Cavity (NS + Smagorinsky) | **10.6-18.1x** | Matches or beats AutoDiff |
+| Kovasznay Flow (constant-viscosity NS) | **7.2-13.4x** | Matches or beats AutoDiff |
+| 2D Linear Elasticity (Navier-Cauchy) | **7.6-13.8x** | ~10% gap (float32 D² conditioning) |
+
+Speedup scales with architecture complexity: MLP (7-11x) → TSA-PINN (9-12x) → PirateNet (14-18x).
+
+## Repository Structure
+
+```
+├── src/
+│   ├── lid_benchmark.py              # Main experiment runner (~3500 lines)
+│   ├── symbolic_vjp.py               # SAGE engine (579 lines, 10 VJP rules)
+│   └── experiment_dt_elm_pinn/
+│       └── models/
+│           ├── tsa_pinn.py            # TSA-PINN architecture
+│           ├── pirate_net.py          # PirateNet architecture
+│           └── pielm_navier_stokes.py # PIELM model
+├── scripts/
+│   ├── plot_training_curves.py        # Training convergence figures
+│   └── plot_pareto_frontiers.py       # Accuracy-speed Pareto frontier figures
+├── sbatch/
+│   ├── run_lid_benchmark.sh           # SLURM script: main benchmarks
+│   └── run_tracking.sh               # SLURM script: per-epoch tracking
+├── results/                           # Benchmark output CSVs
+│   ├── lid_benchmark_results.csv      # Main results (48 runs)
+│   └── tracking_*.csv                 # Per-run epoch-level tracking
+└── requirements.txt
+```
 
 ## Requirements
 
-To run the Matlab code in the [``MatlabSolver/``](MatlabSolver/) folder, a Matlab account is required. For running the code for vanilla-PINNs and DT-PINNs, the following Python libraries are required:
-
-1. numpy
-2. matplotlib
-3. json
-4. scipy
-5. cupy
-6. torch
-
-We provide a [``requirements.txt``](requirements.txt) file that can be used to install the libraries with pip:
+- Python 3.10+
+- NVIDIA GPU (tested on H100 80GB and A40 48GB)
+- CUDA-compatible PyTorch
 
 ```bash
->> git clone git@github.com:ramanshsharma2806/dt-pinn.git
->> cd dt-pinn
->> pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-Our code is compatible with both CPU and GPU, however to replicate our GPU results from the paper (end of this README), we recommend using a GPU.
+Dependencies: `torch`, `numpy`, `scipy`, `matplotlib`
 
+## Reproducing Paper Results
 
-## Dataset
-We provide the Matlab code in [``MatlabSolver/``](MatlabSolver/) to generate the dataset for linear and nonlinear Poisson equations, and the heat equation.
+### 1. Environment Setup
 
-### Poisson equation
-To generate the datset for the Poisson equation, please use the [``GenSCAIMats.m``](MatlabSolver/GenSCAIMats.m) file. Inside it, change the ``nonlinear`` variable value to 0 for linear and 1 for nonlinear. Running this file automatically makes the corresponding ``scai/`` (or ``nonlinear/`` in case of nonlinear Poisson) dataset folder.
+```bash
+git clone <repository-url>
+cd dt-pinn
+python -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+```
 
-### Heat equation
-For the heat equation, use the [``GenerateVectorsTimeDependent.m``](MatlabSolver/GenerateVectorsTimeDependent.m) file. This file will add the three heat equation relevant vectors; ``u_heat.mat``, ``f_heat.mat``, and ``g_heat.mat`` in the dataset folder in all subfolders for size 828.
+### 2. Running Individual Experiments
 
-## PINN code
-We provide the Python code in [``src/``](src/) for vanilla-PINN and DT-PINN for all experiments: linear and nonlinear Poisson, and the heat equation. While the names of the code modules are self-explanatory, we clarify some of them below:
+The unified CLI supports all combinations of problems, methods, models, and configurations:
 
-1. [``dtpinn_cupy_fp32.py``](src/dtpinn_cupy_fp32.py): Corresponds fo fp32 DT-PINN for linear Poisson equation.
-2. [``dtpinn_cupy_fp64.py``](src/dtpinn_cupy_fp64.py): Corresponds fo fp64 DT-PINN for linear Poisson equation.
-3. [``dtpinn_cupy_fp64_nonlinear.py``](src/dtpinn_cupy_fp64_nonlinear.py): Corresponds fo fp64 DT-PINN for nonlinear Poisson equation.
-4. [``heat_dtpinn_cupy.py``](src/heat_dtpinn_cupy.py): Corresponds fo fp64 DT-PINN for the heat equation.
+```bash
+python -u src/lid_benchmark.py \
+    --problem <problem> \
+    --method <method> \
+    --model <model> \
+    --epochs 30000 \
+    --seed 42 \
+    --track \
+    --track-interval 100
+```
 
-The vanilla-PINN code files [``vanilla.py``](src/vanilla.py), [``vanilla_nonlinear.py``](src/vanilla_nonlinear.py), and [``vanilla_heat.py``](src/vanilla_heat.py) correspond to the linear and nonlinear Poisson equations, and heat equation respectively.
+**Problems:** `cavity` (Navier-Stokes + Smagorinsky, Re=1000), `kovasznay` (constant-viscosity NS, Re=40), `elasticity` (Navier-Cauchy)
 
-For all PINN code, one can change the learning rate, floating point precision, training set size, order of differentiation (for DT-PINN), network depth, and activation function directly in the code files. The code contains the hyperparameters we have used throughout our experiments. The files automatically save the results in a descriptive folder name that can later be used for making plots.
+**Methods:** `sage`, `autodiff`, `dtpinn`, `ropinn`, `sk-pinn`, `analytical` (cavity only), `pielm` (cavity only)
 
-## Plots
-Lastly, we also share a script [``plotting.py``](src/plotting.py) for making the plots from the paper for any of the generated results. Since usually the plots were made to compare DT-PINNs and vanilla-PINNs, the file contains two empty variables ``discrete_results_folder`` and ``vanilla_results_folder`` that are to be filled with the folders of the results. The different plots required can be chosen by uncommenting the function calls from the bottom of the file.
+**Models:** `mlp`, `tsa-pinn`, `pirate-net`
 
-## Citation
-This repository is part of the following paper. Please cite the following paper if you would like to cite this repository and find its contents useful:
+**Examples:**
 
-```text
-@article{SharmaShankar2022acceleratingpinn,
-  title = {Accelerated Training of Physics Informed Neural Networks (PINNs) using Meshless Discretizations},
-  author = {Sharma, Ramansh and Shankar, Varun},
-  journal = {Advances in Neural Information Processing Systems},
-  arxiv = {https://arxiv.org/abs/2205.09332},
-  url = {https://proceedings.neurips.cc/paper_files/paper/2022/hash/0764db1151b936aca59249e2c1386101-Abstract-Conference.html},
-  volume = {35},
-  year = {2022}
-}
+```bash
+# SAGE on lid-driven cavity with MLP
+python -u src/lid_benchmark.py --problem cavity --method sage --model mlp --epochs 30000 --seed 42
+
+# AutoDiff baseline on Kovasznay flow with PirateNet
+python -u src/lid_benchmark.py --problem kovasznay --method autodiff --model pirate-net --epochs 30000 --seed 42
+
+# SAGE on linear elasticity with TSA-PINN
+python -u src/lid_benchmark.py --problem elasticity --method sage --model tsa-pinn --epochs 30000 --seed 42
+```
+
+### 3. Full Benchmark Suite
+
+To reproduce the complete set of 48 experiments (3 problems × up to 6 methods × 3 models) reported in the paper, use the provided SLURM scripts on an HPC cluster:
+
+```bash
+sbatch sbatch/run_lid_benchmark.sh    # Main benchmarks
+sbatch sbatch/run_tracking.sh         # With per-epoch tracking
+```
+
+For non-SLURM environments, the individual commands can be extracted from these scripts and run sequentially.
+
+### 4. Generating Figures
+
+After benchmark results are saved to `results/`:
+
+```bash
+python scripts/plot_training_curves.py      # Figure 1: Training convergence
+python scripts/plot_pareto_frontiers.py     # Figure 2: Pareto frontiers
+```
+
+### 5. Results
+
+Results are written to `results/lid_benchmark_results.csv` with columns for problem, method, model, PDE RMS, training time, and speedup. Per-epoch tracking data (when `--track` is enabled) is saved as individual CSV files in `results/`.
+
+## How SAGE Works
+
+1. **Trace**: The forward PDE residual function is executed with symbolic proxy variables (`TracedVar`) that record every operation on an ordered tape.
+2. **Reverse**: The tape is traversed in reverse, applying 10 VJP rules to accumulate adjoint expressions symbolically.
+3. **Emit**: The accumulated expressions are assembled into an explicit Python function, compiled once via `exec()`, and cached.
+4. **Train**: The generated backward function replaces the AD engine for the PDE residual portion, computing the upstream gradient as straight-line arithmetic with no graph overhead.
+
+The key optimization is *adjoint accumulation before matrix multiplication*: all adjoint contributions to an intermediate variable are summed before the transpose matrix-vector product, reducing the backward matmul count to exactly the number of forward matmuls (Proposition 1 in the paper).
+
+## Authors
+
+- Sayed Muhsin (University of Saskatchewan) — sdmuhsin@gmail.com
+- Chul B. Park (University of Toronto)
+- Seokbum Ko (University of Saskatchewan, corresponding author)
+
+## License
+
+Please contact the authors for licensing information.
