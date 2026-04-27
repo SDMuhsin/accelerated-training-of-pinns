@@ -102,62 +102,44 @@ fi
 # CONFIGURATION - Modify these arrays to control what runs
 # ============================================================================
 
-# =====================  DRY-RUN MODE  =====================
-# To verify the pipeline end-to-end before launching the full 460-job sweep:
-#   - cavity_methods: keep all 5 (one job per method on cavity × mlp × seed 0)
-#   - kovasznay_methods + elasticity_methods: empty (loops iterate 0 times)
-#   - models: only mlp
-#   - seeds: only 0
-# Once the dry run succeeds, restore by un-commenting the entries below.
-# ===========================================================
-
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
-# DRY-RUN: commented out so only PIELM (Section 2) submits.
 cavity_methods=(
-    # autodiff
-    # dtpinn
-    # sage
-    # ropinn
-    # sk-pinn
+    autodiff
+    dtpinn
+    sage
+    ropinn
+    sk-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
 # No analytical or pielm for Kovasznay.
 kovasznay_methods=(
-    # autodiff
-    # dtpinn
-    # sage
-    # ropinn
-    # sk-pinn
+    autodiff
+    dtpinn
+    sage
+    ropinn
+    sk-pinn
 )
 
 # Network architectures to benchmark
 models=(
     mlp
-    # tsa-pinn
-    # pirate-net
+    tsa-pinn
+    pirate-net
 )
 
 # Random seeds for statistical significance.
-# Default = 10 seeds. The first five (0, 1, 7, 23, 42) are the 2026-04-26
-# audit set, verified locally on A40 to span the per-seed accuracy range
-# (AD seed 0 reaches sub-0.012 best-pde-rms on Kov × PirateNet, AD seed 7
-# lands at 0.032 — they bracket the paper-era single-seed (42) result).
-# The remaining five (11, 19, 31, 53, 89) are arbitrary additional integers
-# chosen to push n=10 for tighter mean ± std error bars on tab:main_results.
-# Override with --seeds.
+# Default = 5 seeds (0, 1, 7, 23, 42) — the 2026-04-26 audit set, verified
+# locally on A40 to span the per-seed accuracy range (AD seed 0 reaches
+# sub-0.012 best-pde-rms on Kov × PirateNet, AD seed 7 lands at 0.032 —
+# they bracket the paper-era single-seed (42) result). Override with --seeds.
 seeds=(
     0
-    # 1
-    # 7
-    # 11
-    # 19
-    # 23
-    # 31
-    # 42
-    # 53
-    # 89
+    1
+    7
+    23
+    42
 )
 
 # Apply --seeds CLI override (space-separated string → bash array)
@@ -215,13 +197,17 @@ OUTPUT_CSV="${OUTPUT_CSV_OVERRIDE:-results/lid_benchmark_results.csv}"
 #   sage:        ~2.4 min / ~7 min      (fastest, auto-generated backward)
 #   autodiff:    ~22 min / ~48 min
 #   ropinn:      ~23 min / ~25 min
-#   sk-pinn:     ~22 min / ~27 min     (N=200, sparse RKPM)
+#   sk-pinn:     ~22 min / ~27 min     (N=200, sparse RKPM — historical)
 #   dtpinn:      ~8-30 min / ~25-50 min (RBF-FD + L-BFGS + 5K + fp64; per-seed
 #                                       variance is intrinsic to raw L-BFGS)
-# A40 reproduction (2026-04-26 audit) is ~1.5–1.8× slower per epoch, so
-# autodiff × PirateNet × Kovasznay is ~50 min on A40 vs ~29 min on H100.
-# The 2-hour budget gives ≥2× safety margin even on the slower platform.
-GPU_TIME="0-02:00:00"
+# 2026-04-27 dry-run on H100 MIG 2g.20gb (cavity × mlp):
+#   sk-pinn:    63 min (3× slower than the historical estimate above; the
+#                       N=200 grid scales unfavourably on this MIG slice)
+# Worst-case projection for sk-pinn × pirate-net × cavity (PirateNet ~1.5-2×
+# slower per epoch than MLP): ~95-130 min. The previous 2-hour budget was
+# too close for comfort. Bumped to 3 h for ~50% margin over worst case.
+# A40 reproduction is ~1.5-1.8× slower than H100 if anyone re-runs there.
+GPU_TIME="0-03:00:00"
 GPU_TYPE="nvidia_h100_80gb_hbm3_2g.20gb:1"
 GPU_MEM="16000M"
 GPU_CPUS=2
@@ -480,13 +466,13 @@ done
 #   Chebyshev methods (autodiff, dtpinn, sage, ropinn): N=30
 #   SK-PINN: N=100 (sparse RKPM)
 
-# Elasticity training methods (commented out for dry-run; un-comment to restore)
+# Elasticity training methods
 elasticity_methods=(
-    # autodiff
-    # dtpinn
-    # sage
-    # ropinn
-    # sk-pinn
+    autodiff
+    dtpinn
+    sage
+    ropinn
+    sk-pinn
 )
 
 echo ""
