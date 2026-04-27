@@ -242,23 +242,22 @@ mkdir -p ./results
 # a fresh file never both decide to write a header. The Python writer
 # (src/lid_benchmark.py:append_csv_row) checks file size inside the fcntl
 # lock and skips the header when the file is non-empty.
+#
+# The header below MUST stay in lockstep with CSV_COLUMNS in
+# src/lid_benchmark.py (line ~2436). We hardcode it in bash so the sbatch
+# submitter does not need to import the project (numpy/torch on the login
+# node is unavailable on standard HPC setups).
 # ----------------------------------------------------------------------------
+CSV_HEADER='timestamp,problem,method,model,optimizer,lr,epochs,seed,grid_size,technique,tag,train_time_s,train_time_min,peak_gpu_memory_mb,gpu_memory_reserved_mb,ms_per_epoch,n_params,pde_rms,continuity_rms,momentum_rms,final_loss,best_epoch,status,device,gpu_name,pytorch_version'
+
 if [[ ! -f "$OUTPUT_CSV" ]] || [[ ! -s "$OUTPUT_CSV" ]]; then
     echo "Pre-creating $OUTPUT_CSV with header row..."
-    if ! python3 - <<EOF
-import csv, sys, os
-sys.path.insert(0, os.path.abspath("."))
-from src.lid_benchmark import CSV_COLUMNS
-os.makedirs(os.path.dirname("$OUTPUT_CSV") or ".", exist_ok=True)
-with open("$OUTPUT_CSV", 'w', newline='') as f:
-    w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-    w.writeheader()
-print(f"Wrote header ({len(CSV_COLUMNS)} cols) to $OUTPUT_CSV")
-EOF
-    then
-        echo "ERROR: failed to pre-create $OUTPUT_CSV. Run from project root."
+    mkdir -p "$(dirname "$OUTPUT_CSV")"
+    if ! printf '%s\n' "$CSV_HEADER" > "$OUTPUT_CSV"; then
+        echo "ERROR: failed to write $OUTPUT_CSV"
         exit 1
     fi
+    echo "Wrote header ($(awk -F',' '{print NF; exit}' "$OUTPUT_CSV") cols) to $OUTPUT_CSV"
 else
     echo "Reusing existing $OUTPUT_CSV ($(wc -l < "$OUTPUT_CSV") lines)."
 fi
