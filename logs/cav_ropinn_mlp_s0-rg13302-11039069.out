@@ -1,0 +1,91 @@
+========================================
+Job: cav_ropinn_mlp_s0
+Problem: cavity
+Method: ropinn
+Model: mlp
+Seed: 0
+Started: Mon 27 Apr 2026 01:30:13 PM EDT
+========================================
+Mon Apr 27 13:30:13 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          Off |   00000000:4E:00.0 Off |                   On |
+| N/A   42C    P0            129W /  700W |   39794MiB /  81559MiB |     N/A      Default |
+|                                         |                        |              Enabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| MIG devices:                                                                            |
++------------------+----------------------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |                     Memory-Usage |        Vol|        Shared         |
+|      ID  ID  Dev |                       BAR1-Usage | SM     Unc| CE ENC  DEC  OFA  JPG |
+|                  |                                  |        ECC|                       |
+|==================+==================================+===========+=======================|
+|  0    3   0   0  |              17MiB / 20096MiB    | 32      0 |  2   0    2    0    2 |
+|                  |                 0MiB / 32767MiB  |           |                       |
++------------------+----------------------------------+-----------+-----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+======================================================================
+UNIFIED BENCHMARK: Lid-Driven Cavity NS+Smagorinsky
+======================================================================
+Problem:   cavity
+Method:    ropinn
+Model:     mlp
+Optimizer: adam
+LR:        0.001
+Epochs:    30000
+Seed:      0
+Grid:      50x50
+Technique: none
+Device:    cuda
+GPU:       NVIDIA H100 80GB HBM3 MIG 2g.20gb
+PyTorch:   2.9.0
+Tag:       multiseed_20260427
+Output:    results/lid_benchmark_results.csv
+Tracking:  every 100 epochs
+======================================================================
+Tracking to: results/tracking_cavity_ropinn_mlp_s0_multiseed_20260427.csv
+  Epoch 5000: loss=0.031536, region=8.95e-05, grad_var=1.1284
+  Epoch 10000: loss=0.027487, region=8.73e-05, grad_var=1.1409
+  Epoch 15000: loss=0.022204, region=8.75e-05, grad_var=1.1491
+  Epoch 20000: loss=0.027947, region=8.92e-05, grad_var=1.1230
+  Epoch 25000: loss=0.021067, region=8.60e-05, grad_var=1.1662
+  Epoch 30000: loss=0.019274, region=8.65e-05, grad_var=1.1689
+
+Evaluating on 51x51 uniform grid...
+
+Best tracked model at epoch 6300 (PDE 0.021610) < final (PDE 0.044936). Restoring...
+Re-evaluated best model: PDE RMS = 0.021610
+
+======================================================================
+RESULTS
+======================================================================
+Status:          OK
+Train time:      884.98s (14.75 min)
+ms/epoch:        29.50
+Peak GPU mem:    241.4 MB
+Parameters:      21187
+PDE RMS:         0.021610
+Continuity RMS:  0.012968
+Momentum RMS:    0.017286
+Final loss:      0.019274404272437096
+Best epoch:      6300
+======================================================================
+
+Results appended to results/lid_benchmark_results.csv
+Tracking data saved to results/tracking_cavity_ropinn_mlp_s0_multiseed_20260427.csv
+========================================
+Finished: Mon 27 Apr 2026 01:45:03 PM EDT
+========================================

@@ -1,0 +1,91 @@
+========================================
+Job: cav_sage_mlp_s0
+Problem: cavity
+Method: sage
+Model: mlp
+Seed: 0
+Started: Mon 27 Apr 2026 01:26:48 PM EDT
+========================================
+Mon Apr 27 13:26:48 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          Off |   00000000:4E:00.0 Off |                   On |
+| N/A   42C    P0            130W /  700W |   39794MiB /  81559MiB |     N/A      Default |
+|                                         |                        |              Enabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| MIG devices:                                                                            |
++------------------+----------------------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |                     Memory-Usage |        Vol|        Shared         |
+|      ID  ID  Dev |                       BAR1-Usage | SM     Unc| CE ENC  DEC  OFA  JPG |
+|                  |                                  |        ECC|                       |
+|==================+==================================+===========+=======================|
+|  0    3   0   0  |              17MiB / 20096MiB    | 32      0 |  2   0    2    0    2 |
+|                  |                 0MiB / 32767MiB  |           |                       |
++------------------+----------------------------------+-----------+-----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+======================================================================
+UNIFIED BENCHMARK: Lid-Driven Cavity NS+Smagorinsky
+======================================================================
+Problem:   cavity
+Method:    sage
+Model:     mlp
+Optimizer: adam
+LR:        0.001
+Epochs:    30000
+Seed:      0
+Grid:      50x50
+Technique: none
+Device:    cuda
+GPU:       NVIDIA H100 80GB HBM3 MIG 2g.20gb
+PyTorch:   2.9.0
+Tag:       multiseed_20260427
+Output:    results/lid_benchmark_results.csv
+Tracking:  every 100 epochs
+======================================================================
+Tracking to: results/tracking_cavity_sage_mlp_s0_multiseed_20260427.csv
+  Epoch 5000: loss=0.031515
+  Epoch 10000: loss=0.026067
+  Epoch 15000: loss=0.025428
+  Epoch 20000: loss=0.020928
+  Epoch 25000: loss=0.022325
+  Epoch 30000: loss=0.021236
+
+Evaluating on 51x51 uniform grid...
+
+Best tracked model at epoch 3100 (PDE 0.019488) < final (PDE 0.036148). Restoring...
+Re-evaluated best model: PDE RMS = 0.019488
+
+======================================================================
+RESULTS
+======================================================================
+Status:          OK
+Train time:      79.38s (1.32 min)
+ms/epoch:        2.65
+Peak GPU mem:    385.6 MB
+Parameters:      21187
+PDE RMS:         0.019488
+Continuity RMS:  0.008785
+Momentum RMS:    0.017396
+Final loss:      0.02123629141942729
+Best epoch:      3100
+======================================================================
+
+Results appended to results/lid_benchmark_results.csv
+Tracking data saved to results/tracking_cavity_sage_mlp_s0_multiseed_20260427.csv
+========================================
+Finished: Mon 27 Apr 2026 01:28:35 PM EDT
+========================================

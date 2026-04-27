@@ -113,12 +113,13 @@ fi
 
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
+# DRY-RUN: commented out so only PIELM (Section 2) submits.
 cavity_methods=(
-    autodiff
-    dtpinn
-    sage
-    ropinn
-    sk-pinn
+    # autodiff
+    # dtpinn
+    # sage
+    # ropinn
+    # sk-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
@@ -225,8 +226,13 @@ GPU_TYPE="nvidia_h100_80gb_hbm3_2g.20gb:1"
 GPU_MEM="16000M"
 GPU_CPUS=2
 
-# PIELM jobs (CPU-only, numpy-based, takes ~1 min)
-CPU_TIME="0-00:30:00"
+# PIELM jobs (CPU-only, numpy-based). Wall time observed on Compute Canada
+# rorqual rc32* CPU nodes: ~82 s per Picard iter at the configured grid
+# (max_picard_iter=50 in train_pielm), so worst-case ~68 min. Earlier
+# measurements claimed "~1 min" on a faster reference machine; the 30 min
+# budget hit the wall on the 2026-04-27 dry-run (cancelled at iter 22/50).
+# Set to 4 h for a generous 4× buffer over worst case.
+CPU_TIME="0-04:00:00"
 CPU_MEM="8000M"
 CPU_CPUS=4
 

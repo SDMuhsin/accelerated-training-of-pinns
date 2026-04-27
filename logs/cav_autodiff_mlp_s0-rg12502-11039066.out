@@ -1,0 +1,91 @@
+========================================
+Job: cav_autodiff_mlp_s0
+Problem: cavity
+Method: autodiff
+Model: mlp
+Seed: 0
+Started: Mon 27 Apr 2026 01:26:48 PM EDT
+========================================
+Mon Apr 27 13:26:48 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          Off |   00000000:CB:00.0 Off |                   On |
+| N/A   53C    P0            263W /  700W |    4164MiB /  81559MiB |     N/A      Default |
+|                                         |                        |              Enabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| MIG devices:                                                                            |
++------------------+----------------------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |                     Memory-Usage |        Vol|        Shared         |
+|      ID  ID  Dev |                       BAR1-Usage | SM     Unc| CE ENC  DEC  OFA  JPG |
+|                  |                                  |        ECC|                       |
+|==================+==================================+===========+=======================|
+|  0    3   0   0  |              17MiB / 20096MiB    | 32      0 |  2   0    2    0    2 |
+|                  |                 0MiB / 32767MiB  |           |                       |
++------------------+----------------------------------+-----------+-----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+======================================================================
+UNIFIED BENCHMARK: Lid-Driven Cavity NS+Smagorinsky
+======================================================================
+Problem:   cavity
+Method:    autodiff
+Model:     mlp
+Optimizer: adam
+LR:        0.001
+Epochs:    30000
+Seed:      0
+Grid:      50x50
+Technique: none
+Device:    cuda
+GPU:       NVIDIA H100 80GB HBM3 MIG 2g.20gb
+PyTorch:   2.9.0
+Tag:       multiseed_20260427
+Output:    results/lid_benchmark_results.csv
+Tracking:  every 100 epochs
+======================================================================
+Tracking to: results/tracking_cavity_autodiff_mlp_s0_multiseed_20260427.csv
+  Epoch 5000: loss=0.030012
+  Epoch 10000: loss=0.026849
+  Epoch 15000: loss=0.024810
+  Epoch 20000: loss=0.020995
+  Epoch 25000: loss=0.024604
+  Epoch 30000: loss=0.029512
+
+Evaluating on 51x51 uniform grid...
+
+Best tracked model at epoch 5100 (PDE 0.019539) < final (PDE 0.025473). Restoring...
+Re-evaluated best model: PDE RMS = 0.019539
+
+======================================================================
+RESULTS
+======================================================================
+Status:          OK
+Train time:      747.18s (12.45 min)
+ms/epoch:        24.91
+Peak GPU mem:    241.4 MB
+Parameters:      21187
+PDE RMS:         0.019539
+Continuity RMS:  0.012248
+Momentum RMS:    0.015224
+Final loss:      0.029512176290154457
+Best epoch:      5100
+======================================================================
+
+Results appended to results/lid_benchmark_results.csv
+Tracking data saved to results/tracking_cavity_autodiff_mlp_s0_multiseed_20260427.csv
+========================================
+Finished: Mon 27 Apr 2026 01:39:42 PM EDT
+========================================

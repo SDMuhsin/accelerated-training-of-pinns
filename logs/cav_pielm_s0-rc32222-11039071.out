@@ -1,0 +1,45 @@
+========================================
+Job: cav_pielm_s0
+Method: pielm
+Seed: 0
+Started: Mon 27 Apr 2026 01:23:23 PM EDT
+========================================
+======================================================================
+UNIFIED BENCHMARK: Lid-Driven Cavity NS+Smagorinsky
+======================================================================
+Problem:   cavity
+Method:    pielm
+Model:     mlp
+Optimizer: adam
+LR:        0.001
+Epochs:    30000
+Seed:      0
+Grid:      50x50
+Technique: none
+Device:    cpu
+PyTorch:   2.9.0
+Tag:       multiseed_20260427
+Output:    results/lid_benchmark_results.csv
+======================================================================
+  Picard iter 1: rel_change = 1.0000e+00
+  Picard iter 2: rel_change = 1.0635e+00
+  Picard iter 3: rel_change = 5.9556e-01
+  Picard iter 4: rel_change = 3.4737e-01
+  Picard iter 5: rel_change = 3.2263e-01
+  Picard iter 6: rel_change = 3.2112e-01
+  Picard iter 7: rel_change = 2.0385e-01
+  Picard iter 8: rel_change = 7.7264e-02
+  Picard iter 9: rel_change = 4.0639e-02
+  Picard iter 10: rel_change = 2.5595e-02
+  Picard iter 11: rel_change = 1.3967e-02
+  Picard iter 12: rel_change = 7.3511e-03
+  Picard iter 13: rel_change = 3.8810e-03
+  Picard iter 14: rel_change = 2.0350e-03
+  Picard iter 15: rel_change = 1.0609e-03
+  Picard iter 16: rel_change = 5.5489e-04
+  Picard iter 17: rel_change = 2.7212e-04
+  Picard iter 18: rel_change = 1.1728e-04
+  Picard iter 19: rel_change = 5.1473e-05
+  Picard iter 20: rel_change = 3.9973e-05
+  Picard iter 21: rel_change = 2.3283e-05
+  Picard iter 22: rel_change = 1.3176e-05
