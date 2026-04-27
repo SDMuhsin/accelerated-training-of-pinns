@@ -1,0 +1,295 @@
+flow:
+  training:
+    lr: 5.0e-5
+    lr_decay_rate: 0.997
+    lr_decay_steps: 500
+    # use_init_field_warmup: true
+    #--------------------
+    nu_schedule: [1.0e-2, 5.0e-3, 1.0e-3]
+    k_flow_init: 3000
+    k_flow_bc: 2000
+    k_flow_per_stage: [5000, 5000, 10000]
+    max_steps: 1
+    flow_init_batch_size: 4096
+    flow_soft_init_batch_size: 4096
+    flow_wall_batch_size: 2048
+    flow_bc_batch_size: 512
+    flow_pde_batch_size: 4096
+    
+    progress_knn_k: 8
+    progress_max_edge_len: 0.02
+  
+    use_soft_init_during_bc: true
+    use_soft_init_constraint: true
+  
+    grad_agg_freq: 1
+    # max_steps: 1000
+  
+    save_network_freq: 1000
+    print_stats_freq: 100
+    print_sub_losses: true
+    print_sub_losses_top_k: 8
+    print_constraint_sub_losses: true
+    print_constraint_sub_losses_top_k: 12
+    summary_freq: 200
+  
+    rec_constraint_freq: 999999999
+    rec_validation_freq: 999999999
+    rec_inference_freq: 999999999
+    rec_monitor_freq: 999999999
+  
+    grad_clip_max_norm: 1.0
+    monitor_grad_clip: false
+    flow_graph_mode: pixel              # pixel or knn
+    flow_graph_connectivity: 8
+    
+    
+  
+    flow_pde_points_target: 30000
+    flow_pde_wall_boost: 1.0
+    flow_pde_wall_scale: 0.02
+    flow_pde_corridor_boost: 2.0
+    flow_pde_corridor_radius: 0.05
+    flow_pde_sampling_seed: 1234
+  
+    wall_guard_enabled: true
+    wall_guard_radius: 0.02
+    wall_guard_points: 4000
+    wall_guard_separator_enabled: true
+    wall_guard_separator_radius: 0.02
+    wall_guard_separator_points: 3000
+    wall_guard_separator_x_max: 0.42
+    wall_guard_separator_span_factor: 0.85
+    wall_guard_batch_size: 2048
+    wall_guard_normal_k: 4
+    wall_guard_scale: 1.0
+    wall_guard_exclude_ports: true
+  
+    use_geo_direction_guidance: true
+    use_geo_guidance_during_bc: true
+    geo_guidance_bc_scale: 0.25
+    geo_guidance_start_scale: 0.25
+    geo_guidance_end_scale: 0.02
+    geo_guidance_batch_size: 2048
+    geo_guidance_speed_eps: 1.0e-4
+    geo_guidance_max_points: 50000
+    geo_guidance_exclude_ports: true
+    geo_guidance_seed: 1234
+    geo_guidance_weight_floor: 0.1
+  
+    use_init_field_warmup: true
+    
+    init_field_warmup_scale: 1.0
+  
+    soft_init_bc_scale: 0.25
+    soft_init_start_scale: 0.1
+    soft_init_end_scale: 0.01
+  
+    curriculum_chunk_size: 8192
+  
+    w_pde_continuity: 1.0
+    w_pde_momentum_x: 1.0
+    w_pde_momentum_y: 1.0
+    w_wall_u: 1.0
+    w_wall_v: 1.0
+    w_inlet_u: 1.0
+    w_inlet_v: 1.0
+    w_outlet_p: 1.0
+    w_inlet_p: 1.0
+    w_soft_init_u: 0.2
+    w_soft_init_v: 0.2
+    w_soft_init_p: 0.2
+    w_geo_cross: 0.2
+    w_geo_cosine: 0.1
+    w_geo_parallel: 0.05
+    w_geo_speed: 0.0
+    w_wall_guard_normal: 0.5
+    w_wall_guard_separator_normal: 0.5
+  
+    ntk:
+      use_ntk: false
+  
+  run_mode: "train"
+  
+  
+  bc:
+    inlet_u: 1.0
+    inlet_v: 0.0
+    inlet_p: 1.0
+    outlet_p: 1.0
+    use_outlet_pressure_constraint: false
+    use_inlet_pressure_anchor: true
+    use_inlet_pressure_anchor_last_stage_only: true
+    inlet_radius_norm: 0.002
+    outlet_radius_norm: 0.002
+    max_patch_radius_norm: 0.005
+    patch_growth_factor: 1.5
+    inlet_width_px: 2
+    outlet_width_px: 2
+    inlet_half_height_px: 1
+    outlet_half_height_px: 1
+    inlet_direction: right
+    outlet_direction: right
+    min_run_per_strip: 2
+    enforce_connected_chain: true
+  
+  init_guess:
+    knn_k: 8
+    max_edge_len: 0.02
+    velocity_scale: 1.0
+    velocity_power: 1.0
+    pressure_power: 1.0
+    pressure_drop_guess: 0.0
+    save_random_paths_plot: false
+    num_random_paths: 12
+    random_seed: 123
+    save_into_geometry_json: true
+    save_init_preview_json: true
+    save_init_preview_plot: true
+  
+  
+  stop_criterion:
+    metric: "loss"
+    min_delta: 0.0
+    patience: 1000000
+    mode: "min"
+    freq: 1000
+    strict: false
+  
+  amp:
+    enabled: true
+    dtype: "float32"
+  
+  network_dir: ./results/partner_v4/flow
+  initialization_network_dir: ""
+  
+  save_filetypes: []
+  summary_histograms: false
+  
+  problem:
+    geom_json_path: ./data/partner_v4/pipe_three_class_fixed.json
+  
+  physics:
+    rho: 1076.0
+    nu: 7.0e-7
+  
+  
+  inference:
+    save_plot: true
+  
+  
+  
+  flow_model:
+    hidden_layers: 12
+    hidden_size: 512
+    activation: silu
+  
+  jit: false
+  cuda_graphs: false
+  cuda_graph_warmup: 20
+  
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: ${flow.training.lr}
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+    _params_:
+      compute_gradients: adam_compute_gradients
+      apply_gradients: adam_apply_gradients
+  
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ExponentialLR
+    gamma: ${flow.training.lr_decay_rate}
+  
+  loss:
+    _target_: physicsnemo.sym.loss.aggregator.Sum
+
+temp:
+  training:
+    seed: 1234
+    max_steps: 12000
+    pde_batch_size: 2048
+    bc_batch_size: 512
+    lr: 5.0e-4
+    lr_decay_rate: 0.99
+    lr_decay_steps: 500
+    grad_clip_max_norm: 1.0
+    save_network_freq: 1000
+    print_stats_freq: 100
+    loss_weights:
+      pde: 1.0
+      ic: 1.0
+      arrival: 1.0
+      pre_arrival: 1.0
+      inlet: 1.0
+      outlet: 0.5
+      wall: 1.0
+    
+    use_weighted_pde_sampling: true
+    use_weighted_pde_loss: true
+    use_weighted_bc_loss: true
+  
+    pde_start_scale: 0.1
+    pde_end_scale: 1.0
+    ic_start_scale: 1.0
+    ic_end_scale: 1.0
+    arrival_start_scale: 1.0
+    arrival_end_scale: 1.0
+    pre_arrival_start_scale: 1.0
+    pre_arrival_end_scale: 1.0
+    inlet_start_scale: 1.0
+    inlet_end_scale: 1.0
+    outlet_start_scale: 1.0
+    outlet_end_scale: 1.0
+  
+    pde_wall_boost: 2.0
+    pde_wall_scale: 0.02
+    pde_inlet_boost: 0.0
+    pde_inlet_power: 1.0
+  
+    bc_inlet_boost: 0.0
+    bc_inlet_power: 1.0
+    ic_wall_boost: 0.0
+    ic_wall_scale: 0.02
+  
+  run_mode: "train"
+  
+  network_dir: ./results/partner_v4/temp
+  
+  problem:
+    geom_json_path: ./data/partner_v4/pipe_three_class_fixed.json
+    flow_json_path: ./data/partner_v4/pipe_three_class_fixed_pred_flow_steady.json
+    flow_time_index: 0
+    T_init: 60.0
+    t_min: 0.0
+    t_max: 40.0
+    infer_t_start: 0.0
+    infer_t_end: 40.0
+    infer_dt: 1.0
+    geodesic_knn_k: 20
+    geodesic_max_edge_len: 0.0
+    arrival_speed: 0.2
+  
+  physics:
+    D: 1.0e-5
+    Q: 0.0
+  
+  bc:
+    inlet_T: 25.0
+    inlet_radius_norm: 0.005
+    outlet_radius_norm: 0.005
+  
+  model:
+    hidden_layers: 12
+    hidden_size: 256
+    activation: silu
+  
+  optimizer:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  
+  inference:
+    batch_size: 32768
+    output_filename: temperature_predictions.h5

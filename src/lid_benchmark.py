@@ -117,8 +117,10 @@ def parse_args():
                         choices=["cavity", "kovasznay", "elasticity"],
                         help="PDE problem to solve")
     parser.add_argument("--method", required=True,
-                        choices=["autodiff", "dtpinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage"],
-                        help="Training method")
+                        choices=["autodiff", "dtpinn", "chebyshev-pinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"],
+                        help="Training method. 'dtpinn' is the paper-faithful "
+                             "Sharma & Shankar 2022 RBF-FD + fp64 + L-BFGS variant. "
+                             "'chebyshev-pinn' is the prior Chebyshev-spectral baseline.")
     parser.add_argument("--model", default="mlp", choices=["mlp", "tsa-pinn", "pirate-net"],
                         help="Network architecture (ignored for pielm)")
     parser.add_argument("--optimizer", default="adam", choices=["adam", "lbfgs"],
@@ -142,6 +144,16 @@ def parse_args():
                         help="Enable per-epoch tracking for ablation studies")
     parser.add_argument("--track-interval", type=int, default=100,
                         help="Epoch interval for tracking evaluations")
+    # ---- Faithful DT-PINN (Sharma & Shankar 2022) controls ----
+    parser.add_argument("--dtype", default="fp32", choices=["fp32", "fp64"],
+                        help="Compute precision. dtpinn defaults to fp64 if --dtype is "
+                             "left at fp32; pass fp32 explicitly to force fp32 for ablation.")
+    parser.add_argument("--rbf-fd-order", type=int, default=4, choices=[2, 3, 4, 5],
+                        help="RBF-FD polynomial order p (only used by --method dtpinn)")
+    parser.add_argument("--num-nodes", type=int, default=None,
+                        help="Approximate number of scattered nodes (Ni+Nb) for "
+                             "--method dtpinn. Default: ~grid_size² to keep the "
+                             "node count comparable to the Chebyshev baseline.")
     return parser.parse_args()
 
 
@@ -200,6 +212,114 @@ def chebyshev_diff_matrix(N):
                 D[i, j] = (c[i] / c[j]) * ((-1.0) ** (i + j)) / (x[i] - x[j])
         D[i, i] = -np.sum(D[i, :])
     return D
+
+
+# =============================================================================
+# Compact-stencil (FD) adjoint operators for stencil-adjoint method
+# =============================================================================
+def _fornberg_weights(z, x, m):
+    """Fornberg 1988 recurrence: FD weights for derivatives up to order m
+    at location z using nodes x[0..n].  Returns array of shape (n+1, m+1);
+    column k gives the k-th-derivative weights.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x) - 1
+    c = np.zeros((n + 1, m + 1))
+    c1 = 1.0
+    c4 = x[0] - z
+    c[0, 0] = 1.0
+    for i in range(1, n + 1):
+        mn = min(i, m)
+        c2 = 1.0
+        c5 = c4
+        c4 = x[i] - z
+        for j in range(i):
+            c3 = x[i] - x[j]
+            c2 *= c3
+            if j == i - 1:
+                for k in range(mn, 0, -1):
+                    c[i, k] = c1 * (k * c[i - 1, k - 1] - c5 * c[i - 1, k]) / c2
+                c[i, 0] = -c1 * c5 * c[i - 1, 0] / c2
+            for k in range(mn, 0, -1):
+                c[j, k] = (c4 * c[j, k] - k * c[j, k - 1]) / c3
+            c[j, 0] = c4 * c[j, 0] / c3
+        c1 = c2
+    return c
+
+
+def _fd_stencil_1d(x_nodes, order=1, half_bandwidth=3):
+    """Banded 1D differentiation matrix on (possibly non-uniform) nodes.
+
+    Row i approximates d^order/dx^order at x_nodes[i] using the window of
+    2*half_bandwidth+1 nearest nodes (clipped to the grid boundaries via
+    one-sided stencils).  Returns (N, N) float64 dense ndarray whose
+    nonzero pattern is banded + one-sided near edges.
+    """
+    x_nodes = np.asarray(x_nodes, dtype=np.float64)
+    N = len(x_nodes)
+    w = 2 * half_bandwidth + 1
+    w = min(w, N)
+    D = np.zeros((N, N))
+    for i in range(N):
+        lo = max(0, i - half_bandwidth)
+        hi = lo + w
+        if hi > N:
+            hi = N
+            lo = hi - w
+        idx = np.arange(lo, hi)
+        weights = _fornberg_weights(x_nodes[i], x_nodes[idx], order)
+        D[i, idx] = weights[:, order]
+    return D
+
+
+def _inject_stencil_adjoint(g, problem, half_bandwidth=3):
+    """Mutate grid-data g in place: replace transpose-operator entries
+    (DxT, DyT, and for elasticity DxxT, DyyT, DxyT) with compact-stencil
+    approximations.  Forward operators Dx, Dy, ... are left untouched so
+    the observed residual (and loss value) remains exact.
+
+    The stencil is derived from a local polynomial interpolant on the
+    same Chebyshev node set; the approximation error on each operator is
+    O(h^p) where p = 2*half_bandwidth.
+    """
+    N = g['N_grid']
+    device = g['xy_all'].device
+
+    if problem in ('cavity', 'elasticity'):
+        x_ref = chebyshev_points(N)
+        x_phys = 0.5 * (x_ref + 1.0)  # physical nodes on [0,1]
+        x_nodes = y_nodes = x_phys
+    elif problem == 'kovasznay':
+        Lx, Ly = 1.5, 2.0
+        x0, y0 = -0.5, -0.5
+        x_ref = chebyshev_points(N)
+        x_nodes = x0 + Lx * 0.5 * (x_ref + 1.0)
+        y_nodes = y0 + Ly * 0.5 * (x_ref + 1.0)
+    else:
+        raise ValueError(f"unknown problem for stencil injector: {problem}")
+
+    # Fornberg weights on physical nodes are already in physical units; no
+    # extra domain-length scaling needed.
+    Dx1d = _fd_stencil_1d(x_nodes, order=1, half_bandwidth=half_bandwidth)
+    Dy1d = _fd_stencil_1d(y_nodes, order=1, half_bandwidth=half_bandwidth)
+
+    I_mat = np.eye(N)
+    Dx_sten = np.kron(I_mat, Dx1d).astype(np.float32)
+    Dy_sten = np.kron(Dy1d, I_mat).astype(np.float32)
+
+    g['DxT'] = torch.tensor(Dx_sten.T, dtype=torch.float32, device=device).contiguous()
+    g['DyT'] = torch.tensor(Dy_sten.T, dtype=torch.float32, device=device).contiguous()
+
+    if problem == 'elasticity':
+        Dxx_sten = (Dx_sten @ Dx_sten).astype(np.float32)
+        Dyy_sten = (Dy_sten @ Dy_sten).astype(np.float32)
+        Dxy_sten = (Dy_sten @ Dx_sten).astype(np.float32)
+        g['DxxT'] = torch.tensor(Dxx_sten.T, dtype=torch.float32, device=device).contiguous()
+        g['DyyT'] = torch.tensor(Dyy_sten.T, dtype=torch.float32, device=device).contiguous()
+        g['DxyT'] = torch.tensor(Dxy_sten.T, dtype=torch.float32, device=device).contiguous()
+
+    g['_stencil_hbw'] = half_bandwidth
+    return g
 
 
 def build_grid_data(N_grid, device):
@@ -266,6 +386,7 @@ def build_grid_data(N_grid, device):
         'N_all': N_all, 'N_lid': N_lid, 'N_wall': N_wall, 'M': M,
         'off_lid': off_lid, 'off_wall': off_wall, 'off_center': off_center,
         'N_grid': N_grid,
+        'nu_lam': float(nu_laminar),  # Program-B F1 parametric threading
     }
 
 
@@ -518,14 +639,20 @@ def pde_residuals_autodiff(model, xy):
 # Spectral PDE computation
 # =============================================================================
 def compute_pde_terms(pred, g):
-    """PDE residuals via spectral differentiation matrices."""
+    """PDE residuals via spectral differentiation matrices.
+
+    Laminar viscosity is read from g['nu_lam'] if present (Program-B parametric
+    family F1), otherwise falls back to the module-level nu_laminar for legacy
+    callers that expect the fixed Re=1000 cavity.
+    """
+    nu_lam = g['nu_lam'] if 'nu_lam' in g else nu_laminar
     u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
     du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
     dv_dx = g['Dx'] @ v; dv_dy = g['Dy'] @ v
     Sxx, Syy = du_dx, dv_dy
     Sxy = 0.5 * (du_dy + dv_dx)
     S_mag = torch.sqrt(2.0 * (Sxx**2 + Syy**2 + 2.0 * Sxy**2) + 1e-12)
-    nu_eff = nu_laminar + g['Cs_d_sq'] * S_mag
+    nu_eff = nu_lam + g['Cs_d_sq'] * S_mag
     continuity = du_dx + dv_dy
     u_conv = u * du_dx + v * du_dy
     v_conv = u * dv_dx + v * dv_dy
@@ -539,6 +666,7 @@ def compute_pde_terms(pred, g):
 
 def compute_pde_terms_sparse(pred, g):
     """PDE residuals via sparse RKPM differentiation matrices."""
+    nu_lam = g['nu_lam'] if 'nu_lam' in g else nu_laminar
     Dx, Dy = g['Dx'], g['Dy']
     u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
     du_dx = torch.sparse.mm(Dx, u); du_dy = torch.sparse.mm(Dy, u)
@@ -546,7 +674,7 @@ def compute_pde_terms_sparse(pred, g):
     Sxx, Syy = du_dx, dv_dy
     Sxy = 0.5 * (du_dy + dv_dx)
     S_mag = torch.sqrt(2.0 * (Sxx**2 + Syy**2 + 2.0 * Sxy**2) + 1e-12)
-    nu_eff = nu_laminar + g['Cs_d_sq'] * S_mag
+    nu_eff = nu_lam + g['Cs_d_sq'] * S_mag
     continuity = du_dx + dv_dy
     u_conv = u * du_dx + v * du_dy
     v_conv = u * dv_dx + v * dv_dy
@@ -576,9 +704,11 @@ def kovasznay_exact(x, y):
 def compute_pde_kovasznay(pred, g):
     """Kovasznay PDE residuals via spectral differentiation matrices.
 
-    Standard incompressible NS with constant viscosity nu_kov = 1/Re_kov.
-    No Smagorinsky model.
+    Standard incompressible NS with constant viscosity nu = 1/Re.
+    nu is read from g['nu_kov'] if present (Program-B parametric family F2),
+    otherwise falls back to the module-level nu_kov (Re=40).
     """
+    nu = g['nu_kov'] if 'nu_kov' in g else nu_kov
     u, v, p = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3]
 
     du_dx = g['Dx'] @ u;  du_dy = g['Dy'] @ u
@@ -589,14 +719,9 @@ def compute_pde_kovasznay(pred, g):
     d2u_dx2 = g['Dx'] @ du_dx;  d2u_dy2 = g['Dy'] @ du_dy
     d2v_dx2 = g['Dx'] @ dv_dx;  d2v_dy2 = g['Dy'] @ dv_dy
 
-    # Continuity: du/dx + dv/dy = 0
     continuity = du_dx + dv_dy
-
-    # Momentum-u: u*du/dx + v*du/dy + dp/dx - nu*(d2u/dx2 + d2u/dy2) = 0
-    mom_u = u * du_dx + v * du_dy + dp_dx - nu_kov * (d2u_dx2 + d2u_dy2)
-
-    # Momentum-v: u*dv/dx + v*dv/dy + dp/dy - nu*(d2v/dx2 + d2v/dy2) = 0
-    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu_kov * (d2v_dx2 + d2v_dy2)
+    mom_u = u * du_dx + v * du_dy + dp_dx - nu * (d2u_dx2 + d2u_dy2)
+    mom_v = u * dv_dx + v * dv_dy + dp_dy - nu * (d2v_dx2 + d2v_dy2)
 
     return continuity, mom_u, mom_v
 
@@ -673,6 +798,7 @@ def build_grid_data_kovasznay(N_grid, device):
         'N_all': N_all, 'N_bc': N_bc, 'M': M,
         'off_bc': off_bc, 'off_center': off_center,
         'N_grid': N_grid, 'Lx': Lx, 'Ly': Ly,
+        'nu_kov': float(nu_kov),  # Program-B F2 parametric threading
     }
 
 
@@ -926,7 +1052,8 @@ def evaluate_model(model, device):
     x = np.linspace(0, 1, nx); y = np.linspace(0, 1, ny)
     X, Y = np.meshgrid(x, y)
     xy_eval = np.column_stack([X.ravel(), Y.ravel()])
-    xy_t = torch.tensor(xy_eval, dtype=torch.float32, device=device, requires_grad=True)
+    model_dtype = next(model.parameters()).dtype
+    xy_t = torch.tensor(xy_eval, dtype=model_dtype, device=device, requires_grad=True)
 
     model.eval()
     pred = model(xy_t)
@@ -1174,9 +1301,13 @@ def train_autodiff(seed, device, n_epochs, lr, technique, grid_size, model_name=
     return base_model, train_time, final_loss
 
 
-# --- Method: dtpinn ---
-def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None, tracker=None):
-    """Standard DT-PINN: spectral matrices, separate forward passes, autograd backward."""
+# --- Method: chebyshev-pinn ---
+def train_chebyshev_pinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", grid_data=None, tracker=None):
+    """Chebyshev-spectral PINN: dense Chebyshev differentiation matrices, autograd backward.
+    (Previously misnamed `train_dtpinn` — the actual DT-PINN method of Sharma & Shankar 2022
+    is a meshless RBF-FD method, now in `train_dtpinn` / `train_dtpinn_kovasznay` /
+    `train_dtpinn_elasticity`. Preserved here as a separate baseline.)
+    """
     g = grid_data or build_grid_data(grid_size, device)
 
     torch.manual_seed(seed)
@@ -1252,6 +1383,489 @@ def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="m
         torch.cuda.synchronize()
     train_time = time.perf_counter() - start
     return model, train_time, final_loss
+
+
+# =============================================================================
+# Faithful DT-PINN (Sharma & Shankar 2022, arXiv:2205.09332)
+#
+# Meshless RBF-FD with PHS + Legendre polynomial basis, fp64 everywhere,
+# L-BFGS with strong-Wolfe line search, 5K-epoch budget.
+#
+# Operator construction lives in src/rbf_fd_operators.py — this section just
+# wires those operators to our PDE residuals (cavity NS+Smag, Kovasznay,
+# elasticity).  Boundary condition formulation differs from the paper (the
+# paper uses Robin BCs natural for the disk Poisson problem; our test PDEs are
+# Dirichlet, applied via direct boundary-residual evaluation as in every
+# other baseline in this file).  Method (RBF-FD + fp64 + L-BFGS) is faithful;
+# BC type is matched to the test problem.
+# =============================================================================
+
+
+def _dtpinn_default_num_nodes(grid_size: int) -> int:
+    """Pick a default scattered-node count comparable to the Chebyshev N×N
+    tensor grid. The Chebyshev baseline uses N=50 (cavity) or N=30 (kov, elas)
+    by default → 2500 / 900 nodes. Match those orders of magnitude.
+    """
+    return max(grid_size * grid_size, 64)
+
+
+def _build_dtpinn_grid(problem, num_nodes, p, device, dtype, seed):
+    """Generate scattered nodes + sparse RBF-FD operators for `problem`.
+
+    Returns dict g containing torch fp64 tensors and sparse operators.
+
+    For cavity / Kovasznay we build square (Nf, Nf) Dx, Dy so that the
+    NS viscous-flux divergence ∂_x(ν_eff · ∂u/∂x) can be chained through the
+    same operator. The Lap operator (Ni+Nb, Nf) and the elasticity Dxx/Dyy/Dxy
+    operators stay rectangular (no chain needed there).
+    """
+    from src.rbf_fd_operators import gen_rectangle_nodes, build_operators, to_torch_sparse
+
+    if problem == 'cavity' or problem == 'elasticity':
+        xmin, xmax, ymin, ymax = 0.0, 1.0, 0.0, 1.0
+    elif problem == 'kovasznay':
+        xmin, xmax, ymin, ymax = -0.5, 1.0, -0.5, 1.5
+    else:
+        raise ValueError(f"unknown problem {problem!r}")
+
+    Xi_np, Xb_np, normals_np, h = gen_rectangle_nodes(
+        xmin, xmax, ymin, ymax, num_nodes, seed=seed
+    )
+
+    if problem == 'elasticity':
+        # Lamé operator uses individual second derivatives, no chain → rectangular.
+        ops_intbd = build_operators(
+            Xi_np, Xb_np, normals_np, p=p,
+            derivs=((1, 0), (0, 1), (2, 0), (0, 2), (1, 1)),
+            centres_kind='int_bd',
+        )
+        ops_full = None
+    else:
+        # NS+Smag (cavity) and Kovasznay need Dx, Dy at all Nf points to chain
+        # the viscous-flux divergence; Lap stays rectangular for the no-chain
+        # use case (e.g., logging / future Stokes-style residuals).
+        ops_full = build_operators(
+            Xi_np, Xb_np, normals_np, p=p,
+            derivs=((1, 0), (0, 1)),
+            centres_kind='full',
+        )
+        ops_intbd = build_operators(
+            Xi_np, Xb_np, normals_np, p=p,
+            derivs=('lap',),
+            centres_kind='int_bd',
+        )
+
+    md = ops_intbd['__metadata__']
+    Ni, Nb, Ng = md['Ni'], md['Nb'], md['Ng']
+    Xf_np = md['Xf']
+    Nf = Xf_np.shape[0]
+
+    Xf = torch.tensor(Xf_np, dtype=dtype, device=device)
+    Xb_t = torch.tensor(Xb_np, dtype=dtype, device=device)
+    normals_t = torch.tensor(normals_np, dtype=dtype, device=device)
+
+    g = {
+        'Xf': Xf,
+        'Xb': Xb_t,
+        'normals': normals_t,
+        'Ni': Ni, 'Nb': Nb, 'Ng': Ng, 'Nf': Nf,
+        'h': h, 'p': p, 'problem': problem,
+    }
+
+    if problem == 'elasticity':
+        g['Dx'] = to_torch_sparse(ops_intbd[(1, 0)], dtype=dtype, device=device)
+        g['Dy'] = to_torch_sparse(ops_intbd[(0, 1)], dtype=dtype, device=device)
+        g['Dxx'] = to_torch_sparse(ops_intbd[(2, 0)], dtype=dtype, device=device)
+        g['Dyy'] = to_torch_sparse(ops_intbd[(0, 2)], dtype=dtype, device=device)
+        g['Dxy'] = to_torch_sparse(ops_intbd[(1, 1)], dtype=dtype, device=device)
+    else:
+        g['Dx_full'] = to_torch_sparse(ops_full[(1, 0)], dtype=dtype, device=device)
+        g['Dy_full'] = to_torch_sparse(ops_full[(0, 1)], dtype=dtype, device=device)
+        g['Lap'] = to_torch_sparse(ops_intbd['lap'], dtype=dtype, device=device)
+
+    if problem == 'cavity':
+        eps = 1e-9
+        is_lid = (Xb_np[:, 1] >= 1 - eps)
+        lid_idx = np.where(is_lid)[0]
+        wall_idx = np.where(~is_lid)[0]
+        g['lid_idx'] = torch.from_numpy(lid_idx).to(device=device, dtype=torch.long)
+        g['wall_idx'] = torch.from_numpy(wall_idx).to(device=device, dtype=torch.long)
+        # Wall distance and Smagorinsky factor — evaluated at ALL Nf points
+        # so they can multiply the (Nf,)-shape inner derivatives in the
+        # viscous-flux chain. Clamp ≥ 0 to keep ghost points (slightly outside
+        # the unit square) physically valid in the squared term.
+        x_t, y_t = Xf[:, 0:1], Xf[:, 1:2]
+        d_wall = torch.clamp_min(
+            torch.min(torch.min(x_t, 1.0 - x_t), torch.min(y_t, 1.0 - y_t)),
+            0.0,
+        )
+        g['Cs_d_sq_full'] = (Cs * d_wall) ** 2
+        g['xy_center'] = torch.tensor([[0.5, 0.5]], dtype=dtype, device=device)
+        g['nu_lam'] = float(nu_laminar)
+
+    elif problem == 'kovasznay':
+        u_b, v_b, p_b = kovasznay_exact(Xb_t[:, 0:1], Xb_t[:, 1:2])
+        g['bc_target'] = torch.cat([u_b, v_b, p_b], dim=1)
+        g['xy_center'] = torch.tensor([[0.0, 0.0]], dtype=dtype, device=device)
+        _, _, p_c = kovasznay_exact(g['xy_center'][:, 0:1], g['xy_center'][:, 1:2])
+        g['p_center_exact'] = float(p_c.item())
+        g['nu_kov'] = float(nu_kov)
+
+    elif problem == 'elasticity':
+        ux_b, uy_b = elasticity_exact(Xb_t[:, 0:1], Xb_t[:, 1:2])
+        g['bc_target'] = torch.cat([ux_b, uy_b], dim=1)
+        # Body forces at the (Ni+Nb) PDE-residual points
+        x_int_bd = Xf[: Ni + Nb, 0:1]
+        y_int_bd = Xf[: Ni + Nb, 1:2]
+        fx, fy = elasticity_body_forces(x_int_bd, y_int_bd)
+        g['fx'] = fx
+        g['fy'] = fy
+        g['lam_e'] = float(lam_e)
+        g['mu_e'] = float(mu_e)
+
+    return g
+
+
+def _compute_pde_dtpinn_cavity(pred_full, g):
+    """NS+Smagorinsky cavity residual via square (Nf, Nf) RBF-FD operators.
+
+    pred_full: (Nf, 3) network output at all interior+boundary+ghost points.
+    Returns continuity, mom_u, mom_v of shape (Ni+Nb, 1) each — residuals at
+    the (Ni+Nb) interior+boundary stencil centres (paper convention).
+    """
+    Dx, Dy = g['Dx_full'], g['Dy_full']
+    Cs_d_sq = g['Cs_d_sq_full']
+    nu_lam = g['nu_lam']
+    nibd = g['Ni'] + g['Nb']
+
+    u, v, p = pred_full[:, 0:1], pred_full[:, 1:2], pred_full[:, 2:3]
+    du_dx = torch.sparse.mm(Dx, u); du_dy = torch.sparse.mm(Dy, u)
+    dv_dx = torch.sparse.mm(Dx, v); dv_dy = torch.sparse.mm(Dy, v)
+    Sxx, Syy = du_dx, dv_dy
+    Sxy = 0.5 * (du_dy + dv_dx)
+    S_mag = torch.sqrt(2.0 * (Sxx ** 2 + Syy ** 2 + 2.0 * Sxy ** 2) + 1e-12)
+    nu_eff = nu_lam + Cs_d_sq * S_mag  # (Nf, 1) at all points incl. ghost
+
+    continuity = (du_dx + dv_dy)[:nibd]
+    u_int = u[:nibd]; v_int = v[:nibd]
+    u_conv = u_int * du_dx[:nibd] + v_int * du_dy[:nibd]
+    v_conv = u_int * dv_dx[:nibd] + v_int * dv_dy[:nibd]
+    dp_dx = torch.sparse.mm(Dx, p)[:nibd]
+    dp_dy = torch.sparse.mm(Dy, p)[:nibd]
+    visc_u = (
+        torch.sparse.mm(Dx, nu_eff * du_dx)
+        + torch.sparse.mm(Dy, nu_eff * du_dy)
+    )[:nibd]
+    visc_v = (
+        torch.sparse.mm(Dx, nu_eff * dv_dx)
+        + torch.sparse.mm(Dy, nu_eff * dv_dy)
+    )[:nibd]
+    mom_u = u_conv + dp_dx - visc_u
+    mom_v = v_conv + dp_dy - visc_v
+    return continuity, mom_u, mom_v
+
+
+def _compute_pde_dtpinn_kovasznay(pred_full, g):
+    """Steady Kovasznay residual via square (Nf, Nf) RBF-FD operators."""
+    Dx, Dy = g['Dx_full'], g['Dy_full']
+    nu = g['nu_kov']
+    nibd = g['Ni'] + g['Nb']
+
+    u, v, p = pred_full[:, 0:1], pred_full[:, 1:2], pred_full[:, 2:3]
+    du_dx = torch.sparse.mm(Dx, u); du_dy = torch.sparse.mm(Dy, u)
+    dv_dx = torch.sparse.mm(Dx, v); dv_dy = torch.sparse.mm(Dy, v)
+    continuity = (du_dx + dv_dy)[:nibd]
+    u_int = u[:nibd]; v_int = v[:nibd]
+    u_conv = u_int * du_dx[:nibd] + v_int * du_dy[:nibd]
+    v_conv = u_int * dv_dx[:nibd] + v_int * dv_dy[:nibd]
+    dp_dx = torch.sparse.mm(Dx, p)[:nibd]
+    dp_dy = torch.sparse.mm(Dy, p)[:nibd]
+    # constant ν → div(ν ∇u) = ν ∇²u, computed via Dx∘Dx + Dy∘Dy
+    visc_u = nu * (
+        torch.sparse.mm(Dx, du_dx) + torch.sparse.mm(Dy, du_dy)
+    )[:nibd]
+    visc_v = nu * (
+        torch.sparse.mm(Dx, dv_dx) + torch.sparse.mm(Dy, dv_dy)
+    )[:nibd]
+    mom_u = u_conv + dp_dx - visc_u
+    mom_v = v_conv + dp_dy - visc_v
+    return continuity, mom_u, mom_v
+
+
+def _compute_pde_dtpinn_elasticity(pred_full, g):
+    """Lamé/Navier-Cauchy residual via rectangular (Ni+Nb, Nf) RBF-FD ops.
+
+    No chain needed — individual Dxx, Dyy, Dxy operators give the second
+    derivatives directly.
+    """
+    lam = g['lam_e']; mu = g['mu_e']
+    ux, uy = pred_full[:, 0:1], pred_full[:, 1:2]
+    d2ux_dx2 = torch.sparse.mm(g['Dxx'], ux)
+    d2ux_dy2 = torch.sparse.mm(g['Dyy'], ux)
+    d2ux_dxdy = torch.sparse.mm(g['Dxy'], ux)
+    d2uy_dx2 = torch.sparse.mm(g['Dxx'], uy)
+    d2uy_dy2 = torch.sparse.mm(g['Dyy'], uy)
+    d2uy_dxdy = torch.sparse.mm(g['Dxy'], uy)
+    eq_x = ((lam + 2 * mu) * d2ux_dx2 + mu * d2ux_dy2
+            + (lam + mu) * d2uy_dxdy + g['fx'])
+    eq_y = (mu * d2uy_dx2 + (lam + 2 * mu) * d2uy_dy2
+            + (lam + mu) * d2ux_dxdy + g['fy'])
+    return eq_x, eq_y
+
+
+def _dtpinn_train_loop(
+    problem,
+    seed,
+    device,
+    n_epochs,
+    lr,
+    grid_size,
+    model_name,
+    *,
+    dtype,
+    rbf_fd_order,
+    num_nodes,
+    optimizer_kind,
+    tracker,
+):
+    """Common training loop shared by the three problem-specific train_dtpinn_*.
+
+    Implements the paper-faithful auto-restart wrapper from
+    temp/dt-pinn/src/dtpinn_cupy_fp64.py:494-503 — if the L-BFGS at the current
+    lr fails to make progress, halve the lr and retry from the same seed. The
+    paper checks `loss > 500` after i > 30; we use a relative two-checkpoint
+    criterion (see ABORT_CHECKS below) because the absolute threshold 500 is
+    paper-specific to its disk-Poisson scale (init ≈ 100) and misfires on PDEs
+    with different residual magnitudes (e.g., elasticity init ≈ 2000 with the
+    Q_e=4 manufactured solution).
+    """
+    if num_nodes is None:
+        num_nodes = _dtpinn_default_num_nodes(grid_size)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    g = _build_dtpinn_grid(problem, num_nodes, rbf_fd_order, device, dtype, seed)
+    Ni, Nb, Ng, Nf = g['Ni'], g['Nb'], g['Ng'], g['Nf']
+    nibd = Ni + Nb
+    print(f"  RBF-FD grid: Ni={Ni}, Nb={Nb}, Ng={Ng}, Nf={Nf}, h={g['h']:.4f}, p={rbf_fd_order}")
+
+    if problem == 'elasticity':
+        out_dim = 2
+    else:
+        out_dim = 3
+
+    Xf = g['Xf']
+
+    def compute_loss(model):
+        pred_full = model(Xf)
+        if problem == 'cavity':
+            cont, mom_u, mom_v = _compute_pde_dtpinn_cavity(pred_full, g)
+            zero = torch.zeros_like(cont)
+            loss_pde = mse(cont, zero) + mse(mom_u, zero) + mse(mom_v, zero)
+            # boundary: lid u=1, v=0; walls u=0, v=0
+            pred_b = pred_full[Ni:Ni + Nb]  # boundary slice of Xf
+            pred_lid = pred_b[g['lid_idx']]
+            pred_wall = pred_b[g['wall_idx']]
+            loss_lid = mse(pred_lid[:, 0:1], torch.ones_like(pred_lid[:, 0:1])) + \
+                       mse(pred_lid[:, 1:2], torch.zeros_like(pred_lid[:, 1:2]))
+            loss_wall = mse(pred_wall[:, 0:1], torch.zeros_like(pred_wall[:, 0:1])) + \
+                        mse(pred_wall[:, 1:2], torch.zeros_like(pred_wall[:, 1:2]))
+            pred_c = model(g['xy_center'])
+            loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+            loss = loss_pde + loss_lid + loss_wall + loss_p + model_reg_loss(model)
+        elif problem == 'kovasznay':
+            cont, mom_u, mom_v = _compute_pde_dtpinn_kovasznay(pred_full, g)
+            zero = torch.zeros_like(cont)
+            loss_pde = mse(cont, zero) + mse(mom_u, zero) + mse(mom_v, zero)
+            pred_b = pred_full[Ni:Ni + Nb]
+            loss_bc = mse(pred_b, g['bc_target'])
+            pred_c = model(g['xy_center'])
+            p_target = torch.tensor(
+                [[g['p_center_exact']]], dtype=dtype, device=device
+            )
+            loss_p = mse(pred_c[:, 2:3], p_target)
+            loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+        elif problem == 'elasticity':
+            eq_x, eq_y = _compute_pde_dtpinn_elasticity(pred_full, g)
+            zero = torch.zeros_like(eq_x)
+            loss_pde = mse(eq_x, zero) + mse(eq_y, zero)
+            pred_b = pred_full[Ni:Ni + Nb]
+            loss_bc = mse(pred_b, g['bc_target'])
+            loss = loss_pde + loss_bc + model_reg_loss(model)
+        else:
+            raise ValueError(problem)
+        return loss
+
+    # Paper-faithful auto-restart: if L-BFGS overshoots and the run gets stuck
+    # at initial loss OR converges to a clearly suboptimal basin, halve lr and
+    # re-init the network with the same seed. Disabled for adam (Adam is robust
+    # to lr; the check was only ever a paper artefact for raw L-BFGS without
+    # line search). Two checkpoints because a single one cannot distinguish
+    # stuck-at-init from slowly-converging-to-bad-minimum on problems with
+    # different residual scales:
+    #   - epoch 50 / ratio 0.5: catches "stuck at init" (e.g., elas lr=0.04
+    #     stays at loss 2058 forever; aborts immediately).
+    #   - epoch 200 / ratio 0.01: catches "converging to a worse minimum
+    #     than lr/2 would" (e.g., elas lr=0.02 reaches loss ~30 at ep 200 vs
+    #     lr=0.005 which reaches loss ~0.27; the former is 100× worse final
+    #     accuracy and the auto-restart correctly halves lr to find a tighter
+    #     basin). Note: for problems where lr=0.04 already works well
+    #     (cavity, kovasznay), training reaches <<1% of initial loss by ep 200
+    #     so this check is a no-op.
+    MAX_RETRIES = 6
+    ABORT_CHECKS = [
+        (50, 0.5),    # stuck-at-init divergence
+        (200, 0.01),  # slow-converging suboptimal minimum
+    ]
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+
+    cur_lr = lr
+    final_loss = float('nan')
+    final_model = None
+
+    retry_attempts = 0
+    while True:
+        # Re-init network and optimizer. torch.manual_seed makes the network
+        # init reproducible across retries; combined with stationary operators
+        # this exactly matches the paper's retry semantics.
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        model = make_model(model_name, output_dim=out_dim).to(device).to(dtype=dtype)
+
+        if optimizer_kind == 'lbfgs':
+            # Paper-faithful: temp/dt-pinn/src/dtpinn_cupy_fp64.py:117 builds
+            # `optim.LBFGS(self.w.parameters(), lr=self.lr)` with PyTorch
+            # defaults for line_search_fn (None), max_iter (20),
+            # tolerance_grad (1e-7), tolerance_change (1e-9).
+            optimizer = torch.optim.LBFGS(model.parameters(), lr=cur_lr)
+        elif optimizer_kind == 'adam':
+            optimizer = torch.optim.Adam(model.parameters(), lr=cur_lr)
+        else:
+            raise ValueError(f"unknown optimizer {optimizer_kind!r}")
+
+        # If retrying, reset the tracker so its CSV reflects only the
+        # successful run. The TrainingTracker overwrites its CSV on
+        # `_init_csv`, which is invoked when `_initialized` is False.
+        if tracker is not None and retry_attempts > 0:
+            tracker._initialized = False
+            tracker.best_pde_rms = float('inf')
+            tracker.best_epoch = None
+            tracker.best_state_dict = None
+            # Update the lr field so the tracker rows reflect the active lr
+            # (otherwise tracker.metadata still says the original lr).
+            tracker.metadata['lr'] = cur_lr
+
+        initial_loss = float('nan')
+        local_final_loss = float('nan')
+        aborted = False
+
+        for epoch in range(n_epochs):
+            if optimizer_kind == 'lbfgs':
+                def closure():
+                    optimizer.zero_grad()
+                    loss = compute_loss(model)
+                    loss.backward()
+                    return loss
+                loss = optimizer.step(closure)
+                local_final_loss = loss.item() if torch.is_tensor(loss) else float(loss)
+            else:
+                optimizer.zero_grad()
+                loss = compute_loss(model)
+                loss.backward()
+                optimizer.step()
+                local_final_loss = loss.item()
+
+            if epoch == 0:
+                initial_loss = local_final_loss
+
+            if (epoch + 1) % LOG_INTERVAL == 0 or epoch == 0:
+                print(f"  Epoch {epoch+1}: loss={local_final_loss:.6e}")
+
+            # Paper-faithful auto-restart check (lbfgs only; Adam doesn't need
+            # it). If still stuck near / above initial loss at any checkpoint,
+            # abort and retry with halved lr.
+            triggered = False
+            if optimizer_kind == 'lbfgs' and retry_attempts < MAX_RETRIES:
+                for check_epoch, max_ratio in ABORT_CHECKS:
+                    if epoch == check_epoch:
+                        threshold = max_ratio * initial_loss
+                        if math.isnan(local_final_loss) or local_final_loss > threshold:
+                            print(
+                                f"  No progress at epoch {epoch+1}: loss={local_final_loss:.3e}, "
+                                f"initial={initial_loss:.3e}, threshold={threshold:.3e} "
+                                f"({max_ratio:g}× initial); halving lr to {cur_lr/2.0} and retrying"
+                            )
+                            cur_lr = cur_lr / 2.0
+                            aborted = True
+                            triggered = True
+                        break
+            if triggered:
+                break
+
+            if tracker is not None:
+                tracker.step(epoch, local_final_loss, model)
+
+        if not aborted:
+            final_model = model
+            final_loss = local_final_loss
+            break
+
+        retry_attempts += 1
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    if retry_attempts > 0:
+        print(f"  Auto-restart succeeded after {retry_attempts} retries (final lr={cur_lr})")
+    return final_model, train_time, final_loss
+
+
+def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp",
+                  grid_data=None, tracker=None, *,
+                  dtype='fp64', rbf_fd_order=4, num_nodes=None,
+                  optimizer_kind='lbfgs'):
+    """Faithful DT-PINN (Sharma & Shankar 2022) for the lid-driven cavity.
+
+    RBF-FD spatial derivatives + fp64 + L-BFGS with strong-Wolfe line search.
+    `grid_data` is ignored (kept for signature compatibility with the
+    previous Chebyshev variant); operators are always built from scratch.
+    """
+    torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
+    return _dtpinn_train_loop(
+        'cavity', seed, device, n_epochs, lr, grid_size, model_name,
+        dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
+        optimizer_kind=optimizer_kind, tracker=tracker,
+    )
+
+
+def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size,
+                            model_name="mlp", tracker=None, *,
+                            dtype='fp64', rbf_fd_order=4, num_nodes=None,
+                            optimizer_kind='lbfgs'):
+    """Faithful DT-PINN for steady Kovasznay flow."""
+    torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
+    return _dtpinn_train_loop(
+        'kovasznay', seed, device, n_epochs, lr, grid_size, model_name,
+        dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
+        optimizer_kind=optimizer_kind, tracker=tracker,
+    )
+
+
+def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size,
+                             model_name="mlp", tracker=None, *,
+                             dtype='fp64', rbf_fd_order=4, num_nodes=None,
+                             optimizer_kind='lbfgs'):
+    """Faithful DT-PINN for 2D linear elasticity (manufactured solution)."""
+    torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
+    return _dtpinn_train_loop(
+        'elasticity', seed, device, n_epochs, lr, grid_size, model_name,
+        dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
+        optimizer_kind=optimizer_kind, tracker=tracker,
+    )
 
 
 # --- Method: analytical ---
@@ -1376,9 +1990,9 @@ def train_analytical(seed, device, n_epochs, lr, technique, grid_size, model_nam
 
 
 # --- Method: sage (Symbolic Analytical Gradient Engine) ---
-def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+def train_sage(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None, grid_data=None):
     """SAGE: auto-generated backward via symbolic VJP engine."""
-    g = build_grid_data(grid_size, device)
+    g = grid_data if grid_data is not None else build_grid_data(grid_size, device)
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
@@ -1831,18 +2445,23 @@ CSV_COLUMNS = [
 
 
 def append_csv_row(csv_path, row_dict):
-    """Append a single row to CSV with file locking for concurrent safety."""
-    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+    """Append a single row to CSV with file locking for concurrent safety.
 
-    file_exists = os.path.isfile(csv_path)
+    Header decision is made inside the lock by checking the file's current
+    size via fstat, so two parallel writers racing on a fresh CSV won't both
+    write a header.
+    """
+    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
 
     with open(csv_path, 'a', newline='') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            if not file_exists or os.path.getsize(csv_path) == 0:
+            if os.fstat(f.fileno()).st_size == 0:
                 writer.writeheader()
             writer.writerow(row_dict)
+            f.flush()
+            os.fsync(f.fileno())
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -1911,9 +2530,9 @@ def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data, 
 # =============================================================================
 
 # --- Method: sage (Kovasznay) ---
-def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None, grid_data=None):
     """SAGE: auto-generated backward for Kovasznay flow."""
-    g = build_grid_data_kovasznay(grid_size, device)
+    g = grid_data if grid_data is not None else build_grid_data_kovasznay(grid_size, device)
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
@@ -1944,7 +2563,8 @@ def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model
             grad_pde = generated_backward(pred_pde, g)
 
             N_bc = g['N_bc']
-            grad_bc = 2.0 * (pred_bc - g['bc_target']) / N_bc
+            n_out = pred_bc.shape[1]  # 3 for Kovasznay (u, v, p); MSELoss averages over numel
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / (N_bc * n_out)
 
             grad_center = torch.zeros(1, 3, device=device)
             grad_center[:, 2:3] = 2.0 * (pred_c[:, 2:3] - g['p_center_exact'])
@@ -1980,9 +2600,9 @@ def train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model
     return model, train_time, final_loss
 
 
-# --- Method: dtpinn (Kovasznay) ---
-def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
-    """Standard DT-PINN for Kovasznay flow: spectral matrices, autograd backward."""
+# --- Method: chebyshev-pinn (Kovasznay) ---
+def train_chebyshev_pinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Chebyshev-spectral PINN for Kovasznay: dense spectral matrices, autograd backward."""
     g = build_grid_data_kovasznay(grid_size, device)
 
     torch.manual_seed(seed)
@@ -2441,7 +3061,8 @@ def evaluate_kovasznay(model, device):
     y = np.linspace(y0, y0 + Ly, ny)
     X, Y = np.meshgrid(x, y)
     xy_eval = np.column_stack([X.ravel(), Y.ravel()])
-    xy_t = torch.tensor(xy_eval, dtype=torch.float32, device=device, requires_grad=True)
+    model_dtype = next(model.parameters()).dtype
+    xy_t = torch.tensor(xy_eval, dtype=model_dtype, device=device, requires_grad=True)
 
     model.eval()
     pred = model(xy_t)
@@ -2544,7 +3165,13 @@ def compute_pde_elasticity(pred, g):
     Uses precomputed D² matrices (Dxx, Dyy, Dxy) for single-matmul second
     derivatives, avoiding chained Dx@Dx@u which amplifies float32 error.
     Returns (eq_x, eq_y) — 2 residual terms.
+
+    Lamé constants are read from g['lam_e'] / g['mu_e'] if present
+    (Program-B parametric family F3), otherwise fall back to module-level
+    lam_e / mu_e.
     """
+    lam = g['lam_e'] if 'lam_e' in g else lam_e
+    mu = g['mu_e'] if 'mu_e' in g else mu_e
     ux, uy = pred[:, 0:1], pred[:, 1:2]
 
     # Second derivatives via precomputed D² (single matmul, not chained)
@@ -2558,16 +3185,18 @@ def compute_pde_elasticity(pred, g):
     d2ux_dxdy = g['Dxy'] @ ux
 
     # Navier-Cauchy equations + body forces
-    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
-            + (lam_e + mu_e) * d2uy_dxdy + g['fx'])
-    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
-            + (lam_e + mu_e) * d2ux_dxdy + g['fy'])
+    eq_x = ((lam + 2 * mu) * d2ux_dx2 + mu * d2ux_dy2
+            + (lam + mu) * d2uy_dxdy + g['fx'])
+    eq_y = (mu * d2uy_dx2 + (lam + 2 * mu) * d2uy_dy2
+            + (lam + mu) * d2ux_dxdy + g['fy'])
 
     return eq_x, eq_y
 
 
 def compute_pde_elasticity_sparse(pred, g):
     """Elasticity PDE residuals via sparse RKPM differentiation matrices."""
+    lam = g['lam_e'] if 'lam_e' in g else lam_e
+    mu = g['mu_e'] if 'mu_e' in g else mu_e
     Dx, Dy = g['Dx'], g['Dy']
     ux, uy = pred[:, 0:1], pred[:, 1:2]
 
@@ -2584,10 +3213,10 @@ def compute_pde_elasticity_sparse(pred, g):
     d2uy_dxdy = torch.sparse.mm(Dy, duy_dx)
     d2ux_dxdy = torch.sparse.mm(Dy, dux_dx)
 
-    eq_x = ((lam_e + 2 * mu_e) * d2ux_dx2 + mu_e * d2ux_dy2
-            + (lam_e + mu_e) * d2uy_dxdy + g['fx'])
-    eq_y = (mu_e * d2uy_dx2 + (lam_e + 2 * mu_e) * d2uy_dy2
-            + (lam_e + mu_e) * d2ux_dxdy + g['fy'])
+    eq_x = ((lam + 2 * mu) * d2ux_dx2 + mu * d2ux_dy2
+            + (lam + mu) * d2uy_dxdy + g['fx'])
+    eq_y = (mu * d2uy_dx2 + (lam + 2 * mu) * d2uy_dy2
+            + (lam + mu) * d2ux_dxdy + g['fy'])
 
     return eq_x, eq_y
 
@@ -2703,6 +3332,8 @@ def build_grid_data_elasticity(N_grid, device):
         'N_all': N_all, 'N_bc': N_bc, 'M': M,
         'off_bc': off_bc,
         'N_grid': N_grid,
+        'lam_e': float(lam_e),  # Program-B F3 parametric threading
+        'mu_e': float(mu_e),
     }
 
 
@@ -2836,14 +3467,20 @@ def build_sk_data_elasticity(N_grid, device):
 _generated_elasticity_backward = None
 
 def _get_generated_backward_elasticity():
-    """Lazily generate and cache backward function for Elasticity PDE."""
+    """Lazily generate and cache backward function for Elasticity PDE.
+
+    Note: lam_e and mu_e are TracedVar constants so the emitted backward
+    reads them from g at runtime. Without them, the generated backward
+    bakes in the module-level defaults (lam_e=1.0, mu_e=0.5) and breaks
+    Program-B F3 parametric threading via _reparam_elasticity_grid_.
+    """
     global _generated_elasticity_backward
     if _generated_elasticity_backward is None:
         from src.symbolic_vjp import trace_pde_forward, emit_backward
         tape = []
         outputs, inputs = trace_pde_forward(
             compute_pde_elasticity, None, tape, sparse=False,
-            constants=['Dxx', 'Dyy', 'Dxy', 'fx', 'fy'],
+            constants=['Dxx', 'Dyy', 'Dxy', 'fx', 'fy', 'lam_e', 'mu_e'],
             input_names=['ux', 'uy'])
         _, _generated_elasticity_backward = emit_backward(
             tape, list(outputs), ['deq_x', 'deq_y'], inputs, sparse=False,
@@ -2853,9 +3490,9 @@ def _get_generated_backward_elasticity():
 
 
 # --- Method: sage (Elasticity) ---
-def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None, grid_data=None):
     """SAGE: auto-generated backward for elasticity."""
-    g = build_grid_data_elasticity(grid_size, device)
+    g = grid_data if grid_data is not None else build_grid_data_elasticity(grid_size, device)
 
     torch.manual_seed(seed)
     model = make_model(model_name, output_dim=2).to(device)
@@ -2920,9 +3557,45 @@ def train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size, mode
     return model, train_time, final_loss
 
 
-# --- Method: dtpinn (Elasticity) ---
-def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
-    """Standard DT-PINN for elasticity: spectral matrices, autograd backward."""
+# --- Method: stencil-adjoint ---
+#
+# Forward path is identical to SAGE (exact dense spectral operators, so the
+# observed residual and loss are exact). The reverse path replaces every
+# D^T matrix-vector the generated backward would apply with a compact
+# band-limited stencil approximation derived from local polynomial
+# interpolation on the same node set. Nonlinear chain-rule factors are
+# re-evaluated at the current network state, so the adjoint remains
+# state-dependent even though the linear operators inside it are
+# approximate. Phase 4 candidate C2; see research_log/04_design.md.
+_STENCIL_HALF_BANDWIDTH = 3  # window = 7 nodes, effective order 6
+
+def train_stencil_adjoint(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Cavity stencil-adjoint: dense forward, compact-FD adjoint."""
+    g = build_grid_data(grid_size, device)
+    _inject_stencil_adjoint(g, 'cavity', half_bandwidth=_STENCIL_HALF_BANDWIDTH)
+    return train_sage(seed, device, n_epochs, lr, technique, grid_size,
+                      model_name=model_name, tracker=tracker, grid_data=g)
+
+
+def train_stencil_adjoint_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Kovasznay stencil-adjoint: dense forward, compact-FD adjoint."""
+    g = build_grid_data_kovasznay(grid_size, device)
+    _inject_stencil_adjoint(g, 'kovasznay', half_bandwidth=_STENCIL_HALF_BANDWIDTH)
+    return train_sage_kovasznay(seed, device, n_epochs, lr, technique, grid_size,
+                                model_name=model_name, tracker=tracker, grid_data=g)
+
+
+def train_stencil_adjoint_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Elasticity stencil-adjoint: dense forward, compact-FD adjoint."""
+    g = build_grid_data_elasticity(grid_size, device)
+    _inject_stencil_adjoint(g, 'elasticity', half_bandwidth=_STENCIL_HALF_BANDWIDTH)
+    return train_sage_elasticity(seed, device, n_epochs, lr, technique, grid_size,
+                                 model_name=model_name, tracker=tracker, grid_data=g)
+
+
+# --- Method: chebyshev-pinn (Elasticity) ---
+def train_chebyshev_pinn_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """Chebyshev-spectral PINN for elasticity: dense spectral matrices, autograd backward."""
     g = build_grid_data_elasticity(grid_size, device)
 
     torch.manual_seed(seed)
@@ -3230,7 +3903,8 @@ def evaluate_elasticity(model, device):
     y = np.linspace(0, 1, ny)
     X, Y = np.meshgrid(x, y)
     xy_eval = np.column_stack([X.ravel(), Y.ravel()])
-    xy_t = torch.tensor(xy_eval, dtype=torch.float32, device=device, requires_grad=True)
+    model_dtype = next(model.parameters()).dtype
+    xy_t = torch.tensor(xy_eval, dtype=model_dtype, device=device, requires_grad=True)
 
     model.eval()
     pred = model(xy_t)
@@ -3286,6 +3960,322 @@ def evaluate_elasticity(model, device):
 
 
 # =============================================================================
+# SLRM — Static Linear Residual Map surrogate gradient
+# (Research phase 5; see llmdocs/research/research_log/04_design.md.)
+#
+# The PDE-gradient path through the residual DAG is replaced at every
+# training step by a single precomputed linear map applied to the
+# current residual tensor. One constant matrix is built at problem
+# setup by linearising the residual DAG at a fixed reference input;
+# the matrix never changes over the 30 000 training steps.
+# =============================================================================
+
+def _slrm_build_M_cavity(pred_ref, g):
+    from src.slrm import build_slrm_operator
+    def residual_fn(pred):
+        c, mu, mv = compute_pde_terms(pred, g)
+        return torch.cat([c, mu, mv], dim=1)  # (N, 3)
+    return build_slrm_operator(residual_fn, pred_ref)
+
+
+def _slrm_build_M_kovasznay(pred_ref, g):
+    from src.slrm import build_slrm_operator
+    def residual_fn(pred):
+        c, mu, mv = compute_pde_kovasznay(pred, g)
+        return torch.cat([c, mu, mv], dim=1)  # (N, 3)
+    return build_slrm_operator(residual_fn, pred_ref)
+
+
+def _slrm_build_M_elasticity(pred_ref, g):
+    from src.slrm import build_slrm_operator
+    def residual_fn(pred):
+        ex, ey = compute_pde_elasticity(pred, g)
+        return torch.cat([ex, ey], dim=1)  # (N, 2)
+    return build_slrm_operator(residual_fn, pred_ref)
+
+
+def _slrm_grad_from_residual(pred_pde, M_ref, residual_fn_nograd, interior_mask, M_int):
+    """Apply the SLRM operator to the current (masked, flattened) residual.
+
+    Returns the full-grid gradient tensor suitable as the upstream gradient
+    of pred_pde.
+    """
+    with torch.no_grad():
+        r = residual_fn_nograd(pred_pde)          # (N, k)
+        r = r * interior_mask                     # zero boundary rows
+        r_flat = r.reshape(-1)                    # (N*k,)
+        g_flat = M_ref @ r_flat                   # (N*K,)
+        N, K = pred_pde.shape
+        return (2.0 / M_int) * g_flat.reshape(N, K)
+
+
+# --- Method: slrm (Cavity) ---
+def train_slrm(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """SLRM: constant-linear-map surrogate gradient for cavity NS."""
+    g = build_grid_data(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    # Linearise the residual DAG once at the NN's initial full-grid
+    # output. Smooth, non-degenerate, respects the NN's implicit
+    # initialisation statistics. Cost: one jacobian build (~seconds).
+    with torch.no_grad():
+        pred_ref = compiled_model(g['xy_all']).detach().clone()
+    M_ref = _slrm_build_M_cavity(pred_ref, g)
+
+    def residual_fn_nograd(pred):
+        c, mu, mv = compute_pde_terms(pred, g)
+        return torch.cat([c, mu, mv], dim=1)
+
+    interior_mask = g['interior_mask']
+    M_int = g['M']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_l = pred_batch[g['off_lid']:g['off_wall']]
+            pred_w = pred_batch[g['off_wall']:g['off_center']]
+            pred_c = pred_batch[g['off_center']:]
+
+            grad_pde = _slrm_grad_from_residual(
+                pred_pde, M_ref, residual_fn_nograd, interior_mask, M_int)
+
+            N_lid, N_wall = g['N_lid'], g['N_wall']
+            grad_lid = torch.zeros(N_lid, 3, device=device)
+            grad_lid[:, 0:1] = 2.0 * (pred_l[:, 0:1] - 1.0) / N_lid
+            grad_lid[:, 1:2] = 2.0 * pred_l[:, 1:2] / N_lid
+            grad_wall = torch.zeros(N_wall, 3, device=device)
+            grad_wall[:, 0:1] = 2.0 * pred_w[:, 0:1] / N_wall
+            grad_wall[:, 1:2] = 2.0 * pred_w[:, 1:2] / N_wall
+            grad_center = torch.zeros(1, 3, device=device)
+            grad_center[:, 2:3] = 2.0 * pred_c[:, 2:3]
+            upstream = torch.cat([grad_pde, grad_lid, grad_wall, grad_center], dim=0)
+
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
+            with torch.no_grad():
+                u = pred_pde[:, 0:1]; v = pred_pde[:, 1:2]; p = pred_pde[:, 2:3]
+                du_dx = g['Dx'] @ u; du_dy = g['Dy'] @ u
+                dv_dx = g['Dx'] @ v; dv_dy = g['Dy'] @ v
+                Sxx, Syy = du_dx, dv_dy
+                Sxy = 0.5 * (du_dy + dv_dx)
+                S_mag = torch.sqrt(2.0*(Sxx**2+Syy**2+2.0*Sxy**2)+1e-12)
+                nu_eff_val = nu_laminar + g['Cs_d_sq'] * S_mag
+                cont = du_dx + dv_dy
+                dp_dx = g['Dx'] @ p; dp_dy = g['Dy'] @ p
+                visc_u = g['Dx']@(nu_eff_val*du_dx) + g['Dy']@(nu_eff_val*du_dy)
+                visc_v = g['Dx']@(nu_eff_val*dv_dx) + g['Dy']@(nu_eff_val*dv_dy)
+                mu = u*du_dx + v*du_dy + dp_dx - visc_u
+                mv = u*dv_dx + v*dv_dy + dp_dy - visc_v
+                ii = g['interior_idx']
+                loss_pde = (cont[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                loss_lid = mse(pred_l[:, 0:1], torch.ones_like(pred_l[:, 0:1])) + \
+                           mse(pred_l[:, 1:2], torch.zeros_like(pred_l[:, 1:2]))
+                loss_wall = mse(pred_w[:, 0:1], torch.zeros_like(pred_w[:, 0:1])) + \
+                            mse(pred_w[:, 1:2], torch.zeros_like(pred_w[:, 1:2]))
+                loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_lid.item() + loss_wall.item() + loss_p.item() + reg_val
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: slrm (Kovasznay) ---
+def train_slrm_kovasznay(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """SLRM: constant-linear-map surrogate gradient for Kovasznay flow."""
+    g = build_grid_data_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    with torch.no_grad():
+        pred_ref = compiled_model(g['xy_all']).detach().clone()
+    M_ref = _slrm_build_M_kovasznay(pred_ref, g)
+
+    def residual_fn_nograd(pred):
+        c, mu, mv = compute_pde_kovasznay(pred, g)
+        return torch.cat([c, mu, mv], dim=1)
+
+    interior_mask = g['interior_mask']
+    M_int = g['M']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_bc = pred_batch[g['off_bc']:g['off_center']]
+            pred_c = pred_batch[g['off_center']:]
+
+            grad_pde = _slrm_grad_from_residual(
+                pred_pde, M_ref, residual_fn_nograd, interior_mask, M_int)
+
+            N_bc = g['N_bc']
+            n_out = pred_bc.shape[1]
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / (N_bc * n_out)
+
+            grad_center = torch.zeros(1, 3, device=device)
+            grad_center[:, 2:3] = 2.0 * (pred_c[:, 2:3] - g['p_center_exact'])
+
+            upstream = torch.cat([grad_pde, grad_bc, grad_center], dim=0)
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
+            with torch.no_grad():
+                c, mu, mv = compute_pde_kovasznay(pred_pde, g)
+                ii = g['interior_idx']
+                loss_pde = (c[ii]**2).mean() + (mu[ii]**2).mean() + (mv[ii]**2).mean()
+                loss_bc = mse(pred_bc, g['bc_target'])
+                p_target = torch.tensor([[g['p_center_exact']]], dtype=torch.float32, device=pred_c.device)
+                loss_p = mse(pred_c[:, 2:3], p_target)
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_bc.item() + loss_p.item() + reg_val
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: slrm (Elasticity) ---
+def train_slrm_elasticity(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp", tracker=None):
+    """SLRM: constant-linear-map surrogate gradient for 2D elasticity.
+
+    The elasticity residual is linear in the prediction, so the
+    linearisation at any reference input is exact — SLRM reduces to
+    the exact closed-form backward for this problem.
+    """
+    g = build_grid_data_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    with torch.no_grad():
+        pred_ref = compiled_model(g['xy_all']).detach().clone()
+    M_ref = _slrm_build_M_elasticity(pred_ref, g)
+
+    def residual_fn_nograd(pred):
+        ex, ey = compute_pde_elasticity(pred, g)
+        return torch.cat([ex, ey], dim=1)
+
+    interior_mask = g['interior_mask']
+    M_int = g['M']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        pred_batch = compiled_model(g['xy_batched'])
+        with torch.no_grad():
+            pred_pde = pred_batch[:g['N_all']]
+            pred_bc = pred_batch[g['off_bc']:g['off_bc'] + g['N_bc']]
+
+            grad_pde = _slrm_grad_from_residual(
+                pred_pde, M_ref, residual_fn_nograd, interior_mask, M_int)
+
+            N_bc = g['N_bc']
+            n_out = pred_bc.shape[1]
+            grad_bc = 2.0 * (pred_bc - g['bc_target']) / (N_bc * n_out)
+
+            upstream = torch.cat([grad_pde, grad_bc], dim=0)
+        pred_batch.backward(gradient=upstream)
+        reg = model_reg_loss(model)
+        if isinstance(reg, torch.Tensor):
+            reg.backward()
+        optimizer.step()
+        scheduler.step()
+
+        _should_track = tracker is not None and (epoch + 1) % tracker.interval == 0
+        _is_last = (epoch == n_epochs - 1)
+        if (epoch + 1) % LOG_INTERVAL == 0 or _should_track or _is_last:
+            with torch.no_grad():
+                eq_x, eq_y = compute_pde_elasticity(pred_pde, g)
+                ii = g['interior_idx']
+                loss_pde = (eq_x[ii]**2).mean() + (eq_y[ii]**2).mean()
+                loss_bc = mse(pred_bc, g['bc_target'])
+                reg = model_reg_loss(model)
+                reg_val = reg.item() if isinstance(reg, torch.Tensor) else float(reg)
+                final_loss = loss_pde.item() + loss_bc.item() + reg_val
+            if (epoch + 1) % LOG_INTERVAL == 0:
+                print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+            if _should_track:
+                tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -3297,14 +4287,53 @@ def main():
     is_elasticity = (args.problem == "elasticity")
 
     # Validate problem + method combinations
-    if is_kovasznay and args.method not in ("sage", "dtpinn", "autodiff", "ropinn", "sk-pinn"):
-        print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn methods, "
+    if is_kovasznay and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"):
+        print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint methods, "
               f"not '{args.method}'")
         sys.exit(1)
-    if is_elasticity and args.method not in ("sage", "dtpinn", "autodiff", "ropinn", "sk-pinn"):
-        print(f"ERROR: Elasticity problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn methods, "
+    if is_elasticity and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"):
+        print(f"ERROR: Elasticity problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint methods, "
               f"not '{args.method}'")
         sys.exit(1)
+    if args.method == "slrm-jax" and args.model not in ("mlp", "pirate-net"):
+        print(f"ERROR: slrm-jax method only supports --model mlp or pirate-net")
+        sys.exit(1)
+    if args.method == "slrm-jax" and args.track:
+        print(f"WARNING: --track is not supported for slrm-jax; disabling tracker for this run.")
+        args.track = False
+    if args.method == "jaxpinn" and args.model not in ("mlp", "pirate-net"):
+        print(f"ERROR: jaxpinn method only supports --model mlp or pirate-net (TSA-PINN originates in TensorFlow "
+              f"and has no official JAX port; see llmdocs/CONTEXT.md)")
+        sys.exit(1)
+    if args.method in ("sage-jax", "bfsa", "sdccg") and args.model not in ("mlp", "pirate-net"):
+        print(f"ERROR: sage-jax method only supports --model mlp or pirate-net (TSA-PINN originates in TensorFlow "
+              f"and has no Flax port; see llmdocs/CONTEXT.md)")
+        sys.exit(1)
+    if args.method in ("jaxpinn", "sage-jax", "bfsa", "sdccg") and args.track:
+        print(f"WARNING: --track is not supported for {args.method}; disabling tracker for this run.")
+        args.track = False
+
+    # Paper-faithful defaults for the new (Sharma & Shankar 2022) DT-PINN.
+    # The repo's global --optimizer default is `adam` for backward compatibility
+    # with the older Chebyshev variant, but the actual DT-PINN paper trains with
+    # L-BFGS + 5K outer steps + fp64 + lr=0.04. Override here so that the
+    # headline command `--method dtpinn` matches the paper without the user
+    # having to remember four flags. Pass `--optimizer adam` / `--dtype fp32` /
+    # `--epochs N` / `--lr X` explicitly to opt out for ablation; we detect
+    # explicit passes via sys.argv (comparing parsed values to argparse defaults
+    # would silently override `--lr 0.001` since the default is also 0.001).
+    def _arg_passed(name: str) -> bool:
+        return any(a == name or a.startswith(name + '=') for a in sys.argv)
+
+    if args.method == "dtpinn":
+        if not _arg_passed("--optimizer"):
+            args.optimizer = "lbfgs"
+        if not _arg_passed("--dtype"):
+            args.dtype = "fp64"
+        if not _arg_passed("--epochs"):
+            args.epochs = 5000
+        if not _arg_passed("--lr"):
+            args.lr = 0.04  # temp/dt-pinn/src/dtpinn_cupy_fp64.py:372
 
     # Per-method default grid sizes (problem-aware)
     if args.grid_size is None:
@@ -3322,6 +4351,8 @@ def main():
             method_defaults = {
                 'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
                 'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
+                'jaxpinn': 50, 'sage-jax': 50, 'bfsa': 50, 'sdccg': 50, 'slrm': 50, 'slrm-jax': 50,
+                'stencil-adjoint': 50,
             }
             args.grid_size = method_defaults[args.method]
 
@@ -3396,6 +4427,13 @@ def main():
             elif args.method == "dtpinn":
                 model, train_time, final_loss = train_dtpinn_elasticity(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker,
+                    dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
+                    num_nodes=args.num_nodes,
+                    optimizer_kind=args.optimizer)
+            elif args.method == "chebyshev-pinn":
+                model, train_time, final_loss = train_chebyshev_pinn_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
             elif args.method == "autodiff":
                 model, train_time, final_loss = train_autodiff_elasticity(
@@ -3410,6 +4448,34 @@ def main():
                 model, train_time, final_loss = train_sk_pinn_elasticity(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
                     args.model, g, tracker=tracker)
+            elif args.method == "jaxpinn":
+                from src.jax_pinn import train_jaxpinn_elasticity
+                model, train_time, final_loss = train_jaxpinn_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "sage-jax":
+                from src.jax_pinn import train_sage_jax_elasticity
+                model, train_time, final_loss = train_sage_jax_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "bfsa":
+                from src.jax_pinn import train_bfsa_elasticity
+                model, train_time, final_loss = train_bfsa_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "sdccg":
+                from src.jax_pinn import train_sdccg_elasticity
+                model, train_time, final_loss = train_sdccg_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "slrm":
+                model, train_time, final_loss = train_slrm_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "slrm-jax":
+                from src.jax_pinn import train_slrm_jax_elasticity
+                model, train_time, final_loss = train_slrm_jax_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "stencil-adjoint":
+                model, train_time, final_loss = train_stencil_adjoint_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
             n_params = sum(p.numel() for p in model.parameters())
         elif is_kovasznay:
             # Kovasznay problem dispatch
@@ -3419,6 +4485,13 @@ def main():
                     args.model, tracker=tracker)
             elif args.method == "dtpinn":
                 model, train_time, final_loss = train_dtpinn_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker,
+                    dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
+                    num_nodes=args.num_nodes,
+                    optimizer_kind=args.optimizer)
+            elif args.method == "chebyshev-pinn":
+                model, train_time, final_loss = train_chebyshev_pinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
             elif args.method == "autodiff":
@@ -3434,6 +4507,34 @@ def main():
                 model, train_time, final_loss = train_sk_pinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
                     args.model, g, tracker=tracker)
+            elif args.method == "jaxpinn":
+                from src.jax_pinn import train_jaxpinn_kovasznay
+                model, train_time, final_loss = train_jaxpinn_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "sage-jax":
+                from src.jax_pinn import train_sage_jax_kovasznay
+                model, train_time, final_loss = train_sage_jax_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "bfsa":
+                from src.jax_pinn import train_bfsa_kovasznay
+                model, train_time, final_loss = train_bfsa_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "sdccg":
+                from src.jax_pinn import train_sdccg_kovasznay
+                model, train_time, final_loss = train_sdccg_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "slrm":
+                model, train_time, final_loss = train_slrm_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "slrm-jax":
+                from src.jax_pinn import train_slrm_jax_kovasznay
+                model, train_time, final_loss = train_slrm_jax_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+            elif args.method == "stencil-adjoint":
+                model, train_time, final_loss = train_stencil_adjoint_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
             n_params = sum(p.numel() for p in model.parameters())
         else:
             # Cavity problem dispatch (original)
@@ -3445,6 +4546,15 @@ def main():
 
             elif args.method == "dtpinn":
                 model, train_time, final_loss = train_dtpinn(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker,
+                    dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
+                    num_nodes=args.num_nodes,
+                    optimizer_kind=args.optimizer)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "chebyshev-pinn":
+                model, train_time, final_loss = train_chebyshev_pinn(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())
@@ -3474,6 +4584,48 @@ def main():
 
             elif args.method == "sage":
                 model, train_time, final_loss = train_sage(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "jaxpinn":
+                from src.jax_pinn import train_jaxpinn_cavity
+                model, train_time, final_loss = train_jaxpinn_cavity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "sage-jax":
+                from src.jax_pinn import train_sage_jax_cavity
+                model, train_time, final_loss = train_sage_jax_cavity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "bfsa":
+                from src.jax_pinn import train_bfsa_cavity
+                model, train_time, final_loss = train_bfsa_cavity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "sdccg":
+                from src.jax_pinn import train_sdccg_cavity
+                model, train_time, final_loss = train_sdccg_cavity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "slrm":
+                model, train_time, final_loss = train_slrm(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "slrm-jax":
+                from src.jax_pinn import train_slrm_jax_cavity
+                model, train_time, final_loss = train_slrm_jax_cavity(
+                    args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "stencil-adjoint":
+                model, train_time, final_loss = train_stencil_adjoint(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())

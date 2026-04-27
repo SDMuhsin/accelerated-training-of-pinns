@@ -1,0 +1,113 @@
+# conf/partner_v3_config.yaml
+# Faithful reproduction of partner team V3 config
+# Adapted paths for dt-pinn project structure
+
+training:
+  use_sage: false
+  sage_mode: fd
+  sage_stencil: 25
+  sage_chunk: 16384
+  sage_bwd_batch: 4096
+  sage_fd_dx: 1.0e-3
+  pde_batch_size: 512
+  bc_batch_size: 128
+  flow_pde_batch_size: 512
+  flow_bc_batch_size: 128
+  max_steps: 20000
+  k_flow: 5000
+  k_temp: 5000
+  k_joint: 10000
+  lr: 1.0e-4
+  lr_decay_rate: 0.99
+  lr_decay_steps: 2000
+  grad_clip_norm: 1.0
+
+  rec_constraint_freq: 999999999
+  rec_validation_freq: 999999999
+  rec_inference_freq: 999999999
+  rec_monitor_freq: 999999999
+
+  grad_agg_freq: 1
+  save_network_freq: 1000
+  print_stats_freq: 100
+  summary_freq: 200
+
+  grad_clip_max_norm: 1.0
+  monitor_grad_clip: false
+  ntk:
+    use_ntk: false
+
+run_mode: "train"
+stop_criterion:
+  metric: "loss"
+  min_delta: 0.0
+  patience: 1000000
+  mode: "min"
+  freq: 1000
+  strict: false
+amp:
+  enabled: false
+  dtype: "float32"
+network_dir: ./results/partner_v3/checkpoints
+initialization_network_dir: ""
+
+save_filetypes: []
+summary_histograms: false
+
+problem:
+  geom_json_path: ./data/partner_v3/converted.json
+  geom_step_path: ./data/partner_v3/Study_Model_B_1st_4p3T.step
+  T_init: 60.0
+  t_min: 0.0
+  t_max: 10.0
+  infer_t_start: 0.0
+  infer_t_end: 10.0
+  infer_dt: 0.25
+
+physics:
+  V0: 0
+  D: 1.0e-4
+  Q: 0.0
+  rho: 1.0
+  nu: 1.0e-3
+  u: 0.0
+  v: 0.0
+
+bc:
+  inlet_u: 1.0
+  inlet_T: 25.0
+  inlet_v: 0.0
+  inlet_radius_norm: 0.005
+  outlet_radius_norm: 0.005
+
+model:
+  hidden_layers: 21
+  hidden_size: 512
+  activation: silu
+
+flow_model:
+  hidden_layers: 21
+  hidden_size: 512
+  activation: silu
+
+jit: false
+cuda_graphs: false
+cuda_graph_warmup: 20
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: ${training.lr}
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  _params_:
+    compute_gradients: adam_compute_gradients
+    apply_gradients: adam_apply_gradients
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.StepLR
+  step_size: ${training.lr_decay_steps}
+  gamma: ${training.lr_decay_rate}
+
+loss:
+  _target_: physicsnemo.sym.loss.aggregator.Sum

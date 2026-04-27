@@ -86,3 +86,8 @@ paper
 temp/
 CLAUDE.md
 **.zip
+llmdocs**
+output
+outputs
+.claude
+from_partner_team

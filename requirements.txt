@@ -2,3 +2,25 @@ numpy
 scipy
 torch
 matplotlib
+deepxde
+imageio
+Pillow
+h5py
+
+# Partner V3 (PhysicsNeMo Sym) dependencies
+# NOTE: nvidia-physicsnemo and nvidia-physicsnemo-sym are installed
+# as editable from source in temp/physicsnemo and temp/physicsnemo-sym
+hydra-core>=1.2.0
+omegaconf>=2.3.0
+trimesh>=4.0
+shapely>=2.0
+scikit-learn>=1.0
+sympy>=1.12
+symengine>=0.10.0
+
+# JAX stack for SAGE paper stream + V4 JAX-SAGE consortium integration.
+# All three are required by src/jax_pinn.py and src/sage_ns_v4_jax.py.
+jax>=0.6
+jaxlib>=0.6
+flax>=0.10
+optax>=0.2
