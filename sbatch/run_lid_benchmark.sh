@@ -104,22 +104,29 @@ fi
 
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
+# 2026-04-28: All non-CAN-PINN baselines disabled — this submission run
+# exists to gather H100-MIG-2g.20gb numbers for the chebyshev-pinn baseline
+# (CAN-PINN) so the Table III double-dagger A40 footnote can be retired.
+# Re-enable the others by uncommenting; do not delete.
 cavity_methods=(
-    autodiff
-    dtpinn
-    sage
-    ropinn
-    sk-pinn
+    # autodiff
+    # dtpinn
+    # sage
+    # ropinn
+    # sk-pinn
+    chebyshev-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
 # No analytical or pielm for Kovasznay.
+# 2026-04-28: CAN-PINN-only run (see cavity_methods comment above).
 kovasznay_methods=(
-    autodiff
-    dtpinn
-    sage
-    ropinn
-    sk-pinn
+    # autodiff
+    # dtpinn
+    # sage
+    # ropinn
+    # sk-pinn
+    chebyshev-pinn
 )
 
 # Network architectures to benchmark
@@ -169,7 +176,12 @@ DTPINN_OPTIMIZER="lbfgs"
 DTPINN_DTYPE="fp64"
 
 TECHNIQUE="none"
-TAG="${TAG_OVERRIDE:-multiseed_$(date +%Y%m%d)}"
+# 2026-04-28: default tag changed for CAN-PINN-only HPC run.  The previous
+# default (multiseed_$(date +%Y%m%d)) collides with the H100-MIG paper sweep
+# already in results/lid_benchmark_results.csv; canpinn_hpc_<date>
+# distinguishes this run from both that sweep and the A40 cycle-4 baseline
+# (tag: canpinn_cycle4_20260427).  Override with --tag to restore.
+TAG="${TAG_OVERRIDE:-canpinn_hpc_$(date +%Y%m%d)}"
 TRACK_INTERVAL=100
 
 # Helper: emit the four method-specific hyperparameter flags as a single
@@ -258,7 +270,7 @@ echo "========================================================================"
 echo "PINN BENCHMARK: SLURM Job Submission"
 echo "========================================================================"
 echo ""
-echo "Cavity methods:    ${cavity_methods[*]} pielm"
+echo "Cavity methods:    ${cavity_methods[*]}   (pielm disabled 2026-04-28)"
 echo "Kovasznay methods: ${kovasznay_methods[*]}"
 echo "Models:            ${models[*]}"
 echo "Seeds:             ${seeds[*]} (${#seeds[@]} seeds)"
@@ -345,9 +357,12 @@ done
 
 echo ""
 echo "=============================================="
-echo "Section 2: Cavity - PIELM (CPU)"
+echo "Section 2: Cavity - PIELM (CPU)  [DISABLED 2026-04-28: CAN-PINN-only run]"
 echo "=============================================="
 
+# 2026-04-28: PIELM jobs disabled for the CAN-PINN-only HPC submission.
+# Re-enable by removing the `if false` guard.
+if false; then
 for seed in "${seeds[@]}"; do
     job_name="cav_pielm_s${seed}"
     log_file="./logs/${job_name}"
@@ -385,6 +400,7 @@ for seed in "${seeds[@]}"; do
         "
     ((job_count++))
 done
+fi
 
 # ============================================================================
 # SECTION 3: KOVASZNAY FLOW - GRADIENT-BASED METHODS (GPU)
@@ -467,12 +483,14 @@ done
 #   SK-PINN: N=100 (sparse RKPM)
 
 # Elasticity training methods
+# 2026-04-28: CAN-PINN-only run (see cavity_methods comment above).
 elasticity_methods=(
-    autodiff
-    dtpinn
-    sage
-    ropinn
-    sk-pinn
+    # autodiff
+    # dtpinn
+    # sage
+    # ropinn
+    # sk-pinn
+    chebyshev-pinn
 )
 
 echo ""
@@ -536,7 +554,7 @@ done
 # ============================================================================
 
 n_cavity_jobs=$((${#cavity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
-n_pielm_jobs=${#seeds[@]}
+n_pielm_jobs=0   # 2026-04-28: PIELM disabled for CAN-PINN-only run
 n_kovasznay_jobs=$((${#kovasznay_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 n_elasticity_jobs=$((${#elasticity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 
@@ -552,7 +570,7 @@ done
 echo "  Total: $n_cavity_jobs jobs"
 echo ""
 echo "CAVITY - PIELM (CPU):"
-echo "  - pielm  x  ${#seeds[@]} seeds  =  $n_pielm_jobs jobs"
+echo "  - pielm  x  ${#seeds[@]} seeds  =  $n_pielm_jobs jobs   (disabled 2026-04-28)"
 echo ""
 echo "KOVASZNAY - GRADIENT-BASED (GPU):"
 for method in "${kovasznay_methods[@]}"; do

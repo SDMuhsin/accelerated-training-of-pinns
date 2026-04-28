@@ -4349,7 +4349,7 @@ def main():
                 args.grid_size = 30
         else:
             method_defaults = {
-                'autodiff': 50, 'dtpinn': 50, 'analytical': 50,
+                'autodiff': 50, 'dtpinn': 50, 'analytical': 50, 'chebyshev-pinn': 50,
                 'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
                 'jaxpinn': 50, 'sage-jax': 50, 'bfsa': 50, 'sdccg': 50, 'slrm': 50, 'slrm-jax': 50,
                 'stencil-adjoint': 50,

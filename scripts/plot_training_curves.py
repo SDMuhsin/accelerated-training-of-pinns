@@ -20,22 +20,35 @@ from pathlib import Path
 # ============================================================================
 
 RESULTS_DIR = Path('results')
-OUTPUT_DIR = Path('llmdocs/paper')
+OUTPUT_DIR = Path('llmdocs/stream_sage_paper/paper/v2_tetci')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROBLEM = 'cavity'
 MODEL = 'mlp'
 SEED = 42
+TAG = 'multiseed_20260427'
 
-# Methods in display order (SAGE last so it draws on top)
+# Methods in display order (SAGE last so it draws on top).
+# Handcrafted is excluded: not part of the multiseed re-run.
+# DT-PINN is excluded: it uses L-BFGS over 5,000 outer steps with a
+# different loss scale than the four Adam-trained methods (30,000 epochs);
+# we keep this figure to a same-protocol comparison.  DT-PINN's accuracy
+# numbers are in Table III.
+# SK-PINN is excluded from panel (a) only because its training loss is
+# normalized over a 17x denser grid (200 vs 50, see Section IV), making
+# the absolute loss scale not comparable to the Chebyshev-grid methods;
+# the PDE residual in panel (b) is on the same physical interior so the
+# comparison there is meaningful.  See `LOSS_PANEL_METHODS` below.
 METHODS = {
     'sk-pinn':    {'label': 'SK-PINN',     'color': '#D55E00', 'ls': (0, (3, 2)),       'lw': 1.0, 'zorder': 2},
     'ropinn':     {'label': 'RoPINN',      'color': '#888888', 'ls': (0, (4, 2)),       'lw': 1.0, 'zorder': 2},
     'autodiff':   {'label': 'Autodiff',    'color': '#E69F00', 'ls': '-',               'lw': 1.4, 'zorder': 3},
-    'dtpinn':     {'label': 'DT-PINN',     'color': '#009E73', 'ls': '-',               'lw': 1.4, 'zorder': 3},
-    'analytical': {'label': 'Handcrafted', 'color': '#CC79A7', 'ls': (0, (5, 2, 1, 2)), 'lw': 1.3, 'zorder': 4},
     'sage':       {'label': 'SAGE (Ours)', 'color': '#0072B2', 'ls': '-',               'lw': 2.0, 'zorder': 5},
 }
+
+# Methods that share the Chebyshev grid (and therefore a comparable
+# training-loss scale) — used only for panel (a).
+LOSS_PANEL_METHODS = {k: v for k, v in METHODS.items() if k != 'sk-pinn'}
 
 # Smoothing: exponential moving average span (in number of data points)
 EMA_SPAN = 25  # ~2500 epochs at 100-epoch intervals
@@ -45,9 +58,9 @@ EMA_SPAN = 25  # ~2500 epochs at 100-epoch intervals
 # Data loading
 # ============================================================================
 
-def load_tracking(problem, method, model, seed):
-    """Load a single tracking CSV."""
-    path = RESULTS_DIR / f'tracking_{problem}_{method}_{model}_s{seed}.csv'
+def load_tracking(problem, method, model, seed, tag=TAG):
+    """Load a single tracking CSV (tagged variant from the released release)."""
+    path = RESULTS_DIR / f'tracking_{problem}_{method}_{model}_s{seed}_{tag}.csv'
     return pd.read_csv(path)
 
 
@@ -83,26 +96,28 @@ def make_figure():
     )
     fig.subplots_adjust(wspace=0.35, bottom=0.22)
 
-    # Load and plot each method
-    for method, style in METHODS.items():
+    # Panel (a): methods on Chebyshev grid only (SK-PINN excluded — its
+    # uniform N=200 grid normalizes the loss differently).
+    for method, style in LOSS_PANEL_METHODS.items():
         df = load_tracking(PROBLEM, method, MODEL, SEED)
-        epochs = df['epoch'].values / 1000.0  # plot in thousands
+        epochs = df['epoch'].values / 1000.0
         loss_raw = df['train_loss'].values
-        pde_raw = df['pde_rms'].values
-
         loss_smooth = ema(df['train_loss'], EMA_SPAN).values
-        pde_smooth = ema(df['pde_rms'], EMA_SPAN).values
-
-        # Raw data as transparent background
         ax_loss.plot(epochs, loss_raw, color=style['color'],
                      alpha=0.10, lw=0.4, zorder=style['zorder'] - 1)
-        ax_pde.plot(epochs, pde_raw, color=style['color'],
-                    alpha=0.10, lw=0.4, zorder=style['zorder'] - 1)
-
-        # Smoothed foreground
         ax_loss.plot(epochs, loss_smooth, color=style['color'],
                      ls=style['ls'], lw=style['lw'], label=style['label'],
                      zorder=style['zorder'])
+
+    # Panel (b): all methods (PDE residual is computed on the actual
+    # physical interior so the comparison is meaningful).
+    for method, style in METHODS.items():
+        df = load_tracking(PROBLEM, method, MODEL, SEED)
+        epochs = df['epoch'].values / 1000.0
+        pde_raw = df['pde_rms'].values
+        pde_smooth = ema(df['pde_rms'], EMA_SPAN).values
+        ax_pde.plot(epochs, pde_raw, color=style['color'],
+                    alpha=0.10, lw=0.4, zorder=style['zorder'] - 1)
         ax_pde.plot(epochs, pde_smooth, color=style['color'],
                     ls=style['ls'], lw=style['lw'], label=style['label'],
                     zorder=style['zorder'])
