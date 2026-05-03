@@ -156,6 +156,15 @@ def parse_args():
                         help="Approximate number of scattered nodes (Ni+Nb) for "
                              "--method dtpinn. Default: ~grid_size² to keep the "
                              "node count comparable to the Chebyshev baseline.")
+    parser.add_argument("--match-protocol", action="store_true",
+                        help="(SK-PINN only) drop weight decay, drop SK-PINN-specific "
+                             "schedulers, and use the Chebyshev-paired uniform grid "
+                             "(N=50 cavity / N=30 kovasznay / N=30 elasticity) so the "
+                             "SK-PINN row is apples-to-apples with the rest of the "
+                             "matched-protocol baselines (autodiff, sage, "
+                             "chebyshev-pinn, can-pinn-faithful). Tag the run "
+                             "explicitly (e.g., --tag=sk_pinn_matched_<date>) to keep "
+                             "results separable from the historical sk-pinn rows.")
     return parser.parse_args()
 
 
@@ -3370,19 +3379,24 @@ def append_csv_row(csv_path, row_dict):
 
 
 # --- Method: sk-pinn ---
-def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
+def train_sk_pinn(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None,
+                  match_protocol=False):
     """SK-PINN: sparse RKPM differentiation matrices, autograd backward.
 
     Uses model-specific weight decay to prevent the model from learning high-
     frequency features that exceed the RKPM operator's resolution (O(h^2)
     algebraic convergence).  More expressive architectures (PirateNet, TSA-PINN)
     need stronger regularization to avoid overfitting the discretization.
+
+    When ``match_protocol`` is True, weight decay is set to 0.0 so the run is
+    apples-to-apples with the rest of the matched-protocol baselines
+    (autodiff/sage/chebyshev-pinn/can-pinn-faithful).
     """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
-    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    wd = 0.0 if match_protocol else _SK_PINN_WD.get(model_name, 1e-4)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if device.type == 'cuda':
@@ -3900,17 +3914,21 @@ def compute_pde_kovasznay_sparse(pred, g):
     return continuity, mom_u, mom_v
 
 
-def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
+def train_sk_pinn_kovasznay(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None,
+                            match_protocol=False):
     """SK-PINN for Kovasznay flow: sparse RKPM matrices, autograd backward.
 
     Uses model-specific weight decay (see _SK_PINN_WD) to prevent the model
     from learning beyond RKPM resolution.
+
+    When ``match_protocol`` is True, weight decay is set to 0.0 so the run is
+    apples-to-apples with the rest of the matched-protocol baselines.
     """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name).to(device)
-    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    wd = 0.0 if match_protocol else _SK_PINN_WD.get(model_name, 1e-4)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
     if device.type == 'cuda':
@@ -4747,19 +4765,28 @@ def train_ropinn_elasticity(seed, device, n_epochs, lr, optimizer_type, techniqu
 
 
 # --- Method: sk-pinn (Elasticity) ---
-def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None):
+def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, grid_data, tracker=None,
+                             match_protocol=False):
     """SK-PINN for elasticity: sparse RKPM matrices, autograd backward.
 
     Uses model-specific weight decay (see _SK_PINN_WD).
+
+    When ``match_protocol`` is True, weight decay is set to 0.0 and the
+    cosine-annealing scheduler is disabled (flat lr=lr throughout) so the run
+    is apples-to-apples with the rest of the matched-protocol baselines, which
+    all run flat-Adam at lr=1e-3.
     """
     g = grid_data
 
     torch.manual_seed(seed)
     model = make_model(model_name, output_dim=2).to(device)
-    wd = _SK_PINN_WD.get(model_name, 1e-4)
+    wd = 0.0 if match_protocol else _SK_PINN_WD.get(model_name, 1e-4)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_epochs, eta_min=1e-5)
+    if match_protocol:
+        scheduler = None
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=n_epochs, eta_min=1e-5)
 
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
@@ -4782,7 +4809,8 @@ def train_sk_pinn_elasticity(seed, device, n_epochs, lr, grid_size, model_name, 
         loss = loss_pde + loss_bc + model_reg_loss(model)
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
@@ -5242,7 +5270,9 @@ def main():
     if args.grid_size is None:
         if is_kovasznay:
             if args.method == 'sk-pinn':
-                args.grid_size = 150
+                # Matched-protocol: drop to Chebyshev-paired uniform grid (N=30).
+                # Default (paper-faithful upstream): N=150 (dense uniform RKPM).
+                args.grid_size = 30 if args.match_protocol else 150
             elif args.method == 'can-pinn-faithful':
                 # Uniform grid for the FD stencil. 51 -> dx=Lx/50=0.03,
                 # dy=Ly/50=0.04 on the [-0.5, 1.0] x [-0.5, 1.5] domain.
@@ -5251,7 +5281,9 @@ def main():
                 args.grid_size = 30
         elif is_elasticity:
             if args.method == 'sk-pinn':
-                args.grid_size = 100
+                # Matched-protocol: drop to Chebyshev-paired uniform grid (N=30).
+                # Default (paper-faithful upstream): N=100 (dense uniform RKPM).
+                args.grid_size = 30 if args.match_protocol else 100
             elif args.method == 'can-pinn-faithful':
                 # Uniform grid for the FD stencil. 51 -> dx=dy=0.02 on [0,1]^2,
                 # matching the paper's cavity stencil-spacing convention.
@@ -5267,6 +5299,10 @@ def main():
                 'can-pinn-faithful': 50,
             }
             args.grid_size = method_defaults[args.method]
+            # Cavity matched-protocol override for sk-pinn: use Chebyshev-paired
+            # uniform grid (N=50) instead of the paper-faithful N=200.
+            if args.method == 'sk-pinn' and args.match_protocol:
+                args.grid_size = 50
 
     problem_labels = {
         'kovasznay': "Kovasznay Flow (Re=40)",
@@ -5278,7 +5314,7 @@ def main():
     print(f"UNIFIED BENCHMARK: {problem_label}")
     print("=" * 70)
     print(f"Problem:   {args.problem}")
-    print(f"Method:    {args.method}")
+    print(f"Method:    {args.method}{' (matched protocol: wd=0, no LR scheduler, paired grid)' if (args.method == 'sk-pinn' and args.match_protocol) else ''}")
     print(f"Model:     {args.model}")
     print(f"Optimizer: {args.optimizer}")
     print(f"LR:        {args.lr}")
@@ -5359,7 +5395,8 @@ def main():
                 g = build_sk_data_elasticity(args.grid_size, device)
                 model, train_time, final_loss = train_sk_pinn_elasticity(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
-                    args.model, g, tracker=tracker)
+                    args.model, g, tracker=tracker,
+                    match_protocol=args.match_protocol)
             elif args.method == "jaxpinn":
                 from src.jax_pinn import train_jaxpinn_elasticity
                 model, train_time, final_loss = train_jaxpinn_elasticity(
@@ -5422,7 +5459,8 @@ def main():
                 g = build_sk_data_kovasznay(args.grid_size, device)
                 model, train_time, final_loss = train_sk_pinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
-                    args.model, g, tracker=tracker)
+                    args.model, g, tracker=tracker,
+                    match_protocol=args.match_protocol)
             elif args.method == "jaxpinn":
                 from src.jax_pinn import train_jaxpinn_kovasznay
                 model, train_time, final_loss = train_jaxpinn_kovasznay(
@@ -5499,7 +5537,8 @@ def main():
                 g = build_sk_data(args.grid_size, device)
                 model, train_time, final_loss = train_sk_pinn(
                     args.seed, device, args.epochs, args.lr, args.grid_size,
-                    args.model, g, tracker=tracker)
+                    args.model, g, tracker=tracker,
+                    match_protocol=args.match_protocol)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "sage":
