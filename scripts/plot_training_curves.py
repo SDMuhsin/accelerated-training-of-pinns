@@ -27,6 +27,10 @@ PROBLEM = 'cavity'
 MODEL = 'mlp'
 SEED = 42
 TAG = 'multiseed_20260427'
+# CAN-PINN was re-run on the H100 MIG partition under a separate tag
+# (canpinn_hpc_20260428); per-cell tracking CSVs follow the same convention
+# but with method='chebyshev-pinn' (CAN-PINN's internal label) and that tag.
+CANPINN_TAG = 'canpinn_hpc_20260428'
 
 # Methods in display order (SAGE last so it draws on top).
 # Handcrafted is excluded: not part of the multiseed re-run.
@@ -34,21 +38,22 @@ TAG = 'multiseed_20260427'
 # different loss scale than the four Adam-trained methods (30,000 epochs);
 # we keep this figure to a same-protocol comparison.  DT-PINN's accuracy
 # numbers are in Table III.
-# SK-PINN is excluded from panel (a) only because its training loss is
-# normalized over a 17x denser grid (200 vs 50, see Section IV), making
-# the absolute loss scale not comparable to the Chebyshev-grid methods;
-# the PDE residual in panel (b) is on the same physical interior so the
-# comparison there is meaningful.  See `LOSS_PANEL_METHODS` below.
+# SK-PINN is excluded from this figure: its uniform N=200 grid normalizes
+# the loss differently from the Chebyshev N=50 grid the other methods use,
+# and it applies a model-specific weight decay no other Adam baseline does;
+# both panels would mix protocol-incompatible curves.  Numerical comparison
+# at SK-PINN's published configuration is in §V's Combined-speedup paragraph.
+# CAN-PINN (chebyshev-pinn): same Chebyshev forward / Adam+fp32 / 30k-epoch
+# protocol as SAGE; loaded from the canpinn_hpc_20260428 tracking CSVs.
 METHODS = {
-    'sk-pinn':    {'label': 'SK-PINN',     'color': '#D55E00', 'ls': (0, (3, 2)),       'lw': 1.0, 'zorder': 2},
-    'ropinn':     {'label': 'RoPINN',      'color': '#888888', 'ls': (0, (4, 2)),       'lw': 1.0, 'zorder': 2},
-    'autodiff':   {'label': 'Autodiff',    'color': '#E69F00', 'ls': '-',               'lw': 1.4, 'zorder': 3},
-    'sage':       {'label': 'SAGE (Ours)', 'color': '#0072B2', 'ls': '-',               'lw': 2.0, 'zorder': 5},
+    'ropinn':         {'label': 'RoPINN',      'color': '#888888', 'ls': (0, (4, 2)),       'lw': 1.0, 'zorder': 2},
+    'autodiff':       {'label': 'Autodiff',    'color': '#E69F00', 'ls': '-',               'lw': 1.4, 'zorder': 3},
+    'chebyshev-pinn': {'label': 'Spectral-AD', 'color': '#CC79A7', 'ls': (0, (5, 2)),       'lw': 1.4, 'zorder': 4},
+    'sage':           {'label': 'SAGE (Ours)', 'color': '#0072B2', 'ls': '-',               'lw': 2.0, 'zorder': 5},
 }
 
-# Methods that share the Chebyshev grid (and therefore a comparable
-# training-loss scale) — used only for panel (a).
-LOSS_PANEL_METHODS = {k: v for k, v in METHODS.items() if k != 'sk-pinn'}
+# All methods share the Chebyshev grid; both panels can use them.
+LOSS_PANEL_METHODS = METHODS
 
 # Smoothing: exponential moving average span (in number of data points)
 EMA_SPAN = 25  # ~2500 epochs at 100-epoch intervals
@@ -58,8 +63,15 @@ EMA_SPAN = 25  # ~2500 epochs at 100-epoch intervals
 # Data loading
 # ============================================================================
 
-def load_tracking(problem, method, model, seed, tag=TAG):
-    """Load a single tracking CSV (tagged variant from the released release)."""
+def load_tracking(problem, method, model, seed, tag=None):
+    """Load a single tracking CSV (tagged variant from the released release).
+
+    CAN-PINN (method='chebyshev-pinn') lives under the canpinn_hpc_20260428
+    tag; all other methods under multiseed_20260427.  Caller may override
+    `tag` explicitly; otherwise the default is chosen by method.
+    """
+    if tag is None:
+        tag = CANPINN_TAG if method == 'chebyshev-pinn' else TAG
     path = RESULTS_DIR / f'tracking_{problem}_{method}_{model}_s{seed}_{tag}.csv'
     return pd.read_csv(path)
 

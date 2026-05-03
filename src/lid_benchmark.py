@@ -117,10 +117,12 @@ def parse_args():
                         choices=["cavity", "kovasznay", "elasticity"],
                         help="PDE problem to solve")
     parser.add_argument("--method", required=True,
-                        choices=["autodiff", "dtpinn", "chebyshev-pinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"],
+                        choices=["autodiff", "dtpinn", "chebyshev-pinn", "analytical", "ropinn", "pielm", "sk-pinn", "sage", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint", "can-pinn-faithful"],
                         help="Training method. 'dtpinn' is the paper-faithful "
                              "Sharma & Shankar 2022 RBF-FD + fp64 + L-BFGS variant. "
-                             "'chebyshev-pinn' is the prior Chebyshev-spectral baseline.")
+                             "'chebyshev-pinn' is the prior Chebyshev-spectral baseline. "
+                             "'can-pinn-faithful' is the Chiu et al. 2022 CMAME coupled "
+                             "automatic-numerical differentiation method (cavity only in Phase 2).")
     parser.add_argument("--model", default="mlp", choices=["mlp", "tsa-pinn", "pirate-net"],
                         help="Network architecture (ignored for pielm)")
     parser.add_argument("--optimizer", default="adam", choices=["adam", "lbfgs"],
@@ -684,6 +686,627 @@ def compute_pde_terms_sparse(pred, g):
     mom_u = u_conv + dp_dx - visc_u
     mom_v = v_conv + dp_dy - visc_v
     return continuity, mom_u, mom_v
+
+
+# =============================================================================
+# CAN-PINN faithful (Chiu et al. 2022, CMAME 395, 114909) — independent
+# PyTorch reimplementation of the coupled automatic-numerical differentiation
+# scheme. NO upstream code copied; algorithm reconstructed from the paper and
+# the spec at llmdocs/trackers/can_pinn_replication_2026-04-29.md.
+#
+# Stencil per interior point: 9 evaluations (C, E, W, N, S, EE, WW, NN, SS)
+# with 5 AD first-derivative computations (at C, E, W, N, S). Convection uses
+# can(uw2) (eq. 8/9), pressure gradient uses can(cd) (eq. 12/13), viscous
+# Laplacian uses plain 2nd-order central difference. The /8 dispersion term
+# is included for cd-pressure (matches paper eq. 12) and EXCLUDED for uw2
+# convection (matches upstream demo notebook; eq. 11's /8 is a higher-order
+# modified-equation correction the notebook drops).
+# =============================================================================
+def build_canpinn_grid_data(N_grid, device):
+    """Build a uniform NxN grid on [0,1]^2 with interior/lid/wall classification.
+
+    The grid is uniform (NOT Chebyshev) because the can-PINN stencil presupposes
+    equispaced points. dx = dy = 1/(N_grid - 1). Boundary points are classified
+    the same way as build_grid_data: top edge -> lid (u=1, v=0), other three
+    edges -> wall (u=0, v=0), with corners assigned to lid via the
+    `is_wall = is_boundary & ~is_lid` rule (matches upstream notebook's
+    `_left & ~_top`, `_right & ~_top`).
+
+    Returns a dict with the keys consumed by pde_residuals_canpinn_cavity().
+    Stencil queries are computed inside the residual function from `xy_int`
+    (interior collocation coordinates) and are NOT precomputed here, so this
+    builder is intentionally minimal — neighbor coordinates can move outside
+    [0,1]^2 (matches the upstream notebook's "no clamping" behavior; see
+    Phase 1 spec gotcha 7.7).
+    """
+    dx = 1.0 / (N_grid - 1)
+    dy = dx
+
+    x_lin = np.linspace(0.0, 1.0, N_grid)
+    xx, yy = np.meshgrid(x_lin, x_lin, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = (xc < eps) | (xc > 1 - eps) | (yc < eps) | (yc > 1 - eps)
+    is_lid = (yc > 1 - eps)
+    is_wall = is_boundary & ~is_lid
+
+    interior_idx = np.where(~is_boundary)[0]
+    lid_idx = np.where(is_lid)[0]
+    wall_idx = np.where(is_wall)[0]
+
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_int = xy_all[interior_idx].contiguous()
+    xy_lid = xy_all[lid_idx].contiguous()
+    xy_wall = xy_all[wall_idx].contiguous()
+
+    # Wall distance for Smagorinsky at the interior (C) points only.
+    x_int = xy_int[:, 0:1]
+    y_int = xy_int[:, 1:2]
+    d_wall_int = torch.min(torch.min(x_int, 1.0 - x_int),
+                           torch.min(y_int, 1.0 - y_int))
+    Cs_d_sq_int = (Cs * d_wall_int) ** 2
+
+    return {
+        'xy_all': xy_all, 'xy_int': xy_int, 'xy_lid': xy_lid, 'xy_wall': xy_wall,
+        'interior_idx': interior_idx, 'lid_idx': lid_idx, 'wall_idx': wall_idx,
+        'd_wall_int': d_wall_int, 'Cs_d_sq_int': Cs_d_sq_int,
+        'dx': dx, 'dy': dy,
+        'N_grid': N_grid, 'N_int': len(interior_idx),
+        'N_lid': len(lid_idx), 'N_wall': len(wall_idx),
+        'nu_lam': float(nu_laminar),
+    }
+
+
+def _canpinn_stencil_offsets(dx, dy, device, dtype=torch.float32):
+    """Return the 9 (Δx, Δy) offsets in the order [C, E, W, N, S, EE, WW, NN, SS]."""
+    return torch.tensor([
+        [ 0.0,    0.0   ],   # C
+        [ dx,     0.0   ],   # E
+        [-dx,     0.0   ],   # W
+        [ 0.0,    dy    ],   # N
+        [ 0.0,   -dy    ],   # S
+        [ 2*dx,   0.0   ],   # EE
+        [-2*dx,   0.0   ],   # WW
+        [ 0.0,    2*dy  ],   # NN
+        [ 0.0,   -2*dy  ],   # SS
+    ], dtype=dtype, device=device)
+
+
+def pde_residuals_canpinn_cavity(model, xy_int, dx, dy,
+                                 Cs_d_sq_int=None, nu_lam=None,
+                                 use_smagorinsky=True, return_components=False):
+    """Compute the CAN-PINN PDE residuals at the given interior points.
+
+    `xy_int` : (N_int, 2) tensor of interior collocation points. Boundary
+        points must already be excluded by the caller (we do not re-mask here).
+    `dx, dy` : scalar stencil spacings (Python floats, or 0-d tensors).
+    `Cs_d_sq_int` : (N_int, 1) precomputed (Cs * d_wall)^2 at interior points.
+        Required iff use_smagorinsky=True.
+    `nu_lam` : scalar laminar viscosity. Defaults to module-level nu_laminar
+        (= 1/Re_cavity = 1/1000).
+    `use_smagorinsky` : if True (harness drop-in for cavity Re=1000+Smag),
+        compute nu_eff = nu_lam + (Cs*d_wall)^2 |S| at C and use it in the
+        viscous Laplacian via (1/Re_eff)·∇²U with Re_eff = 1/nu_eff. If False
+        (paper-faithful Re=400 plain NS), use 1/Re·∇²U with Re = 1/nu_lam.
+
+    Returns (continuity, mom_u, mom_v), each shape (N_int, 1).
+
+    The implementation is a single forward pass over a 9*N_int batched input
+    plus a single autograd.grad call to obtain (du/dx, du/dy, dv/dx, dv/dy,
+    dp/dx, dp/dy) at every stencil location. The 5 AD-needed derivatives
+    (at C, E, W, N, S) are then sliced from the full tensor — EE/WW/NN/SS
+    AD gradients are computed but not used (cheap).
+    """
+    if nu_lam is None:
+        nu_lam = nu_laminar
+
+    N_int = xy_int.shape[0]
+    device = xy_int.device
+    dtype = xy_int.dtype
+
+    # Build the 9*N_int stencil batch by broadcasting offsets onto each point.
+    offs = _canpinn_stencil_offsets(dx, dy, device, dtype)        # (9, 2)
+    xy_stencil = (xy_int.unsqueeze(0) + offs.unsqueeze(1))         # (9, N_int, 2)
+    xy_stencil = xy_stencil.reshape(9 * N_int, 2)
+    xy_stencil = xy_stencil.detach().requires_grad_(True)
+
+    # Single forward pass over all stencil points.
+    pred = model(xy_stencil)                                       # (9*N_int, 3)
+    u_all = pred[:, 0:1]
+    v_all = pred[:, 1:2]
+    p_all = pred[:, 2:3]
+
+    # Single AD call gets gradients of all three outputs at every stencil
+    # location. We compute one gradient per output (3 calls), each accumulating
+    # over the full 9*N_int batch — this gives us du, dv, dp at every neighbor
+    # in three autograd.grad invocations rather than one per location.
+    grad_u = torch.autograd.grad(u_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(u_all),
+                                 create_graph=True, retain_graph=True)[0]
+    grad_v = torch.autograd.grad(v_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(v_all),
+                                 create_graph=True, retain_graph=True)[0]
+    grad_p = torch.autograd.grad(p_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(p_all),
+                                 create_graph=True, retain_graph=True)[0]
+
+    # Reshape to (9, N_int, 1).
+    u_s = u_all.reshape(9, N_int, 1)
+    v_s = v_all.reshape(9, N_int, 1)
+    p_s = p_all.reshape(9, N_int, 1)
+    ux_s = grad_u[:, 0:1].reshape(9, N_int, 1)
+    uy_s = grad_u[:, 1:2].reshape(9, N_int, 1)
+    vx_s = grad_v[:, 0:1].reshape(9, N_int, 1)
+    vy_s = grad_v[:, 1:2].reshape(9, N_int, 1)
+    px_s = grad_p[:, 0:1].reshape(9, N_int, 1)
+    py_s = grad_p[:, 1:2].reshape(9, N_int, 1)
+
+    # Slice each stencil location.  Order: C, E, W, N, S, EE, WW, NN, SS.
+    u_C, u_E, u_W, u_N, u_S, _, _, _, _ = (u_s[i] for i in range(9))
+    v_C, v_E, v_W, v_N, v_S, _, _, _, _ = (v_s[i] for i in range(9))
+    p_C, p_E, p_W, p_N, p_S, _, _, _, _ = (p_s[i] for i in range(9))
+    u_x_C = ux_s[0]; u_x_E = ux_s[1]; u_x_W = ux_s[2]
+    u_y_C = uy_s[0]; u_y_N = uy_s[3]; u_y_S = uy_s[4]
+    v_x_C = vx_s[0]; v_x_E = vx_s[1]; v_x_W = vx_s[2]
+    v_y_C = vy_s[0]; v_y_N = vy_s[3]; v_y_S = vy_s[4]
+    p_x_C = px_s[0]; p_x_E = px_s[1]; p_x_W = px_s[2]
+    p_y_C = py_s[0]; p_y_N = py_s[3]; p_y_S = py_s[4]
+
+    # Face velocities (paper eq. 7 / notebook lines 363-365).
+    u_face_e = 0.5 * (u_E + u_C)
+    u_face_w = 0.5 * (u_W + u_C)
+    v_face_n = 0.5 * (v_N + v_C)
+    v_face_s = 0.5 * (v_S + v_C)
+
+    # CAN(uw2) convection (paper eq. 8/9; notebook lines 444-476).
+    # /8 dispersion correction commented out in upstream demo — match that.
+    half_dx = 0.5 * dx
+    half_dy = 0.5 * dy
+
+    Ue_minus = u_C + u_x_C * half_dx
+    Ue_plus  = u_E - u_x_E * half_dx
+    U_e = torch.where(u_face_e >= 0.0, Ue_minus, Ue_plus)
+
+    Uw_minus = u_W + u_x_W * half_dx
+    Uw_plus  = u_C - u_x_C * half_dx
+    U_w = torch.where(u_face_w >= 0.0, Uw_minus, Uw_plus)
+
+    Un_minus = u_C + u_y_C * half_dy
+    Un_plus  = u_N - u_y_N * half_dy
+    U_n = torch.where(v_face_n >= 0.0, Un_minus, Un_plus)
+
+    Us_minus = u_S + u_y_S * half_dy
+    Us_plus  = u_C - u_y_C * half_dy
+    U_s = torch.where(v_face_s >= 0.0, Us_minus, Us_plus)
+
+    Ve_minus = v_C + v_x_C * half_dx
+    Ve_plus  = v_E - v_x_E * half_dx
+    V_e = torch.where(u_face_e >= 0.0, Ve_minus, Ve_plus)
+
+    Vw_minus = v_W + v_x_W * half_dx
+    Vw_plus  = v_C - v_x_C * half_dx
+    V_w = torch.where(u_face_w >= 0.0, Vw_minus, Vw_plus)
+
+    Vn_minus = v_C + v_y_C * half_dy
+    Vn_plus  = v_N - v_y_N * half_dy
+    V_n = torch.where(v_face_n >= 0.0, Vn_minus, Vn_plus)
+
+    Vs_minus = v_S + v_y_S * half_dy
+    Vs_plus  = v_C - v_y_C * half_dy
+    V_s = torch.where(v_face_s >= 0.0, Vs_minus, Vs_plus)
+
+    UU_x = (u_face_e * U_e - u_face_w * U_w) / dx
+    VU_y = (v_face_n * U_n - v_face_s * U_s) / dy
+    UV_x = (u_face_e * V_e - u_face_w * V_w) / dx
+    VV_y = (v_face_n * V_n - v_face_s * V_s) / dy
+
+    # CAN(cd) pressure (paper eq. 12/13; notebook lines 478-485). /8 term ON.
+    eighth_dx = dx / 8.0
+    eighth_dy = dy / 8.0
+    p_e = 0.5 * (p_C + p_E) - (p_x_E - p_x_C) * eighth_dx
+    p_w = 0.5 * (p_W + p_C) - (p_x_C - p_x_W) * eighth_dx
+    p_n = 0.5 * (p_C + p_N) - (p_y_N - p_y_C) * eighth_dy
+    p_s = 0.5 * (p_S + p_C) - (p_y_C - p_y_S) * eighth_dy
+    P_x = (p_e - p_w) / dx
+    P_y = (p_n - p_s) / dy
+
+    # Plain 2nd-order central difference for viscous Laplacian (notebook 402-405).
+    Uxx = (u_E - 2.0 * u_C + u_W) / (dx * dx)
+    Uyy = (u_N - 2.0 * u_C + u_S) / (dy * dy)
+    Vxx = (v_E - 2.0 * v_C + v_W) / (dx * dx)
+    Vyy = (v_N - 2.0 * v_C + v_S) / (dy * dy)
+
+    # Continuity from staggered face velocities (notebook line 365).
+    div = (u_face_e - u_face_w) / dx + (v_face_n - v_face_s) / dy
+
+    # Effective viscosity. For Smagorinsky harness drop-in: nu_eff at C from
+    # AD-S evaluated at C, then used as a local-constant in the FD Laplacian.
+    # This is design choice b1 from the spec (§7.1). For paper-faithful plain
+    # NS, use_smagorinsky=False -> nu_eff = nu_lam (constant).
+    if use_smagorinsky:
+        if Cs_d_sq_int is None:
+            raise ValueError("Cs_d_sq_int must be provided when use_smagorinsky=True")
+        Sxx = u_x_C
+        Syy = v_y_C
+        Sxy = 0.5 * (u_y_C + v_x_C)
+        S_mag = torch.sqrt(2.0 * (Sxx ** 2 + Syy ** 2 + 2.0 * Sxy ** 2) + 1e-12)
+        nu_eff = nu_lam + Cs_d_sq_int * S_mag
+    else:
+        nu_eff = nu_lam
+
+    # PDE residuals (paper eq. 14 / notebook 487-489). Conservative form:
+    # mom = (uU)_x + (vU)_y - nu·(U_xx + U_yy) - U·div + P_x.
+    R_continuity = div
+    R_mom_u = UU_x + VU_y - nu_eff * (Uxx + Uyy) - u_C * div + P_x
+    R_mom_v = UV_x + VV_y - nu_eff * (Vxx + Vyy) - v_C * div + P_y
+
+    if return_components:
+        # For the stencil-sanity script: expose the can-PDE residuals and a
+        # diagnostic of nu_eff so callers can compare them to AD residuals on
+        # the same physics.
+        return R_continuity, R_mom_u, R_mom_v, {'nu_eff': nu_eff}
+    return R_continuity, R_mom_u, R_mom_v
+
+
+# =============================================================================
+# CAN-PINN extension: Kovasznay flow (Phase 5)
+# =============================================================================
+# Steady incompressible NS at Re=40 with the Kovasznay closed-form solution as
+# Dirichlet BCs on [-0.5, 1.0] x [-0.5, 1.5]. Constant viscosity nu_kov = 1/40
+# (no Smagorinsky term). The Taylor-coupled FD stencil (paper Chiu et al. 2022)
+# is identical to the cavity scheme: can(uw2) for convection, can(cd) for the
+# pressure gradient, and plain 2nd-order central FD for the viscous Laplacian.
+# Domain is rectangular but non-square so dx and dy are independently sized.
+# =============================================================================
+def build_canpinn_grid_data_kovasznay(N_grid, device):
+    """Build a uniform NxN grid on the Kovasznay domain [-0.5, 1.0] x [-0.5, 1.5].
+
+    The grid is uniform (NOT Chebyshev) because the can-PINN stencil presupposes
+    equispaced points. dx = Lx/(N_grid - 1), dy = Ly/(N_grid - 1) — the two are
+    different because the domain is non-square (Lx=1.5, Ly=2.0).
+
+    All boundary nodes carry Dirichlet BCs from `kovasznay_exact`; there is no
+    distinction between "lid" and "wall" here. Stencil neighbors at points one
+    cell from the boundary will land outside the domain — matches upstream
+    notebook behavior (no clamping; see Phase 1 spec gotcha 7.7).
+    """
+    Lx, Ly = 1.5, 2.0
+    x0, y0 = -0.5, -0.5
+
+    dx = Lx / (N_grid - 1)
+    dy = Ly / (N_grid - 1)
+
+    x_lin = np.linspace(x0, x0 + Lx, N_grid)
+    y_lin = np.linspace(y0, y0 + Ly, N_grid)
+    xx, yy = np.meshgrid(x_lin, y_lin, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = ((xc < x0 + eps) | (xc > x0 + Lx - eps) |
+                   (yc < y0 + eps) | (yc > y0 + Ly - eps))
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_int = xy_all[interior_idx].contiguous()
+    xy_bc = xy_all[bc_idx].contiguous()
+
+    # Exact BC values for u, v, p at boundary nodes.
+    u_ex, v_ex, p_ex = kovasznay_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([u_ex, v_ex, p_ex], dim=1)  # (N_bc, 3)
+
+    # Pressure reference at domain center (matches chebyshev variant).
+    x_center = torch.tensor([[x0 + Lx / 2, y0 + Ly / 2]], dtype=torch.float32, device=device)
+    _, _, p_ctr = kovasznay_exact(x_center[:, 0:1], x_center[:, 1:2])
+    p_center_exact = p_ctr.item()
+
+    return {
+        'xy_all': xy_all, 'xy_int': xy_int, 'xy_bc': xy_bc,
+        'xy_center': x_center,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'bc_target': bc_target, 'p_center_exact': p_center_exact,
+        'dx': dx, 'dy': dy,
+        'N_grid': N_grid, 'N_int': len(interior_idx), 'N_bc': len(bc_idx),
+        'Lx': Lx, 'Ly': Ly, 'x0': x0, 'y0': y0,
+        'nu_kov': float(nu_kov),
+    }
+
+
+def pde_residuals_canpinn_kov(model, xy_int, dx, dy, nu=None):
+    """CAN-PINN PDE residuals for steady Kovasznay NS at the given interior points.
+
+    `xy_int` : (N_int, 2) tensor of interior collocation points (boundary
+        excluded by the caller).
+    `dx, dy` : scalar stencil spacings (Python floats).
+    `nu`     : kinematic viscosity. Defaults to module-level nu_kov (= 1/40).
+
+    The scheme mirrors `pde_residuals_canpinn_cavity` but with:
+      - constant viscosity (no Smagorinsky term),
+      - no homogeneous-boundary specialization (BCs come from the exact
+        Kovasznay solution and are imposed externally as Dirichlet residuals).
+
+    Stencil layout (paper Fig 2): C, E, W, N, S, EE, WW, NN, SS — 9 forward-
+    pass evaluations. AD gradients are taken at C, E, W, N, S only; EE/WW/NN/SS
+    contribute through their direct values via the upwind branch selectors.
+    Returns (continuity, mom_u, mom_v), each shape (N_int, 1).
+    """
+    if nu is None:
+        nu = nu_kov
+
+    N_int = xy_int.shape[0]
+    device = xy_int.device
+    dtype = xy_int.dtype
+
+    offs = _canpinn_stencil_offsets(dx, dy, device, dtype)        # (9, 2)
+    xy_stencil = (xy_int.unsqueeze(0) + offs.unsqueeze(1))         # (9, N_int, 2)
+    xy_stencil = xy_stencil.reshape(9 * N_int, 2)
+    xy_stencil = xy_stencil.detach().requires_grad_(True)
+
+    pred = model(xy_stencil)                                       # (9*N_int, 3)
+    u_all = pred[:, 0:1]
+    v_all = pred[:, 1:2]
+    p_all = pred[:, 2:3]
+
+    grad_u = torch.autograd.grad(u_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(u_all),
+                                 create_graph=True, retain_graph=True)[0]
+    grad_v = torch.autograd.grad(v_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(v_all),
+                                 create_graph=True, retain_graph=True)[0]
+    grad_p = torch.autograd.grad(p_all, xy_stencil,
+                                 grad_outputs=torch.ones_like(p_all),
+                                 create_graph=True, retain_graph=True)[0]
+
+    u_s = u_all.reshape(9, N_int, 1)
+    v_s = v_all.reshape(9, N_int, 1)
+    p_s = p_all.reshape(9, N_int, 1)
+    ux_s = grad_u[:, 0:1].reshape(9, N_int, 1)
+    uy_s = grad_u[:, 1:2].reshape(9, N_int, 1)
+    vx_s = grad_v[:, 0:1].reshape(9, N_int, 1)
+    vy_s = grad_v[:, 1:2].reshape(9, N_int, 1)
+    px_s = grad_p[:, 0:1].reshape(9, N_int, 1)
+    py_s = grad_p[:, 1:2].reshape(9, N_int, 1)
+
+    u_C, u_E, u_W, u_N, u_S, _, _, _, _ = (u_s[i] for i in range(9))
+    v_C, v_E, v_W, v_N, v_S, _, _, _, _ = (v_s[i] for i in range(9))
+    p_C, p_E, p_W, p_N, p_S, _, _, _, _ = (p_s[i] for i in range(9))
+    u_x_C = ux_s[0]; u_x_E = ux_s[1]; u_x_W = ux_s[2]
+    u_y_C = uy_s[0]; u_y_N = uy_s[3]; u_y_S = uy_s[4]
+    v_x_C = vx_s[0]; v_x_E = vx_s[1]; v_x_W = vx_s[2]
+    v_y_C = vy_s[0]; v_y_N = vy_s[3]; v_y_S = vy_s[4]
+    p_x_C = px_s[0]; p_x_E = px_s[1]; p_x_W = px_s[2]
+    p_y_C = py_s[0]; p_y_N = py_s[3]; p_y_S = py_s[4]
+
+    # Face velocities (paper eq. 7).
+    u_face_e = 0.5 * (u_E + u_C)
+    u_face_w = 0.5 * (u_W + u_C)
+    v_face_n = 0.5 * (v_N + v_C)
+    v_face_s = 0.5 * (v_S + v_C)
+
+    # CAN(uw2) convection (paper eq. 8/9). /8 dispersion correction omitted to
+    # match the upstream demo notebook (Phase 1 spec gotcha 7.2).
+    half_dx = 0.5 * dx
+    half_dy = 0.5 * dy
+
+    Ue_minus = u_C + u_x_C * half_dx
+    Ue_plus  = u_E - u_x_E * half_dx
+    U_e = torch.where(u_face_e >= 0.0, Ue_minus, Ue_plus)
+
+    Uw_minus = u_W + u_x_W * half_dx
+    Uw_plus  = u_C - u_x_C * half_dx
+    U_w = torch.where(u_face_w >= 0.0, Uw_minus, Uw_plus)
+
+    Un_minus = u_C + u_y_C * half_dy
+    Un_plus  = u_N - u_y_N * half_dy
+    U_n = torch.where(v_face_n >= 0.0, Un_minus, Un_plus)
+
+    Us_minus = u_S + u_y_S * half_dy
+    Us_plus  = u_C - u_y_C * half_dy
+    U_s = torch.where(v_face_s >= 0.0, Us_minus, Us_plus)
+
+    Ve_minus = v_C + v_x_C * half_dx
+    Ve_plus  = v_E - v_x_E * half_dx
+    V_e = torch.where(u_face_e >= 0.0, Ve_minus, Ve_plus)
+
+    Vw_minus = v_W + v_x_W * half_dx
+    Vw_plus  = v_C - v_x_C * half_dx
+    V_w = torch.where(u_face_w >= 0.0, Vw_minus, Vw_plus)
+
+    Vn_minus = v_C + v_y_C * half_dy
+    Vn_plus  = v_N - v_y_N * half_dy
+    V_n = torch.where(v_face_n >= 0.0, Vn_minus, Vn_plus)
+
+    Vs_minus = v_S + v_y_S * half_dy
+    Vs_plus  = v_C - v_y_C * half_dy
+    V_s = torch.where(v_face_s >= 0.0, Vs_minus, Vs_plus)
+
+    UU_x = (u_face_e * U_e - u_face_w * U_w) / dx
+    VU_y = (v_face_n * U_n - v_face_s * U_s) / dy
+    UV_x = (u_face_e * V_e - u_face_w * V_w) / dx
+    VV_y = (v_face_n * V_n - v_face_s * V_s) / dy
+
+    # CAN(cd) pressure (paper eq. 12/13). /8 term ON.
+    eighth_dx = dx / 8.0
+    eighth_dy = dy / 8.0
+    p_e = 0.5 * (p_C + p_E) - (p_x_E - p_x_C) * eighth_dx
+    p_w = 0.5 * (p_W + p_C) - (p_x_C - p_x_W) * eighth_dx
+    p_n = 0.5 * (p_C + p_N) - (p_y_N - p_y_C) * eighth_dy
+    p_s = 0.5 * (p_S + p_C) - (p_y_C - p_y_S) * eighth_dy
+    P_x = (p_e - p_w) / dx
+    P_y = (p_n - p_s) / dy
+
+    # Plain 2nd-order central difference for viscous Laplacian.
+    Uxx = (u_E - 2.0 * u_C + u_W) / (dx * dx)
+    Uyy = (u_N - 2.0 * u_C + u_S) / (dy * dy)
+    Vxx = (v_E - 2.0 * v_C + v_W) / (dx * dx)
+    Vyy = (v_N - 2.0 * v_C + v_S) / (dy * dy)
+
+    # Continuity from staggered face velocities.
+    div = (u_face_e - u_face_w) / dx + (v_face_n - v_face_s) / dy
+
+    # Steady incompressible NS at constant nu (paper eq. 14, conservative form).
+    R_continuity = div
+    R_mom_u = UU_x + VU_y - nu * (Uxx + Uyy) - u_C * div + P_x
+    R_mom_v = UV_x + VV_y - nu * (Vxx + Vyy) - v_C * div + P_y
+
+    return R_continuity, R_mom_u, R_mom_v
+
+
+# =============================================================================
+# CAN-PINN extension: 2D linear elasticity (Phase 5)
+# =============================================================================
+# 2D Navier-Cauchy with manufactured solution on [0,1]^2:
+#   (lam+2*mu) * d^2 ux/dx^2 + mu * d^2 ux/dy^2 + (lam+mu) * d^2 uy/(dx*dy) + fx = 0
+#   mu * d^2 uy/dx^2 + (lam+2*mu) * d^2 uy/dy^2 + (lam+mu) * d^2 ux/(dx*dy) + fy = 0
+# 2 outputs (ux, uy), no pressure, no convection. The CAN-PINN coupling for
+# 2nd-order PDEs is can(cd) — Taylor-augmented central-difference for the
+# divergence-of-gradient term and plain central FD for the Laplacians (Phase 1
+# spec §8.2). The cross derivative d^2 uy/(dx*dy) is computed by a 4-point
+# stencil (corners not needed): central difference of the AD gradient `du/dy`
+# along x at C, identical in form to the cd-pressure scheme — this preserves
+# the Taylor coupling along x while leaving the y-derivative to AD.
+# =============================================================================
+def build_canpinn_grid_data_elasticity(N_grid, device):
+    """Build a uniform NxN grid on [0,1]^2 for the elasticity manufactured PDE.
+
+    All boundary nodes carry Dirichlet BCs from `elasticity_exact` (no lid/wall
+    distinction). Body forces fx, fy are precomputed at every grid point so the
+    residual function can index them with the interior mask.
+    """
+    dx = 1.0 / (N_grid - 1)
+    dy = dx
+
+    x_lin = np.linspace(0.0, 1.0, N_grid)
+    xx, yy = np.meshgrid(x_lin, x_lin, indexing='xy')
+    xy_grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+    eps = 1e-10
+    xc, yc = xy_grid[:, 0], xy_grid[:, 1]
+    is_boundary = (xc < eps) | (xc > 1 - eps) | (yc < eps) | (yc > 1 - eps)
+
+    interior_idx = np.where(~is_boundary)[0]
+    bc_idx = np.where(is_boundary)[0]
+
+    xy_all = torch.tensor(xy_grid, dtype=torch.float32, device=device)
+    xy_int = xy_all[interior_idx].contiguous()
+    xy_bc = xy_all[bc_idx].contiguous()
+
+    # Body forces at interior points (used inside the residual).
+    fx_int, fy_int = elasticity_body_forces(xy_int[:, 0:1], xy_int[:, 1:2])
+
+    # BC targets at boundary nodes.
+    ux_ex, uy_ex = elasticity_exact(xy_bc[:, 0:1], xy_bc[:, 1:2])
+    bc_target = torch.cat([ux_ex, uy_ex], dim=1)  # (N_bc, 2)
+
+    return {
+        'xy_all': xy_all, 'xy_int': xy_int, 'xy_bc': xy_bc,
+        'interior_idx': interior_idx, 'bc_idx': bc_idx,
+        'bc_target': bc_target,
+        'fx_int': fx_int, 'fy_int': fy_int,
+        'dx': dx, 'dy': dy,
+        'N_grid': N_grid, 'N_int': len(interior_idx), 'N_bc': len(bc_idx),
+        'lam_e': float(lam_e), 'mu_e': float(mu_e),
+    }
+
+
+def pde_residuals_canpinn_elas(model, xy_int, dx, dy, fx_int, fy_int,
+                               lam=None, mu=None):
+    """CAN-PINN PDE residuals for 2D linear elasticity at the given interior pts.
+
+    Implements can(cd) for second-order PDE: plain central FD for the diagonal
+    Laplacian terms (d2/dx2, d2/dy2), and a central-difference of the AD-gradient
+    along the orthogonal axis for the cross derivative. This mirrors the
+    cd-pressure construction (paper eq. 12/13) but applied to displacement
+    derivatives — no upwind / convection branch, since elasticity has no
+    advective term (Phase 1 spec §8.2).
+
+    Stencil: C, E, W, N, S (5 points; EE/WW/NN/SS not needed for this PDE).
+    AD gradients are taken at all 5 to feed the Taylor /8 correction in the
+    cross-derivative term.
+    Returns (eq_x, eq_y), each shape (N_int, 1).
+    """
+    if lam is None:
+        lam = lam_e
+    if mu is None:
+        mu = mu_e
+
+    N_int = xy_int.shape[0]
+    device = xy_int.device
+    dtype = xy_int.dtype
+
+    # 5-point stencil — reuse the canonical 9-point offsets and slice the first
+    # 5 (C, E, W, N, S) so callers and tooling can rely on a single offset
+    # generator. The slicing is the only place the elasticity scheme deviates
+    # from the cavity / Kovasznay 9-point evaluation.
+    offs9 = _canpinn_stencil_offsets(dx, dy, device, dtype)        # (9, 2)
+    offs = offs9[:5]                                                # (5, 2)
+    xy_stencil = (xy_int.unsqueeze(0) + offs.unsqueeze(1))          # (5, N_int, 2)
+    xy_stencil = xy_stencil.reshape(5 * N_int, 2)
+    xy_stencil = xy_stencil.detach().requires_grad_(True)
+
+    pred = model(xy_stencil)                                        # (5*N_int, 2)
+    ux_all = pred[:, 0:1]
+    uy_all = pred[:, 1:2]
+
+    grad_ux = torch.autograd.grad(ux_all, xy_stencil,
+                                  grad_outputs=torch.ones_like(ux_all),
+                                  create_graph=True, retain_graph=True)[0]
+    grad_uy = torch.autograd.grad(uy_all, xy_stencil,
+                                  grad_outputs=torch.ones_like(uy_all),
+                                  create_graph=True, retain_graph=True)[0]
+
+    ux_s = ux_all.reshape(5, N_int, 1)
+    uy_s = uy_all.reshape(5, N_int, 1)
+    ux_x_s = grad_ux[:, 0:1].reshape(5, N_int, 1)
+    ux_y_s = grad_ux[:, 1:2].reshape(5, N_int, 1)
+    uy_x_s = grad_uy[:, 0:1].reshape(5, N_int, 1)
+    uy_y_s = grad_uy[:, 1:2].reshape(5, N_int, 1)
+
+    ux_C, ux_E, ux_W, ux_N, ux_S = (ux_s[i] for i in range(5))
+    uy_C, uy_E, uy_W, uy_N, uy_S = (uy_s[i] for i in range(5))
+
+    # AD gradients at C / E / W / N / S — used by the can(cd) cross-derivative.
+    ux_y_C = ux_y_s[0]; ux_y_E = ux_y_s[1]; ux_y_W = ux_y_s[2]
+    uy_x_C = uy_x_s[0]; uy_x_N = uy_x_s[3]; uy_x_S = uy_x_s[4]
+    # ...also expose the raw AD second-order taylor terms used in /8 corrections
+    ux_x_C = ux_x_s[0]; ux_x_E = ux_x_s[1]; ux_x_W = ux_x_s[2]
+    uy_y_C = uy_y_s[0]; uy_y_N = uy_y_s[3]; uy_y_S = uy_y_s[4]
+
+    # Diagonal Laplacian terms — plain 2nd-order central FD (no AD coupling).
+    d2ux_dx2 = (ux_E - 2.0 * ux_C + ux_W) / (dx * dx)
+    d2ux_dy2 = (ux_N - 2.0 * ux_C + ux_S) / (dy * dy)
+    d2uy_dx2 = (uy_E - 2.0 * uy_C + uy_W) / (dx * dx)
+    d2uy_dy2 = (uy_N - 2.0 * uy_C + uy_S) / (dy * dy)
+
+    # Cross derivative d^2 uy / (dx dy) — can(cd) form: central difference of
+    # the AD gradient `duy/dx` along y, with /8 Taylor correction in y. This
+    # mirrors the cd-pressure construction in `pde_residuals_canpinn_cavity`
+    # (paper eq. 12) — half-face values weight the AD second derivative onto
+    # the interior point.
+    eighth_dx = dx / 8.0
+    eighth_dy = dy / 8.0
+    # face-averaged uy_x along y, with Taylor correction:
+    uy_x_n = 0.5 * (uy_x_C + uy_x_N) - (uy_y_N - uy_y_C) * eighth_dy
+    uy_x_s_face = 0.5 * (uy_x_S + uy_x_C) - (uy_y_C - uy_y_S) * eighth_dy
+    d2uy_dxdy = (uy_x_n - uy_x_s_face) / dy
+
+    # Cross derivative d^2 ux / (dx dy) — can(cd) form: central difference of
+    # the AD gradient `dux/dy` along x, with /8 Taylor correction in x.
+    ux_y_e = 0.5 * (ux_y_C + ux_y_E) - (ux_x_E - ux_x_C) * eighth_dx
+    ux_y_w = 0.5 * (ux_y_W + ux_y_C) - (ux_x_C - ux_x_W) * eighth_dx
+    d2ux_dxdy = (ux_y_e - ux_y_w) / dx
+
+    # Navier-Cauchy equilibrium with body forces.
+    eq_x = ((lam + 2.0 * mu) * d2ux_dx2 + mu * d2ux_dy2
+            + (lam + mu) * d2uy_dxdy + fx_int)
+    eq_y = (mu * d2uy_dx2 + (lam + 2.0 * mu) * d2uy_dy2
+            + (lam + mu) * d2ux_dxdy + fy_int)
+
+    return eq_x, eq_y
 
 
 # =============================================================================
@@ -1372,6 +1995,286 @@ def train_chebyshev_pinn(seed, device, n_epochs, lr, technique, grid_size, model
             loss = loss_pde + loss_lid + loss_wall + loss_p + model_reg_loss(model)
             loss.backward()
             optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: can-pinn-faithful (cavity) ---
+def train_can_pinn_faithful(seed, device, n_epochs, lr, technique, grid_size,
+                            model_name="mlp", tracker=None):
+    """CAN-PINN faithful PyTorch port (cavity NS+Smagorinsky harness drop-in).
+
+    Implements Chiu et al. 2022 (CMAME 395, 114909) coupled automatic-numerical
+    differentiation. The PDE residual is computed by:
+      - can(uw2) upwind for convection (notebook eq. 8/9; /8 dispersion term
+        commented out in the upstream demo, MATCHED here),
+      - can(cd) central-difference-with-AD for pressure gradient (eq. 12/13;
+        /8 term INCLUDED, matching the upstream demo),
+      - plain 2nd-order central FD for the viscous Laplacian.
+    Smagorinsky is retained for parity with the harness's autodiff baseline
+    (option b1 in the Phase-1 spec §7.1): nu_eff is computed via AD at C and
+    used as a local-constant in the FD Laplacian. The paper-faithful Re=400
+    plain-NS variant lives in scripts/can_pinn_paper_validation.py — this
+    function is the harness drop-in for cavity Re=1000+Smag.
+
+    Mirrors the structural pattern of train_chebyshev_pinn (cavity) so the
+    tracker / CSV / dispatch wiring is byte-equivalent.
+    """
+    g = build_canpinn_grid_data(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    scaler = torch.amp.GradScaler('cuda') if technique == "amp" else None
+    use_amp = technique == "amp"
+
+    # Pre-extract the constants the residual function needs each iteration.
+    xy_int = g['xy_int']
+    Cs_d_sq_int = g['Cs_d_sq_int']
+    dx = g['dx']
+    dy = g['dy']
+    nu_lam = g['nu_lam']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                continuity, mom_u, mom_v = pde_residuals_canpinn_cavity(
+                    compiled_model, xy_int, dx, dy,
+                    Cs_d_sq_int=Cs_d_sq_int, nu_lam=nu_lam,
+                    use_smagorinsky=True)
+                loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                           mse(mom_u, torch.zeros_like(mom_u)) + \
+                           mse(mom_v, torch.zeros_like(mom_v))
+                pred_lid = compiled_model(g['xy_lid'])
+                loss_lid = mse(pred_lid[:, 0:1], torch.ones_like(pred_lid[:, 0:1])) + \
+                           mse(pred_lid[:, 1:2], torch.zeros_like(pred_lid[:, 1:2]))
+                pred_wall = compiled_model(g['xy_wall'])
+                loss_wall = mse(pred_wall[:, 0:1], torch.zeros_like(pred_wall[:, 0:1])) + \
+                            mse(pred_wall[:, 1:2], torch.zeros_like(pred_wall[:, 1:2]))
+                pc = torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device)
+                pred_c = compiled_model(pc)
+                loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+                loss = loss_pde + loss_lid + loss_wall + loss_p + model_reg_loss(model)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            continuity, mom_u, mom_v = pde_residuals_canpinn_cavity(
+                compiled_model, xy_int, dx, dy,
+                Cs_d_sq_int=Cs_d_sq_int, nu_lam=nu_lam,
+                use_smagorinsky=True)
+            loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                       mse(mom_u, torch.zeros_like(mom_u)) + \
+                       mse(mom_v, torch.zeros_like(mom_v))
+            pred_lid = compiled_model(g['xy_lid'])
+            loss_lid = mse(pred_lid[:, 0:1], torch.ones_like(pred_lid[:, 0:1])) + \
+                       mse(pred_lid[:, 1:2], torch.zeros_like(pred_lid[:, 1:2]))
+            pred_wall = compiled_model(g['xy_wall'])
+            loss_wall = mse(pred_wall[:, 0:1], torch.zeros_like(pred_wall[:, 0:1])) + \
+                        mse(pred_wall[:, 1:2], torch.zeros_like(pred_wall[:, 1:2]))
+            pc = torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device)
+            pred_c = compiled_model(pc)
+            loss_p = mse(pred_c[:, 2:3], torch.zeros_like(pred_c[:, 2:3]))
+            loss = loss_pde + loss_lid + loss_wall + loss_p + model_reg_loss(model)
+            loss.backward()
+            optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: can-pinn-faithful (Kovasznay) ---
+def train_can_pinn_faithful_kovasznay(seed, device, n_epochs, lr, technique, grid_size,
+                                       model_name="mlp", tracker=None):
+    """CAN-PINN faithful PyTorch port for Kovasznay flow (Phase 5 extension).
+
+    Steady incompressible NS at Re=40 on [-0.5, 1.0] x [-0.5, 1.5] with the
+    Kovasznay closed-form solution as Dirichlet BCs. Uses the can(uw2-conv,
+    cd-p) scheme from Chiu et al. 2022 — convection terms are upwind-coupled,
+    pressure gradient is cd-coupled with /8 Taylor correction, and the viscous
+    Laplacian is plain 2nd-order central FD. Constant viscosity (no
+    Smagorinsky). Mirrors the structural pattern of `train_chebyshev_pinn_kovasznay`.
+    """
+    g = build_canpinn_grid_data_kovasznay(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name).to(device)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    scaler = torch.amp.GradScaler('cuda') if technique == "amp" else None
+    use_amp = technique == "amp"
+
+    xy_int = g['xy_int']
+    xy_bc = g['xy_bc']
+    bc_target = g['bc_target']
+    xy_center = g['xy_center']
+    p_center_exact = g['p_center_exact']
+    dx = g['dx']
+    dy = g['dy']
+    nu = g['nu_kov']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                continuity, mom_u, mom_v = pde_residuals_canpinn_kov(
+                    compiled_model, xy_int, dx, dy, nu=nu)
+                loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                           mse(mom_u, torch.zeros_like(mom_u)) + \
+                           mse(mom_v, torch.zeros_like(mom_v))
+                pred_bc = compiled_model(xy_bc)
+                loss_bc = mse(pred_bc, bc_target)
+                pred_c = compiled_model(xy_center)
+                p_target = torch.tensor([[p_center_exact]], dtype=torch.float32, device=device)
+                loss_p = mse(pred_c[:, 2:3], p_target)
+                loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            continuity, mom_u, mom_v = pde_residuals_canpinn_kov(
+                compiled_model, xy_int, dx, dy, nu=nu)
+            loss_pde = mse(continuity, torch.zeros_like(continuity)) + \
+                       mse(mom_u, torch.zeros_like(mom_u)) + \
+                       mse(mom_v, torch.zeros_like(mom_v))
+            pred_bc = compiled_model(xy_bc)
+            loss_bc = mse(pred_bc, bc_target)
+            pred_c = compiled_model(xy_center)
+            p_target = torch.tensor([[p_center_exact]], dtype=torch.float32, device=device)
+            loss_p = mse(pred_c[:, 2:3], p_target)
+            loss = loss_pde + loss_bc + loss_p + model_reg_loss(model)
+            loss.backward()
+            optimizer.step()
+
+        final_loss = loss.item()
+        if (epoch + 1) % LOG_INTERVAL == 0:
+            print(f"  Epoch {epoch+1}: loss={final_loss:.6f}")
+        if tracker is not None:
+            tracker.step(epoch, final_loss, model)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    train_time = time.perf_counter() - start
+    return model, train_time, final_loss
+
+
+# --- Method: can-pinn-faithful (Elasticity) ---
+def train_can_pinn_faithful_elasticity(seed, device, n_epochs, lr, technique, grid_size,
+                                        model_name="mlp", tracker=None):
+    """CAN-PINN faithful PyTorch port for 2D linear elasticity (Phase 5 extension).
+
+    Manufactured-solution Navier-Cauchy on [0,1]^2 with Dirichlet BCs from the
+    exact ux/uy. Implements can(cd) for the second-order PDE: plain central FD
+    for the diagonal Laplacians and AD-coupled central difference for the
+    cross-derivative gradient-of-divergence terms (Phase 1 spec §8.2). No
+    convection term — there is nothing to upwind. Mirrors the structural
+    pattern of `train_chebyshev_pinn_elasticity`, including the cosine-anneal
+    LR schedule for late-epoch stability.
+    """
+    g = build_canpinn_grid_data_elasticity(grid_size, device)
+
+    torch.manual_seed(seed)
+    model = make_model(model_name, output_dim=2).to(device)
+
+    if technique == "compile":
+        compiled_model = torch.compile(model, mode='reduce-overhead')
+    else:
+        compiled_model = model
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-5)
+
+    scaler = torch.amp.GradScaler('cuda') if technique == "amp" else None
+    use_amp = technique == "amp"
+
+    xy_int = g['xy_int']
+    xy_bc = g['xy_bc']
+    bc_target = g['bc_target']
+    fx_int = g['fx_int']
+    fy_int = g['fy_int']
+    dx = g['dx']
+    dy = g['dy']
+    lam = g['lam_e']
+    mu = g['mu_e']
+
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    final_loss = float('nan')
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                eq_x, eq_y = pde_residuals_canpinn_elas(
+                    compiled_model, xy_int, dx, dy, fx_int, fy_int, lam=lam, mu=mu)
+                loss_pde = mse(eq_x, torch.zeros_like(eq_x)) + \
+                           mse(eq_y, torch.zeros_like(eq_y))
+                pred_bc = compiled_model(xy_bc)
+                loss_bc = mse(pred_bc, bc_target)
+                loss = loss_pde + loss_bc + model_reg_loss(model)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            eq_x, eq_y = pde_residuals_canpinn_elas(
+                compiled_model, xy_int, dx, dy, fx_int, fy_int, lam=lam, mu=mu)
+            loss_pde = mse(eq_x, torch.zeros_like(eq_x)) + \
+                       mse(eq_y, torch.zeros_like(eq_y))
+            pred_bc = compiled_model(xy_bc)
+            loss_bc = mse(pred_bc, bc_target)
+            loss = loss_pde + loss_bc + model_reg_loss(model)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
 
         final_loss = loss.item()
         if (epoch + 1) % LOG_INTERVAL == 0:
@@ -4287,12 +5190,12 @@ def main():
     is_elasticity = (args.problem == "elasticity")
 
     # Validate problem + method combinations
-    if is_kovasznay and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"):
-        print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint methods, "
+    if is_kovasznay and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint", "can-pinn-faithful"):
+        print(f"ERROR: Kovasznay problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint, can-pinn-faithful methods, "
               f"not '{args.method}'")
         sys.exit(1)
-    if is_elasticity and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint"):
-        print(f"ERROR: Elasticity problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint methods, "
+    if is_elasticity and args.method not in ("sage", "dtpinn", "chebyshev-pinn", "autodiff", "ropinn", "sk-pinn", "jaxpinn", "sage-jax", "bfsa", "sdccg", "slrm", "slrm-jax", "stencil-adjoint", "can-pinn-faithful"):
+        print(f"ERROR: Elasticity problem only supports sage, dtpinn, autodiff, ropinn, sk-pinn, jaxpinn, sage-jax, slrm, slrm-jax, stencil-adjoint, can-pinn-faithful methods, "
               f"not '{args.method}'")
         sys.exit(1)
     if args.method == "slrm-jax" and args.model not in ("mlp", "pirate-net"):
@@ -4340,11 +5243,19 @@ def main():
         if is_kovasznay:
             if args.method == 'sk-pinn':
                 args.grid_size = 150
+            elif args.method == 'can-pinn-faithful':
+                # Uniform grid for the FD stencil. 51 -> dx=Lx/50=0.03,
+                # dy=Ly/50=0.04 on the [-0.5, 1.0] x [-0.5, 1.5] domain.
+                args.grid_size = 51
             else:
                 args.grid_size = 30
         elif is_elasticity:
             if args.method == 'sk-pinn':
                 args.grid_size = 100
+            elif args.method == 'can-pinn-faithful':
+                # Uniform grid for the FD stencil. 51 -> dx=dy=0.02 on [0,1]^2,
+                # matching the paper's cavity stencil-spacing convention.
+                args.grid_size = 51
             else:
                 args.grid_size = 30
         else:
@@ -4353,6 +5264,7 @@ def main():
                 'ropinn': 50, 'pielm': 50, 'sk-pinn': 200, 'sage': 50,
                 'jaxpinn': 50, 'sage-jax': 50, 'bfsa': 50, 'sdccg': 50, 'slrm': 50, 'slrm-jax': 50,
                 'stencil-adjoint': 50,
+                'can-pinn-faithful': 50,
             }
             args.grid_size = method_defaults[args.method]
 
@@ -4476,6 +5388,10 @@ def main():
                 model, train_time, final_loss = train_stencil_adjoint_elasticity(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
+            elif args.method == "can-pinn-faithful":
+                model, train_time, final_loss = train_can_pinn_faithful_elasticity(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
             n_params = sum(p.numel() for p in model.parameters())
         elif is_kovasznay:
             # Kovasznay problem dispatch
@@ -4533,6 +5449,10 @@ def main():
                     args.seed, device, args.epochs, args.lr, args.grid_size, args.model)
             elif args.method == "stencil-adjoint":
                 model, train_time, final_loss = train_stencil_adjoint_kovasznay(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+            elif args.method == "can-pinn-faithful":
+                model, train_time, final_loss = train_can_pinn_faithful_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
             n_params = sum(p.numel() for p in model.parameters())
@@ -4626,6 +5546,12 @@ def main():
 
             elif args.method == "stencil-adjoint":
                 model, train_time, final_loss = train_stencil_adjoint(
+                    args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
+                    args.model, tracker=tracker)
+                n_params = sum(p.numel() for p in model.parameters())
+
+            elif args.method == "can-pinn-faithful":
+                model, train_time, final_loss = train_can_pinn_faithful(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
                     args.model, tracker=tracker)
                 n_params = sum(p.numel() for p in model.parameters())

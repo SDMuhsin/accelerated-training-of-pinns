@@ -36,6 +36,7 @@ OUTPUT_DIR = Path('llmdocs/stream_sage_paper/paper/v2_tetci')
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TAG = 'multiseed_20260427'
+CANPINN_TAG = 'canpinn_hpc_20260428'
 
 # Panels: (problem, model, title) -- one per PDE problem to cover the full
 # accuracy-speed envelope; elasticity-MLP is the cell where DT-PINN's
@@ -53,15 +54,17 @@ ANNOT_OFFSETS = [(12, 28), (12, 28), (12, 28)]
 
 # Wong colorblind-safe palette (consistent with Fig 1)
 METHOD_CFG = {
-    'sage':       {'label': 'SAGE (Ours)', 'color': '#0072B2', 'marker': '*',  'ms': 220, 'zorder': 10},
-    'autodiff':   {'label': 'Autodiff',    'color': '#E69F00', 'marker': 'o',  'ms': 50,  'zorder': 5},
-    'dtpinn':     {'label': 'DT-PINN',     'color': '#009E73', 'marker': 's',  'ms': 50,  'zorder': 5},
-    'ropinn':     {'label': 'RoPINN',      'color': '#888888', 'marker': '^',  'ms': 55,  'zorder': 5},
-    'sk-pinn':    {'label': 'SK-PINN',     'color': '#D55E00', 'marker': 'X',  'ms': 50,  'zorder': 5},
+    'sage':           {'label': 'SAGE (Ours)', 'color': '#0072B2', 'marker': '*',  'ms': 220, 'zorder': 10},
+    'autodiff':       {'label': 'Autodiff',    'color': '#E69F00', 'marker': 'o',  'ms': 50,  'zorder': 5},
+    'dtpinn':         {'label': 'DT-PINN',     'color': '#009E73', 'marker': 's',  'ms': 50,  'zorder': 5},
+    'chebyshev-pinn': {'label': 'Spectral-AD', 'color': '#CC79A7', 'marker': 'D',  'ms': 50,  'zorder': 8},
+    'ropinn':         {'label': 'RoPINN',      'color': '#888888', 'marker': '^',  'ms': 55,  'zorder': 5},
+    'sk-pinn':        {'label': 'SK-PINN',     'color': '#D55E00', 'marker': 'X',  'ms': 50,  'zorder': 5},
 }
 
-# Legend ordering (SAGE first, then baselines by speed)
-DISPLAY_ORDER = ['sage', 'autodiff', 'dtpinn', 'ropinn', 'sk-pinn']
+# Legend ordering (SAGE first, then CAN-PINN as the headline-isolation baseline,
+# then the other gradient methods)
+DISPLAY_ORDER = ['sage', 'chebyshev-pinn', 'autodiff', 'dtpinn', 'ropinn', 'sk-pinn']
 
 
 # ============================================================================
@@ -93,8 +96,14 @@ def aggregate_means(df, problem, model):
 
 
 def make_figure():
-    df = pd.read_csv(RESULTS_CSV)
-    df = df[df['tag'] == TAG].copy()
+    df_all = pd.read_csv(RESULTS_CSV)
+    # CAN-PINN rows live under a different tag (canpinn_hpc_20260428); the
+    # other five baselines and SAGE live under multiseed_20260427.  We read
+    # both tag groups and concatenate so the headline isolation against
+    # CAN-PINN appears on every panel.
+    df_main = df_all[df_all['tag'] == TAG].copy()
+    df_canpinn = df_all[df_all['tag'] == CANPINN_TAG].copy()
+    df = pd.concat([df_main, df_canpinn], ignore_index=True)
 
     # Global style (matches convergence figure)
     plt.rcParams.update({
@@ -139,22 +148,22 @@ def make_figure():
             if method not in legend_handles:
                 legend_handles[method] = h
 
-        # Speedup annotation (SAGE vs Autodiff)
+        # Speedup annotation (SAGE vs Spectral-AD = matched-protocol headline)
         sage_r = agg[agg['method'] == 'sage']
-        auto_r = agg[agg['method'] == 'autodiff']
+        spad_r = agg[agg['method'] == 'chebyshev-pinn']
         dt_r = agg[agg['method'] == 'dtpinn']
-        if not sage_r.empty and not auto_r.empty:
+        if not sage_r.empty and not spad_r.empty:
             sage_t = sage_r['train_time_min'].values[0]
-            auto_t = auto_r['train_time_min'].values[0]
-            speedup = auto_t / sage_t
+            spad_t = spad_r['train_time_min'].values[0]
+            speedup = spad_t / sage_t
             sage_pde = sage_r['pde_rms'].values[0]
             ox, oy = ANNOT_OFFSETS[i]
             ax.annotate(
-                f'{speedup:.1f}×',
+                f'{speedup:.1f}× vs.\nSpectral-AD',
                 xy=(sage_t, sage_pde),
                 xytext=(ox, oy),
                 textcoords='offset points',
-                fontsize=8.5, color='#0072B2', fontweight='bold',
+                fontsize=8.0, color='#0072B2', fontweight='bold',
                 ha='center', va='bottom',
                 arrowprops=dict(
                     arrowstyle='->', color='#0072B2', lw=0.8,
