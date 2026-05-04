@@ -157,14 +157,20 @@ def parse_args():
                              "--method dtpinn. Default: ~grid_size² to keep the "
                              "node count comparable to the Chebyshev baseline.")
     parser.add_argument("--match-protocol", action="store_true",
-                        help="(SK-PINN only) drop weight decay, drop SK-PINN-specific "
-                             "schedulers, and use the Chebyshev-paired uniform grid "
+                        help="(SK-PINN, DT-PINN) drop method-specific protocol "
+                             "knobs and run on the Chebyshev-paired uniform grid "
                              "(N=50 cavity / N=30 kovasznay / N=30 elasticity) so the "
-                             "SK-PINN row is apples-to-apples with the rest of the "
+                             "row is apples-to-apples with the rest of the "
                              "matched-protocol baselines (autodiff, sage, "
-                             "chebyshev-pinn, can-pinn-faithful). Tag the run "
-                             "explicitly (e.g., --tag=sk_pinn_matched_<date>) to keep "
-                             "results separable from the historical sk-pinn rows.")
+                             "chebyshev-pinn, can-pinn-faithful). For sk-pinn this "
+                             "drops weight decay and the elasticity cosine scheduler. "
+                             "For dtpinn this skips the paper-faithful four-flag "
+                             "override (Adam-only, fp32, no L-BFGS, no auto-restart) "
+                             "while keeping the RBF-FD operators (the method's "
+                             "distinguishing feature). Tag the run explicitly "
+                             "(e.g., --tag=sk_pinn_matched_<date> or "
+                             "--tag=dtpinn_matched_<date>) to keep results separable "
+                             "from the historical/faithful rows.")
     return parser.parse_args()
 
 
@@ -2539,6 +2545,7 @@ def _dtpinn_train_loop(
     num_nodes,
     optimizer_kind,
     tracker,
+    match_protocol=False,
 ):
     """Common training loop shared by the three problem-specific train_dtpinn_*.
 
@@ -2550,6 +2557,14 @@ def _dtpinn_train_loop(
     paper-specific to its disk-Poisson scale (init ≈ 100) and misfires on PDEs
     with different residual magnitudes (e.g., elasticity init ≈ 2000 with the
     Q_e=4 manufactured solution).
+
+    When ``match_protocol`` is True, the auto-restart wrapper is disabled so
+    the run is apples-to-apples with the other matched-protocol comparators
+    (autodiff / sage / chebyshev-pinn / can-pinn-faithful / sk-pinn-matched),
+    none of which use a halve-lr-and-retry harness. RBF-FD operators are kept
+    (the method's distinguishing feature). In matched mode the caller passes
+    optimizer_kind='adam' / dtype=fp32 / lr=1e-3 / n_epochs=30000 to mirror
+    the rest of the matched-protocol baselines.
     """
     if num_nodes is None:
         num_nodes = _dtpinn_default_num_nodes(grid_size)
@@ -2699,9 +2714,13 @@ def _dtpinn_train_loop(
 
             # Paper-faithful auto-restart check (lbfgs only; Adam doesn't need
             # it). If still stuck near / above initial loss at any checkpoint,
-            # abort and retry with halved lr.
+            # abort and retry with halved lr. Also disabled in match_protocol
+            # mode (defensive — matched mode is Adam in practice, but this
+            # makes the apples-to-apples intent explicit).
             triggered = False
-            if optimizer_kind == 'lbfgs' and retry_attempts < MAX_RETRIES:
+            if (optimizer_kind == 'lbfgs'
+                    and retry_attempts < MAX_RETRIES
+                    and not match_protocol):
                 for check_epoch, max_ratio in ABORT_CHECKS:
                     if epoch == check_epoch:
                         threshold = max_ratio * initial_loss
@@ -2739,44 +2758,57 @@ def _dtpinn_train_loop(
 def train_dtpinn(seed, device, n_epochs, lr, technique, grid_size, model_name="mlp",
                   grid_data=None, tracker=None, *,
                   dtype='fp64', rbf_fd_order=4, num_nodes=None,
-                  optimizer_kind='lbfgs'):
+                  optimizer_kind='lbfgs', match_protocol=False):
     """Faithful DT-PINN (Sharma & Shankar 2022) for the lid-driven cavity.
 
     RBF-FD spatial derivatives + fp64 + L-BFGS with strong-Wolfe line search.
     `grid_data` is ignored (kept for signature compatibility with the
     previous Chebyshev variant); operators are always built from scratch.
+
+    When ``match_protocol`` is True, the auto-restart wrapper is disabled and
+    the caller is expected to pass Adam-only / fp32 / lr=1e-3 / n_epochs=30000
+    so the row is apples-to-apples with the other matched-protocol baselines.
     """
     torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
     return _dtpinn_train_loop(
         'cavity', seed, device, n_epochs, lr, grid_size, model_name,
         dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
         optimizer_kind=optimizer_kind, tracker=tracker,
+        match_protocol=match_protocol,
     )
 
 
 def train_dtpinn_kovasznay(seed, device, n_epochs, lr, technique, grid_size,
                             model_name="mlp", tracker=None, *,
                             dtype='fp64', rbf_fd_order=4, num_nodes=None,
-                            optimizer_kind='lbfgs'):
-    """Faithful DT-PINN for steady Kovasznay flow."""
+                            optimizer_kind='lbfgs', match_protocol=False):
+    """Faithful DT-PINN for steady Kovasznay flow.
+
+    See ``train_dtpinn`` for the matched-protocol semantics.
+    """
     torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
     return _dtpinn_train_loop(
         'kovasznay', seed, device, n_epochs, lr, grid_size, model_name,
         dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
         optimizer_kind=optimizer_kind, tracker=tracker,
+        match_protocol=match_protocol,
     )
 
 
 def train_dtpinn_elasticity(seed, device, n_epochs, lr, technique, grid_size,
                              model_name="mlp", tracker=None, *,
                              dtype='fp64', rbf_fd_order=4, num_nodes=None,
-                             optimizer_kind='lbfgs'):
-    """Faithful DT-PINN for 2D linear elasticity (manufactured solution)."""
+                             optimizer_kind='lbfgs', match_protocol=False):
+    """Faithful DT-PINN for 2D linear elasticity (manufactured solution).
+
+    See ``train_dtpinn`` for the matched-protocol semantics.
+    """
     torch_dtype = torch.float64 if dtype == 'fp64' else torch.float32
     return _dtpinn_train_loop(
         'elasticity', seed, device, n_epochs, lr, grid_size, model_name,
         dtype=torch_dtype, rbf_fd_order=rbf_fd_order, num_nodes=num_nodes,
         optimizer_kind=optimizer_kind, tracker=tracker,
+        match_protocol=match_protocol,
     )
 
 
@@ -5256,7 +5288,13 @@ def main():
     def _arg_passed(name: str) -> bool:
         return any(a == name or a.startswith(name + '=') for a in sys.argv)
 
-    if args.method == "dtpinn":
+    # Skip the paper-faithful overrides when --match-protocol is set so the
+    # matched-DT-PINN row uses Adam-only / fp32 / lr=1e-3 / n_epochs from the
+    # Adam defaults (i.e., the same protocol the rest of the matched-protocol
+    # comparators run on). The matched-protocol caller is expected to pass
+    # those four flags explicitly; this guard is defensive against partial
+    # passes from interactive smoke tests.
+    if args.method == "dtpinn" and not args.match_protocol:
         if not _arg_passed("--optimizer"):
             args.optimizer = "lbfgs"
         if not _arg_passed("--dtype"):
@@ -5300,7 +5338,11 @@ def main():
             }
             args.grid_size = method_defaults[args.method]
             # Cavity matched-protocol override for sk-pinn: use Chebyshev-paired
-            # uniform grid (N=50) instead of the paper-faithful N=200.
+            # uniform grid (N=50) instead of the paper-faithful N=200. For
+            # dtpinn the default is already N=50 (the Chebyshev-paired count),
+            # so --match-protocol is a no-op on the cavity grid; the matched-
+            # protocol semantics for dtpinn live in the trainer (no L-BFGS,
+            # no auto-restart) and the four-flag override skip above.
             if args.method == 'sk-pinn' and args.match_protocol:
                 args.grid_size = 50
 
@@ -5314,7 +5356,13 @@ def main():
     print(f"UNIFIED BENCHMARK: {problem_label}")
     print("=" * 70)
     print(f"Problem:   {args.problem}")
-    print(f"Method:    {args.method}{' (matched protocol: wd=0, no LR scheduler, paired grid)' if (args.method == 'sk-pinn' and args.match_protocol) else ''}")
+    if args.method == 'sk-pinn' and args.match_protocol:
+        method_suffix = ' (matched protocol: wd=0, no LR scheduler, paired grid)'
+    elif args.method == 'dtpinn' and args.match_protocol:
+        method_suffix = ' (matched protocol: Adam-only, fp32, no auto-restart, RBF-FD kept)'
+    else:
+        method_suffix = ''
+    print(f"Method:    {args.method}{method_suffix}")
     print(f"Model:     {args.model}")
     print(f"Optimizer: {args.optimizer}")
     print(f"LR:        {args.lr}")
@@ -5378,7 +5426,8 @@ def main():
                     args.model, tracker=tracker,
                     dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
                     num_nodes=args.num_nodes,
-                    optimizer_kind=args.optimizer)
+                    optimizer_kind=args.optimizer,
+                    match_protocol=args.match_protocol)
             elif args.method == "chebyshev-pinn":
                 model, train_time, final_loss = train_chebyshev_pinn_elasticity(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
@@ -5442,7 +5491,8 @@ def main():
                     args.model, tracker=tracker,
                     dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
                     num_nodes=args.num_nodes,
-                    optimizer_kind=args.optimizer)
+                    optimizer_kind=args.optimizer,
+                    match_protocol=args.match_protocol)
             elif args.method == "chebyshev-pinn":
                 model, train_time, final_loss = train_chebyshev_pinn_kovasznay(
                     args.seed, device, args.epochs, args.lr, args.technique, args.grid_size,
@@ -5508,7 +5558,8 @@ def main():
                     args.model, tracker=tracker,
                     dtype=args.dtype, rbf_fd_order=args.rbf_fd_order,
                     num_nodes=args.num_nodes,
-                    optimizer_kind=args.optimizer)
+                    optimizer_kind=args.optimizer,
+                    match_protocol=args.match_protocol)
                 n_params = sum(p.numel() for p in model.parameters())
 
             elif args.method == "chebyshev-pinn":

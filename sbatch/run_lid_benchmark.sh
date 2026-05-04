@@ -3,6 +3,17 @@
 # PINN Benchmark Suite - SLURM Submission Script
 # ============================================================================
 #
+# 2026-05-04 ACTIVE CONFIGURATION: Matched-Protocol DT-PINN sweep.
+#   45 jobs = 3 problems x 1 method (dtpinn) x 3 models x 5 seeds, run with
+#   --match-protocol so the dtpinn row in tab:main_results becomes apples-to-
+#   apples with the rest of the matched-protocol baselines (Adam-only / fp32
+#   / lr=1e-3 / 30K iter / no auto-restart). RBF-FD operators stay (the
+#   method's distinguishing feature). The faithful DT-PINN values from the
+#   multiseed_20260427 sweep are preserved on disk and will move to an
+#   appendix table after the matched results land. Default tag:
+#   dtpinn_matched_<date>. Set MATCH_PROTOCOL_DTPINN=0 below to revert to the
+#   paper-faithful DT-PINN configuration (L-BFGS+fp64+5K+lr=0.04+auto-restart).
+#
 # Submits PINN benchmark jobs to SLURM for two PDE problems:
 #   1. Lid-Driven Cavity (NS+Smagorinsky, Re=1000)
 #   2. Kovasznay Flow (constant-viscosity NS, Re=40)
@@ -104,29 +115,45 @@ fi
 
 # Cavity training methods (gradient-based, GPU required)
 # These support all three models via --model flag.
-# 2026-04-28: All non-CAN-PINN baselines disabled — this submission run
-# exists to gather H100-MIG-2g.20gb numbers for the chebyshev-pinn baseline
-# (CAN-PINN) so the Table III double-dagger A40 footnote can be retired.
-# Re-enable the others by uncommenting; do not delete.
+# 2026-05-04: Matched-protocol DT-PINN sweep — only `dtpinn` enabled,
+# combined with --match-protocol below to swap the historical paper-faithful
+# DT-PINN row in tab:main_results for an apples-to-apples Adam-only / fp32 /
+# matched-grid row. RBF-FD operators stay (the method's distinguishing
+# feature). The faithful DT-PINN values from the multiseed_20260427 sweep
+# are preserved on disk and will move to an appendix table.
+# 2026-04-28: previously CAN-PINN-only (chebyshev-pinn) for the H100-MIG
+# 2g.20gb baseline migration. Re-enable the others by uncommenting; do not
+# delete.
 cavity_methods=(
     # autodiff
-    # dtpinn
+    dtpinn
     # sage
     # ropinn
     # sk-pinn
-    chebyshev-pinn
+    # chebyshev-pinn
 )
 
 # Kovasznay training methods (gradient-based, GPU required)
 # No analytical or pielm for Kovasznay.
-# 2026-04-28: CAN-PINN-only run (see cavity_methods comment above).
+# 2026-05-04: Matched-protocol DT-PINN sweep (see cavity_methods comment).
 kovasznay_methods=(
     # autodiff
-    # dtpinn
+    dtpinn
     # sage
     # ropinn
     # sk-pinn
-    chebyshev-pinn
+    # chebyshev-pinn
+)
+
+# Elasticity training methods (gradient-based, GPU required)
+# 2026-05-04: Matched-protocol DT-PINN sweep (see cavity_methods comment).
+elasticity_methods=(
+    # autodiff
+    dtpinn
+    # sage
+    # ropinn
+    # sk-pinn
+    # chebyshev-pinn
 )
 
 # Network architectures to benchmark
@@ -176,24 +203,49 @@ DTPINN_OPTIMIZER="lbfgs"
 DTPINN_DTYPE="fp64"
 
 TECHNIQUE="none"
-# 2026-04-28: default tag changed for CAN-PINN-only HPC run.  The previous
-# default (multiseed_$(date +%Y%m%d)) collides with the H100-MIG paper sweep
-# already in results/lid_benchmark_results.csv; canpinn_hpc_<date>
-# distinguishes this run from both that sweep and the A40 cycle-4 baseline
-# (tag: canpinn_cycle4_20260427).  Override with --tag to restore.
-TAG="${TAG_OVERRIDE:-canpinn_hpc_$(date +%Y%m%d)}"
+# 2026-05-04: default tag changed for matched-protocol DT-PINN sweep.
+# `dtpinn_matched_<date>` distinguishes this run from the paper-faithful
+# `multiseed_20260427` DT-PINN rows (which use L-BFGS+fp64+5K+lr=0.04 +
+# auto-restart). Override with --tag to restore.
+# Previous defaults: canpinn_hpc_<date> (2026-04-28 chebyshev-pinn HPC re-run);
+# multiseed_<date> (2026-04-27 paper-quality sweep).
+TAG="${TAG_OVERRIDE:-dtpinn_matched_$(date +%Y%m%d)}"
 TRACK_INTERVAL=100
+
+# Matched-protocol DT-PINN sweep flag. When 1, --method dtpinn is run with
+# Adam / fp32 / lr=1e-3 / 30K iter / --match-protocol so the row is apples-
+# to-apples with the rest of the matched-protocol baselines (autodiff /
+# sage / chebyshev-pinn / can-pinn-faithful / sk-pinn-matched). When 0
+# (the historical default), --method dtpinn uses the paper-faithful
+# DTPINN_* defaults below.
+MATCH_PROTOCOL_DTPINN=1
 
 # Helper: emit the four method-specific hyperparameter flags as a single
 # string ready to splice into the python invocation.  Adam-trained methods
 # get $OPTIMIZER/$LR/$EPOCHS/$DTYPE; --method dtpinn gets the paper-faithful
-# DTPINN_* values.  Use as: $(method_hparams "$method")
+# DTPINN_* values UNLESS MATCH_PROTOCOL_DTPINN=1 (then dtpinn also takes the
+# matched-protocol Adam values). Use as: $(method_hparams "$method")
 method_hparams() {
     local m="$1"
-    if [[ "$m" == "dtpinn" ]]; then
+    if [[ "$m" == "dtpinn" && "$MATCH_PROTOCOL_DTPINN" != "1" ]]; then
         echo "--optimizer=$DTPINN_OPTIMIZER --lr=$DTPINN_LR --epochs=$DTPINN_EPOCHS --dtype=$DTPINN_DTYPE"
     else
         echo "--optimizer=$OPTIMIZER --lr=$LR --epochs=$EPOCHS --dtype=$DTYPE"
+    fi
+}
+
+# Helper: emit --match-protocol if the method uses it under the current
+# sweep configuration. dtpinn under the matched-protocol sweep does; the
+# historical sk-pinn workflow has its own dedicated sbatch script
+# (run_sk_pinn_matched.sh), so --match-protocol from this script is dtpinn-
+# specific. Other methods (autodiff/sage/ropinn/chebyshev-pinn/etc.)
+# receive an empty string. Use as: $(method_extra_flags "$method")
+method_extra_flags() {
+    local m="$1"
+    if [[ "$m" == "dtpinn" && "$MATCH_PROTOCOL_DTPINN" == "1" ]]; then
+        echo "--match-protocol"
+    else
+        echo ""
     fi
 }
 
@@ -270,12 +322,18 @@ echo "========================================================================"
 echo "PINN BENCHMARK: SLURM Job Submission"
 echo "========================================================================"
 echo ""
+if [[ "$MATCH_PROTOCOL_DTPINN" == "1" ]]; then
+    echo "Mode:              matched-protocol DT-PINN sweep (--match-protocol)"
+fi
 echo "Cavity methods:    ${cavity_methods[*]}   (pielm disabled 2026-04-28)"
 echo "Kovasznay methods: ${kovasznay_methods[*]}"
+echo "Elasticity methods:${elasticity_methods[*]}"
 echo "Models:            ${models[*]}"
 echo "Seeds:             ${seeds[*]} (${#seeds[@]} seeds)"
-echo "Epochs:            $EPOCHS"
-echo "LR:                $LR"
+echo "Epochs:            $EPOCHS  (matched-protocol Adam: $OPTIMIZER, lr=$LR, $DTYPE)"
+if [[ "$MATCH_PROTOCOL_DTPINN" != "1" ]]; then
+    echo "Faithful DT-PINN:  $DTPINN_OPTIMIZER, lr=$DTPINN_LR, epochs=$DTPINN_EPOCHS, $DTPINN_DTYPE"
+fi
 echo "Tag:               $TAG"
 echo "Output:            $OUTPUT_CSV"
 if [[ -n "$ACCOUNT" ]]; then
@@ -334,6 +392,7 @@ for method in "${cavity_methods[@]}"; do
                         --method=$method \
                         --model=$model \
                         $(method_hparams "$method") \
+                        $(method_extra_flags "$method") \
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
@@ -458,6 +517,7 @@ for method in "${kovasznay_methods[@]}"; do
                         --method=$method \
                         --model=$model \
                         $(method_hparams "$method") \
+                        $(method_extra_flags "$method") \
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
@@ -482,16 +542,9 @@ done
 #   Chebyshev methods (autodiff, dtpinn, sage, ropinn): N=30
 #   SK-PINN: N=100 (sparse RKPM)
 
-# Elasticity training methods
-# 2026-04-28: CAN-PINN-only run (see cavity_methods comment above).
-elasticity_methods=(
-    # autodiff
-    # dtpinn
-    # sage
-    # ropinn
-    # sk-pinn
-    chebyshev-pinn
-)
+# elasticity_methods declaration moved to the top configuration block (next
+# to cavity_methods / kovasznay_methods) so the run-time summary can echo
+# all three method lists before the submission loops start.
 
 echo ""
 echo "=============================================="
@@ -534,6 +587,7 @@ for method in "${elasticity_methods[@]}"; do
                         --method=$method \
                         --model=$model \
                         $(method_hparams "$method") \
+                        $(method_extra_flags "$method") \
                         --seed=$seed \
                         --technique=$TECHNIQUE \
                         --output-csv=$OUTPUT_CSV \
