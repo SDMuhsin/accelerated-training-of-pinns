@@ -2,21 +2,15 @@
 """
 Generate accuracy-vs-speed Pareto frontier figures for the SAGE paper.
 
-Three-panel scatter plot, one per PDE problem, chosen so each axis stress
-is visible: (a) cavity-PirateNet shows SAGE's largest wall-clock win
-(18.8x); (b) Kovasznay-MLP shows the regime where DT-PINN's L-BFGS+fp64
-beats SAGE-Adam-fp32 on residual; (c) elasticity-MLP shows DT-PINN's
-largest residual lead (3.5x), the worst case for SAGE's accuracy.  The
-DT-PINN annotation calls out its lower residual where it exists.
+Three-panel scatter plot, one per PDE problem.  Points are per-seed
+medians across the five paper seeds {0, 1, 7, 23, 42}.  DT-PINN points
+use the matched-protocol rows (dtpinn_matched_20260504), matching the
+headline Table III row.
 
-  (a) Cavity      PirateNet:    SAGE 18.8x faster than Autodiff
-  (b) Kovasznay   MLP:          DT-PINN 1.6x lower residual; SAGE 7.0x faster
-  (c) Elasticity  MLP (n=4):    DT-PINN 3.5x lower residual; SAGE 8.0x faster
-
-Data source: results/lid_benchmark_results.csv filtered to
-tag == 'multiseed_20260427' (5 seeds {0, 1, 7, 23, 42}); points are seed
-means.  Elasticity-MLP DT-PINN excludes seed 0 per Table III's $^\dagger$
-exclusion rule (PDE RMS > 5x median of remaining seeds).
+Data sources (per method):
+  - sage / autodiff / ropinn / sk-pinn:  multiseed_20260427
+  - chebyshev-pinn (Spectral-AD):        canpinn_hpc_20260428
+  - dtpinn:                              dtpinn_matched_20260504
 
 Output: llmdocs/stream_sage_paper/paper/v2_tetci/fig_pareto_frontiers.pdf
 """
@@ -37,6 +31,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TAG = 'multiseed_20260427'
 CANPINN_TAG = 'canpinn_hpc_20260428'
+DTPINN_MATCHED_TAG = 'dtpinn_matched_20260504'
 
 # Panels: (problem, model, title) -- one per PDE problem to cover the full
 # accuracy-speed envelope; elasticity-MLP is the cell where DT-PINN's
@@ -72,10 +67,10 @@ DISPLAY_ORDER = ['sage', 'chebyshev-pinn', 'autodiff', 'dtpinn', 'ropinn', 'sk-p
 # ============================================================================
 
 def aggregate_means(df, problem, model):
-    """Return seed-mean (train_time_min, pde_rms) per method.
+    """Return seed-median (train_time_min, pde_rms) per method.
 
-    For elasticity-MLP/-PirateNet under DT-PINN, exclude seed 0 (n=4)
-    matching the Table III dagger convention.
+    DT-PINN points use the matched-protocol rows (Adam, fp32, $N=50/30/30$),
+    matching the headline Table III row.
     """
     sub = df[(df['problem'] == problem) & (df['model'] == model)]
     rows = []
@@ -83,14 +78,10 @@ def aggregate_means(df, problem, model):
         g = sub[sub['method'] == method]
         if g.empty:
             continue
-        # Apply n=4 dagger filter for the elasticity DT-PINN cells.
-        if (problem == 'elasticity' and method == 'dtpinn'
-                and model in ('mlp', 'pirate-net')):
-            g = g[g['seed'] != 0]
         rows.append({
             'method': method,
-            'train_time_min': g['train_time_min'].mean(),
-            'pde_rms': g['pde_rms'].mean(),
+            'train_time_min': g['train_time_min'].median(),
+            'pde_rms': g['pde_rms'].median(),
         })
     return pd.DataFrame(rows)
 
@@ -103,7 +94,9 @@ def make_figure():
     # CAN-PINN appears on every panel.
     df_main = df_all[df_all['tag'] == TAG].copy()
     df_canpinn = df_all[df_all['tag'] == CANPINN_TAG].copy()
-    df = pd.concat([df_main, df_canpinn], ignore_index=True)
+    df_dtpinn_matched = df_all[df_all['tag'] == DTPINN_MATCHED_TAG].copy()
+    df_main = df_main[df_main['method'] != 'dtpinn']
+    df = pd.concat([df_main, df_canpinn, df_dtpinn_matched], ignore_index=True)
 
     # Global style (matches convergence figure)
     plt.rcParams.update({

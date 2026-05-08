@@ -24,3 +24,8 @@ jax>=0.6
 jaxlib>=0.6
 flax>=0.10
 optax>=0.2
+
+# TGV Phase 3 — SOAP optimizer (Vyas et al. 2024, arXiv:2409.11321).
+# The reference PyTorch implementation at https://github.com/nikhilvyas/SOAP
+# is not pip-installable as of 2026-05-07; the file is vendored verbatim
+# at src/soap.py under its Apache-2.0 license. No external dep added.

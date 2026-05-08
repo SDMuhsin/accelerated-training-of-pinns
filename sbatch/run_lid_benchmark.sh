@@ -125,8 +125,11 @@ fi
 # 2g.20gb baseline migration. Re-enable the others by uncommenting; do not
 # delete.
 cavity_methods=(
+    # 2026-05-08: 2D sweep disabled for the TGV-only paperscale submission.
+    # The matched-DT-PINN sweep is preserved here in commented form. Restore
+    # by uncommenting `dtpinn` (and any other method desired).
     # autodiff
-    dtpinn
+    # dtpinn
     # sage
     # ropinn
     # sk-pinn
@@ -137,8 +140,9 @@ cavity_methods=(
 # No analytical or pielm for Kovasznay.
 # 2026-05-04: Matched-protocol DT-PINN sweep (see cavity_methods comment).
 kovasznay_methods=(
+    # 2026-05-08: 2D sweep disabled for the TGV-only paperscale submission.
     # autodiff
-    dtpinn
+    # dtpinn
     # sage
     # ropinn
     # sk-pinn
@@ -148,8 +152,9 @@ kovasznay_methods=(
 # Elasticity training methods (gradient-based, GPU required)
 # 2026-05-04: Matched-protocol DT-PINN sweep (see cavity_methods comment).
 elasticity_methods=(
+    # 2026-05-08: 2D sweep disabled for the TGV-only paperscale submission.
     # autodiff
-    dtpinn
+    # dtpinn
     # sage
     # ropinn
     # sk-pinn
@@ -161,6 +166,47 @@ models=(
     mlp
     tsa-pinn
     pirate-net
+)
+
+# 2026-05-08: TGV Phase 3 paperscale integration. The 3D Taylor-Green vortex
+# benchmark lives in src/taylor_green_benchmark.py (plain PyTorch, no
+# PhysicsNeMo dep) and writes to a SEPARATE CSV (`results/tgv_phase3_results.csv`)
+# because its schema differs from src/lid_benchmark.py's 2D-result schema
+# (TKE trajectory, LES knobs, causal-loss knobs, multi-window training, etc.
+# vs the 2D's pde_rms/best_epoch/ms_per_epoch).
+#
+# Currently src/taylor_green_benchmark.py supports:
+#   methods: autodiff
+#   models : mlp, pirate-net
+#
+# DT-PINN, SAGE, CAN-PINN, RoPINN, SK-PINN, and the tsa-pinn architecture
+# are NOT YET implemented for 3D periodic Navier-Stokes — adding them is a
+# separate, multi-day task per method (RBF-FD on a 3D periodic grid for
+# DT-PINN, SAGE wiring for the 3D NS residual + Smagorinsky LES, Chiu et al.
+# Taylor-expansion stencils in 3D for CAN-PINN, etc.). When those are added
+# to src/taylor_green_benchmark.py, simply append to tgv_methods / tgv_models
+# below and the existing loop submits them.
+tgv_methods=(
+    autodiff
+    # dtpinn               # not implemented for 3D periodic NS yet
+    # sage                 # not implemented for 3D periodic NS yet
+    # can-pinn-faithful    # not implemented for 3D periodic NS yet
+    # ropinn               # not implemented for 3D periodic NS yet
+    # sk-pinn              # not implemented for 3D periodic NS yet
+)
+tgv_models=(
+    mlp
+    pirate-net
+    # tsa-pinn             # not implemented in src/taylor_green_benchmark.py yet
+)
+# Seed list for TGV is intentionally smaller than the 2D seeds (paperscale
+# is a 24h job; n=1 lands the headline row first, multi-seed can follow).
+tgv_seeds=(
+    0
+    # 1
+    # 7
+    # 23
+    # 42
 )
 
 # Random seeds for statistical significance.
@@ -252,6 +298,30 @@ method_extra_flags() {
 # Output CSV (shared across all jobs, concurrent-safe via fcntl locking)
 OUTPUT_CSV="${OUTPUT_CSV_OVERRIDE:-results/lid_benchmark_results.csv}"
 
+# ----------------------------------------------------------------------------
+# TGV Phase 3 paperscale hyperparameters (head-to-head with Wang/Perdikaris
+# 2025, arXiv:2507.08972). All values match the verified Re=500/Re=1600
+# warmup smokes from 2026-05-08 (see llmdocs/trackers/taylor_green_phase3_*.md).
+# ----------------------------------------------------------------------------
+TGV_RE=1600
+TGV_NUM_WINDOWS=11
+TGV_WINDOW_SIZE=1.0
+TGV_EPOCHS_PER_WINDOW=30000
+TGV_BATCH_INTERIOR=2048
+TGV_BATCH_IC=2048
+TGV_EVAL_GRID=32
+TGV_EVAL_TIMES=4
+TGV_LES_CS=0.1
+TGV_PIRATE_NUM_LAYERS=3
+TGV_PIRATE_HIDDEN_DIM=256
+TGV_CAUSAL_EPS=1.0
+TGV_CAUSAL_CHUNKS=16
+TGV_OPTIMIZER=soap
+TGV_LR="1e-3"
+TGV_IC_WEIGHT=100
+TGV_OUTPUT_CSV="${TGV_OUTPUT_CSV_OVERRIDE:-results/tgv_phase3_results.csv}"
+TGV_TAG="${TGV_TAG_OVERRIDE:-tgv_phase3_re${TGV_RE}_$(date +%Y%m%d)}"
+
 # ============================================================================
 # SLURM RESOURCE ALLOCATION
 # ============================================================================
@@ -286,6 +356,18 @@ CPU_TIME="0-04:00:00"
 CPU_MEM="8000M"
 CPU_CPUS=4
 
+# TGV Phase 3 paperscale jobs (GPU). Wall time projection:
+#   2026-05-08 dev-box A40 measured 354 ms/ep at Re=1600 with all four
+#   extensions on (PirateNet + LES + causal + SOAP). Paperscale is
+#   11 windows × 30K ep × 354 ms = ~32 h on A40.
+#   H100 MIG 2g.20gb is ~1.5-1.8x faster than A40 per the existing GPU_TIME
+#   comment, so paperscale on H100 ≈ 18-22 h. Allocate 1 day with a 24-hour
+#   margin → 2 days. SLURM defaults often cap at 7 days; check your cluster.
+TGV_GPU_TIME="2-00:00:00"
+TGV_GPU_TYPE="nvidia_h100_80gb_hbm3_2g.20gb:1"
+TGV_GPU_MEM="24000M"
+TGV_GPU_CPUS=4
+
 # ============================================================================
 # SETUP
 # ============================================================================
@@ -318,6 +400,24 @@ else
     echo "Reusing existing $OUTPUT_CSV ($(wc -l < "$OUTPUT_CSV") lines)."
 fi
 
+# TGV CSV (separate from the 2D lid_benchmark CSV — different schema).
+# This header MUST stay in lockstep with TGV_CSV_COLUMNS at
+# src/taylor_green_benchmark.py:~480. We hardcode it in bash so the sbatch
+# submitter does not need to import the project from a login node.
+TGV_CSV_HEADER='timestamp,method,model,Re,domain_length,num_windows,window_size,epochs_per_window,total_epochs,lr,lr_decay_rate,lr_decay_steps,ic_weight,les_cs,les_delta,les_eps,optimizer,causal_eps,causal_chunks,batch_interior,batch_ic,hidden_dim,num_layers,n_params,seed,tag,wall_time_s,wall_time_min,ms_per_epoch,peak_gpu_memory_mb,final_loss,final_pde_loss,final_ic_loss,nan_windows,tke_t_grid,tke_values,status,device,gpu_name,pytorch_version'
+
+if [[ ${#tgv_methods[@]} -gt 0 ]] && { [[ ! -f "$TGV_OUTPUT_CSV" ]] || [[ ! -s "$TGV_OUTPUT_CSV" ]]; }; then
+    echo "Pre-creating $TGV_OUTPUT_CSV with TGV header row..."
+    mkdir -p "$(dirname "$TGV_OUTPUT_CSV")"
+    if ! printf '%s\n' "$TGV_CSV_HEADER" > "$TGV_OUTPUT_CSV"; then
+        echo "ERROR: failed to write $TGV_OUTPUT_CSV"
+        exit 1
+    fi
+    echo "Wrote TGV header ($(awk -F',' '{print NF; exit}' "$TGV_OUTPUT_CSV") cols) to $TGV_OUTPUT_CSV"
+elif [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo "Reusing existing $TGV_OUTPUT_CSV ($(wc -l < "$TGV_OUTPUT_CSV") lines)."
+fi
+
 echo "========================================================================"
 echo "PINN BENCHMARK: SLURM Job Submission"
 echo "========================================================================"
@@ -331,6 +431,12 @@ echo "Elasticity methods:${elasticity_methods[*]}"
 echo "Models:            ${models[*]}"
 echo "Seeds:             ${seeds[*]} (${#seeds[@]} seeds)"
 echo "Epochs:            $EPOCHS  (matched-protocol Adam: $OPTIMIZER, lr=$LR, $DTYPE)"
+if [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo "TGV methods:       ${tgv_methods[*]}"
+    echo "TGV models:        ${tgv_models[*]}"
+    echo "TGV seeds:         ${tgv_seeds[*]} (${#tgv_seeds[@]} seeds)"
+    echo "TGV config:        Re=$TGV_RE, $TGV_NUM_WINDOWS win x $TGV_EPOCHS_PER_WINDOW ep, $TGV_OPTIMIZER, lr=$TGV_LR, LES cs=$TGV_LES_CS, causal eps=$TGV_CAUSAL_EPS"
+fi
 if [[ "$MATCH_PROTOCOL_DTPINN" != "1" ]]; then
     echo "Faithful DT-PINN:  $DTPINN_OPTIMIZER, lr=$DTPINN_LR, epochs=$DTPINN_EPOCHS, $DTPINN_DTYPE"
 fi
@@ -604,6 +710,102 @@ for method in "${elasticity_methods[@]}"; do
 done
 
 # ============================================================================
+# SECTION 5: TGV (3D TAYLOR-GREEN VORTEX, Re=1600) - GRADIENT-BASED METHODS (GPU)
+# ============================================================================
+# 3D incompressible Navier-Stokes Taylor-Green vortex on [0, 2pi]^3 x [0, 11]
+# with Smagorinsky LES (Cs=0.1, Delta=2pi/64). The Phase 3 recipe combines
+# PirateNet residual architecture, causal training (Wang et al. 2022 Eq. 10
+# form), and the SOAP optimizer (Vyas et al. 2024). Head-to-head reference:
+# Wang/Perdikaris arXiv:2507.08972.
+#
+# This section calls src/taylor_green_benchmark.py — a self-contained plain
+# PyTorch runner (no PhysicsNeMo dep, no shared code with src/lid_benchmark.py).
+# Output rows append to $TGV_OUTPUT_CSV (different schema from $OUTPUT_CSV).
+#
+# NOTE: only method=autodiff and model={mlp, pirate-net} are currently
+# supported by src/taylor_green_benchmark.py. Other methods (DT-PINN, SAGE,
+# CAN-PINN, RoPINN, SK-PINN) and tsa-pinn are 2D-only at present and would
+# require substantive new work in src/taylor_green_benchmark.py for 3D
+# periodic Navier-Stokes. The $tgv_methods / $tgv_models arrays at the top
+# of this file are the single point of extension once those land.
+
+if [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo ""
+    echo "=============================================="
+    echo "Section 5: TGV (3D Taylor-Green) - Gradient-Based Methods (GPU)"
+    echo "=============================================="
+fi
+
+for method in "${tgv_methods[@]}"; do
+    for model in "${tgv_models[@]}"; do
+        for seed in "${tgv_seeds[@]}"; do
+            job_name="tgv_${method}_${model}_s${seed}"
+            log_file="./logs/${job_name}"
+
+            # Phase 3 paperscale uses the Wang/Perdikaris (2025) recipe:
+            # PirateNet (3 layers, hidden 256) + causal loss (eps=1.0,
+            # chunks=16) + SOAP optimizer + Smagorinsky LES (cs=0.1).
+            # The MLP variant in this sweep is the same recipe minus
+            # PirateNet — useful as an ablation row.
+            echo "Submitting: $job_name"
+            sbatch \
+                $ACCOUNT_FLAG \
+                --nodes=1 \
+                --ntasks-per-node=1 \
+                --cpus-per-task=$TGV_GPU_CPUS \
+                --gpus=$TGV_GPU_TYPE \
+                --mem=$TGV_GPU_MEM \
+                --time=$TGV_GPU_TIME \
+                --job-name=$job_name \
+                --output=${log_file}-%N-%j.out \
+                --error=${log_file}-%N-%j.err \
+                --wrap="
+                    module load scipy-stack cuda cudnn
+                    module load arrow
+                    source ./env/bin/activate
+                    echo '========================================'
+                    echo 'Job: $job_name'
+                    echo 'Problem: tgv (3D Taylor-Green vortex)'
+                    echo 'Method: $method'
+                    echo 'Model: $model'
+                    echo 'Re: $TGV_RE'
+                    echo 'Seed: $seed'
+                    echo 'Tag: $TGV_TAG'
+                    echo 'Started: '\$(date)
+                    echo '========================================'
+                    nvidia-smi
+                    python3 -u src/taylor_green_benchmark.py \
+                        --method=$method \
+                        --model=$model \
+                        --re=$TGV_RE \
+                        --num-windows=$TGV_NUM_WINDOWS \
+                        --window-size=$TGV_WINDOW_SIZE \
+                        --epochs-per-window=$TGV_EPOCHS_PER_WINDOW \
+                        --batch-interior=$TGV_BATCH_INTERIOR \
+                        --batch-ic=$TGV_BATCH_IC \
+                        --eval-grid=$TGV_EVAL_GRID \
+                        --eval-times-per-window=$TGV_EVAL_TIMES \
+                        --les-cs=$TGV_LES_CS \
+                        --pirate-num-layers=$TGV_PIRATE_NUM_LAYERS \
+                        --pirate-hidden-dim=$TGV_PIRATE_HIDDEN_DIM \
+                        --causal-eps=$TGV_CAUSAL_EPS \
+                        --causal-chunks=$TGV_CAUSAL_CHUNKS \
+                        --optimizer=$TGV_OPTIMIZER \
+                        --lr=$TGV_LR \
+                        --ic-weight=$TGV_IC_WEIGHT \
+                        --seed=$seed \
+                        --output-csv=$TGV_OUTPUT_CSV \
+                        --tag=${TGV_TAG}_s${seed}
+                    echo '========================================'
+                    echo 'Finished: '\$(date)
+                    echo '========================================'
+                "
+            ((job_count++))
+        done
+    done
+done
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 
@@ -611,6 +813,7 @@ n_cavity_jobs=$((${#cavity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 n_pielm_jobs=0   # 2026-04-28: PIELM disabled for CAN-PINN-only run
 n_kovasznay_jobs=$((${#kovasznay_methods[@]} * ${#models[@]} * ${#seeds[@]}))
 n_elasticity_jobs=$((${#elasticity_methods[@]} * ${#models[@]} * ${#seeds[@]}))
+n_tgv_jobs=$((${#tgv_methods[@]} * ${#tgv_models[@]} * ${#tgv_seeds[@]}))
 
 echo ""
 echo "========================================================================"
@@ -638,8 +841,24 @@ for method in "${elasticity_methods[@]}"; do
 done
 echo "  Total: $n_elasticity_jobs jobs"
 echo ""
+if [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo "TGV (3D Taylor-Green, Re=$TGV_RE) - GRADIENT-BASED (GPU):"
+    for method in "${tgv_methods[@]}"; do
+        echo "  - $method  x  ${#tgv_models[@]} models  x  ${#tgv_seeds[@]} seeds  =  $((${#tgv_models[@]} * ${#tgv_seeds[@]})) jobs"
+    done
+    echo "  Total: $n_tgv_jobs jobs (each ${TGV_NUM_WINDOWS} win x ${TGV_EPOCHS_PER_WINDOW} ep, ~24 h on H100 MIG 2g.20gb)"
+    echo "  TGV CSV:  ./$TGV_OUTPUT_CSV"
+    echo "  TGV tag:  $TGV_TAG"
+    echo ""
+fi
 echo "TOTAL JOBS: $job_count"
 echo ""
 echo "Results:  ./$OUTPUT_CSV"
+if [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo "          ./$TGV_OUTPUT_CSV  (TGV — separate schema)"
+fi
 echo "Logs:     ./logs/cav_*  ./logs/kov_*  ./logs/ela_*"
+if [[ ${#tgv_methods[@]} -gt 0 ]]; then
+    echo "          ./logs/tgv_*"
+fi
 echo "========================================================================"
