@@ -61,12 +61,23 @@ def parse_args(argv=None):
         description="3D Taylor-Green Vortex PINN benchmark (Phase 1 AD baseline)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--method", default="autodiff", choices=["autodiff"],
-                   help="Gradient-engine method. AD only for now.")
-    p.add_argument("--model", default="mlp", choices=["mlp", "pirate-net"],
+    p.add_argument("--method", default="autodiff",
+                   choices=["autodiff", "ropinn", "chebyshev-pinn", "sk-pinn",
+                            "can-pinn-faithful", "dtpinn", "sage"],
+                   help="Gradient-engine method. 'autodiff' is the Phase 1/2/3 plain-AD "
+                        "path; the others mirror the 2D method roster in "
+                        "src/lid_benchmark.py (RoPINN region perturbation, Spectral-AD "
+                        "via 3D Fourier, SK-PINN sparse RKPM, CAN-PINN Taylor-expansion "
+                        "stencils, DT-PINN RBF-FD + L-BFGS, SAGE traced auto-generated "
+                        "backward).")
+    p.add_argument("--model", default="mlp", choices=["mlp", "pirate-net", "tsa-pinn"],
                    help="Network architecture. 'mlp' is the Phase 1/2 Fourier MLP; "
-                        "'pirate-net' enables Phase 3 PirateNet residual arch "
-                        "(naming matches src/lid_benchmark.py for sweep-system compatibility).")
+                        "'pirate-net' enables Phase 3 PirateNet residual arch; "
+                        "'tsa-pinn' is the trainable-sinusoidal-activation MLP of "
+                        "Khademi (Comput. Phys. Commun. 2025). All three share the "
+                        "same periodic Fourier embedding so periodicity is enforced "
+                        "exactly across architectures (naming matches "
+                        "src/lid_benchmark.py for sweep-system compatibility).")
     p.add_argument("--re", type=float, default=500.0, help="Reynolds number")
     p.add_argument("--domain-length", type=float, default=2 * math.pi,
                    help="Cubic domain side length L; full domain is [0,L]^3.")
@@ -104,6 +115,83 @@ def parse_args(argv=None):
                    help="PirateNet hidden width inside each bottleneck. Ignored when --model=mlp.")
     p.add_argument("--pirate-nonlinearity", type=float, default=0.0,
                    help="PirateNet alpha init (0.0 => identity init at start, the 'physics-informed init' trick).")
+    # ----- TSA-PINN knobs (defaults active only when --model=tsa-pinn). -----
+    p.add_argument("--tsa-initial-freq", type=float, default=1.0,
+                   help="Initial frequency for trainable sinusoidal activations "
+                        "(Khademi 2025). Ignored unless --model=tsa-pinn.")
+    p.add_argument("--tsa-reg-weight", type=float, default=1.0,
+                   help="Weight on the Dynamic Slope Recovery (DSR) regularizer "
+                        "L_reg = 1 / sum_i exp(mean(omega_i)). The original "
+                        "Khademi 2025 formulation adds this term unweighted "
+                        "(weight=1) to the total loss; set 0 to disable. "
+                        "Ignored unless --model=tsa-pinn.")
+    # ----- RoPINN knobs (defaults match src/lid_benchmark.py:1665-1668). -----
+    p.add_argument("--ropinn-initial-region", type=float, default=1e-4,
+                   help="RoPINN initial trust-region radius. Ignored unless "
+                        "--method=ropinn.")
+    p.add_argument("--ropinn-region-max", type=float, default=0.01,
+                   help="RoPINN maximum trust-region radius. Ignored unless "
+                        "--method=ropinn.")
+    p.add_argument("--ropinn-past-iterations", type=int, default=10,
+                   help="RoPINN past-iteration history for gradient-variance "
+                        "computation. Ignored unless --method=ropinn.")
+    # ----- Spectral-AD knobs (chebyshev-pinn 3D analog: 3D Fourier spectral). -----
+    p.add_argument("--spectral-n", type=int, default=16,
+                   help="Spatial grid resolution per axis (Nx=Ny=Nz=N) for the "
+                        "Spectral-AD (chebyshev-pinn) method. Total spatial points = N**3. "
+                        "Larger N improves spectral-derivative accuracy but cost grows as "
+                        "N**3. Ignored unless --method=chebyshev-pinn.")
+    p.add_argument("--spectral-k", type=int, default=4,
+                   help="Number of time samples per epoch on the structured 4D grid "
+                        "for Spectral-AD. Total collocation = N**3 * K. When --causal-eps>0 "
+                        "the value of --spectral-k must equal --causal-chunks (each time "
+                        "slice forms one causal chunk). Ignored unless --method=chebyshev-pinn.")
+    # ----- CAN-PINN-faithful knobs (3D analog of pde_residuals_canpinn_cavity). -----
+    p.add_argument("--canpinn-n", type=int, default=10,
+                   help="Spatial grid resolution per axis for CAN-PINN-faithful. "
+                        "dx=dy=dz=L/N so the 7-point stencil neighbors land on adjacent "
+                        "grid points modulo periodic wrap. Ignored unless "
+                        "--method=can-pinn-faithful.")
+    p.add_argument("--canpinn-k", type=int, default=4,
+                   help="Number of time samples per epoch for CAN-PINN-faithful. Total "
+                        "centers = N**3 * K; total stencil evaluations = 7 * centers. "
+                        "When --causal-eps>0, --canpinn-k must equal --causal-chunks. "
+                        "Ignored unless --method=can-pinn-faithful.")
+    # ----- SK-PINN knobs (3D analog of build_sk_data + train_sk_pinn). -----
+    p.add_argument("--skpinn-n", type=int, default=12,
+                   help="Spatial grid resolution per axis for SK-PINN. h=L/N is the "
+                        "RKPM grid spacing; SPH cutoff radius = 2*1.4*h matches the "
+                        "2D cubic-spline-radius scaling. Total grid = N**3, total "
+                        "collocation = N**3 * K. Larger N improves O(h**2) accuracy "
+                        "but memory grows as N**3 * max_neighbors. Ignored unless "
+                        "--method=sk-pinn.")
+    p.add_argument("--skpinn-k", type=int, default=4,
+                   help="Number of time samples per epoch for SK-PINN. When "
+                        "--causal-eps>0, --skpinn-k must equal --causal-chunks. "
+                        "Ignored unless --method=sk-pinn.")
+    p.add_argument("--skpinn-wd", type=float, default=-1.0,
+                   help="SK-PINN weight decay. -1 (default) selects per-model defaults: "
+                        "mlp=1e-4, tsa-pinn=5e-4, pirate-net=1e-3 (mirrors the 2D "
+                        "_SK_PINN_WD lookup at src/lid_benchmark.py:77). 0.0 = matched "
+                        "protocol (no model-specific regularization). Ignored unless "
+                        "--method=sk-pinn.")
+    p.add_argument("--skpinn-h-factor", type=float, default=1.4,
+                   help="SK-PINN kernel smoothing length factor: h = h_factor * dx. "
+                        "Default matches the 2D harness. Ignored unless --method=sk-pinn.")
+    # ----- DT-PINN knobs (3D periodic analog of dt-pinn / RBF-FD). -----
+    p.add_argument("--dtpinn-n", type=int, default=12,
+                   help="Spatial grid resolution per axis for DT-PINN (uniform N**3 "
+                        "periodic grid). Larger N → smaller h → tighter RBF-FD stencil "
+                        "and lower truncation error, but build cost grows as O(N**3 * "
+                        "stencil_size**3). Ignored unless --method=dtpinn.")
+    p.add_argument("--dtpinn-k", type=int, default=4,
+                   help="Number of time samples per epoch for DT-PINN. When "
+                        "--causal-eps>0, --dtpinn-k must equal --causal-chunks. "
+                        "Ignored unless --method=dtpinn.")
+    p.add_argument("--dtpinn-p", type=int, default=2,
+                   help="RBF-FD polynomial order (Sharma & Shankar 2022). p>=2; "
+                        "p=2 → ell=2 (grad) / 3 (lap), reasonable accuracy at modest "
+                        "stencil size. Ignored unless --method=dtpinn.")
     p.add_argument("--causal-eps", type=float, default=0.0,
                    help="Causal-loss eps (>0 enables temporal causal weighting; "
                         "0.0 = no causal, route through the existing mean-PDE-loss path "
@@ -330,6 +418,78 @@ class TGVPirateNet(nn.Module):
         return self.head(x)
 
 
+# =============================================================================
+# Network: TSA-PINN (trainable sinusoidal activations) — port of
+# src/experiment_dt_elm_pinn/models/tsa_pinn.py for the TGV problem.
+# Reference: Khademi, Comput. Phys. Commun. (May 2025); upstream code at
+# https://github.com/AmirhosseinnnKhademi/TSA-PINN.
+# =============================================================================
+class TGVTsaPINN(nn.Module):
+    """Trainable-sinusoidal-activation MLP for the TGV problem.
+
+    Each hidden layer applies the Khademi (2025) activation
+        h = 0.5 * (sin(omega * z + b) + cos(omega * z + b))
+    where ``omega`` is a learnable per-neuron frequency parameter. The
+    Dynamic Slope Recovery (DSR) regularizer
+        L_reg = 1 / sum_i exp(mean(omega_i))
+    penalises small frequencies and is exposed via ``regularization_loss``;
+    the training loop adds it to the total loss when
+    ``--tsa-reg-weight > 0`` (default 1.0, matching the Khademi reference).
+
+    The network reuses the periodic Fourier embedding from ``TGVFourierMLP``
+    so that periodicity in (x, y, z) is enforced by the input mapping —
+    consistent with MLP and PirateNet for TGV. The 2D upstream consumes
+    raw (x, y); for 3D periodic NS the embedding is the load-bearing piece
+    that guarantees exact periodicity, so it stays.
+    """
+
+    def __init__(self, hidden_dim: int = 256, num_layers: int = 6,
+                 initial_freq: float = 1.0, period: float = 2 * math.pi):
+        super().__init__()
+        self.period = period
+        self.omega_input = 2.0 * math.pi / period
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        in_dim = 7  # sin/cos for x,y,z + raw t (matches TGVFourierMLP)
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        self.freqs = nn.ParameterList()
+        for _ in range(num_layers):
+            w = nn.Parameter(torch.empty(in_dim, hidden_dim))
+            b = nn.Parameter(torch.zeros(1, hidden_dim))
+            f = nn.Parameter(torch.full((1, hidden_dim), float(initial_freq)))
+            nn.init.xavier_normal_(w)
+            self.weights.append(w)
+            self.biases.append(b)
+            self.freqs.append(f)
+            in_dim = hidden_dim
+
+        self.output_weight = nn.Parameter(torch.empty(hidden_dim, 4))
+        self.output_bias = nn.Parameter(torch.zeros(1, 4))
+        nn.init.xavier_normal_(self.output_weight)
+
+    def fourier_features(self, xyzt: torch.Tensor) -> torch.Tensor:
+        x, y, z, t = xyzt[..., 0:1], xyzt[..., 1:2], xyzt[..., 2:3], xyzt[..., 3:4]
+        w = self.omega_input
+        return torch.cat([
+            torch.sin(w * x), torch.cos(w * x),
+            torch.sin(w * y), torch.cos(w * y),
+            torch.sin(w * z), torch.cos(w * z),
+            t,
+        ], dim=-1)
+
+    def forward(self, xyzt: torch.Tensor) -> torch.Tensor:
+        h = self.fourier_features(xyzt)
+        for w, b, f in zip(self.weights, self.biases, self.freqs):
+            z = h @ w
+            h = 0.5 * (torch.sin(f * z + b) + torch.cos(f * z + b))
+        return h @ self.output_weight + self.output_bias
+
+    def regularization_loss(self) -> torch.Tensor:
+        return 1.0 / sum(torch.exp(freq.mean()) for freq in self.freqs)
+
+
 def make_model(args, problem) -> nn.Module:
     """Build a fresh model per --model. Used both for the trained model and
     the model_template handed to `evaluate_tke_trajectory`."""
@@ -344,6 +504,13 @@ def make_model(args, problem) -> nn.Module:
             hidden_dim=args.pirate_hidden_dim,
             num_layers=args.pirate_num_layers,
             nonlinearity=args.pirate_nonlinearity,
+            period=problem.L,
+        )
+    if args.model == "tsa-pinn":
+        return TGVTsaPINN(
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            initial_freq=args.tsa_initial_freq,
             period=problem.L,
         )
     raise ValueError(f"Unknown --model: {args.model!r}")
@@ -462,6 +629,1241 @@ def autodiff_residual(
 
 
 # =============================================================================
+# Spectral-AD (chebyshev-pinn) — 3D Fourier-spectral spatial derivatives
+# (period [0, L]^3) + AD on the temporal coordinate.
+#
+# The 2D chebyshev-pinn baseline in src/lid_benchmark.py uses dense Chebyshev
+# differentiation matrices on a Chebyshev tensor-product grid. The natural 3D
+# analog for a triply-periodic domain is the Fourier-spectral collocation
+# method: derivatives are diagonal in Fourier space, computed via FFT/IFFT
+# pairs. Time, which is non-periodic on [0, T_w], stays AD.
+#
+# torch.fft is differentiable, so the FFT-based residual still propagates
+# gradients through model parameters via PyTorch autograd.
+# =============================================================================
+def build_spectral_grid(N: int, K: int, problem: TGVProblem,
+                        window_size: float, device: torch.device):
+    """Build the structured (Nx, Ny, Nz, K) 4D collocation grid for Spectral-AD.
+
+    Returns:
+        xyz_grid:   (N, N, N, 3) tensor of spatial coordinates.
+        t_samples:  (K,) tensor of time samples in [0, T_w], excluding the
+                    right endpoint (since the right endpoint of one window
+                    is the left endpoint of the next under the moving-window
+                    scheme; including it would double-count).
+        kx, ky, kz: (N,) angular wavenumbers ``2*pi/L * fftfreq(N, d=L/N) * N``.
+    """
+    axis = torch.linspace(0, problem.L, N + 1, device=device)[:-1]
+    X, Y, Z = torch.meshgrid(axis, axis, axis, indexing="ij")
+    xyz_grid = torch.stack([X, Y, Z], dim=-1)  # (N, N, N, 3)
+
+    if K <= 0:
+        raise ValueError(f"--spectral-k must be >= 1; got {K}")
+    t_samples = torch.linspace(0, window_size, K + 1, device=device)[:-1]
+
+    freqs = 2.0 * math.pi * torch.fft.fftfreq(
+        N, d=problem.L / N, device=device,
+    )
+    return xyz_grid, t_samples, freqs
+
+
+def _spectral_grad(field_grid: torch.Tensor, k_dir: torch.Tensor) -> torch.Tensor:
+    """First spatial derivative via FFT.
+
+    field_grid: (N, N, N, K) real tensor on the structured grid.
+    k_dir:      (N, N, N, 1) angular-wavenumber tensor for the desired axis
+                (broadcastable over the K dimension).
+    Returns:    (N, N, N, K) real tensor of partial derivative.
+    """
+    # Cast to complex for FFT; multiply by i*k in spectral space; IFFT, take real.
+    f_hat = torch.fft.fftn(field_grid, dim=(0, 1, 2))
+    d_hat = (1j * k_dir) * f_hat
+    return torch.fft.ifftn(d_hat, dim=(0, 1, 2)).real
+
+
+def spectral_residual(
+    model: nn.Module,
+    xyz_grid: torch.Tensor,
+    t_samples: torch.Tensor,
+    freqs: torch.Tensor,
+    problem: TGVProblem,
+    *,
+    cs: float = 0.0,
+    delta: float = 0.0,
+    eps: float = 1e-12,
+):
+    """3D-Fourier-spectral spatial + AD-time NS residual on the structured grid.
+
+    xyz_grid:   (N, N, N, 3) spatial mesh.
+    t_samples:  (K,) time samples.
+    freqs:      (N,) angular wavenumber array (from ``build_spectral_grid``).
+
+    Returns ``(continuity, mom_x, mom_y, mom_z)`` each flattened to ``(N**3*K, 1)``,
+    matching ``autodiff_residual``'s return shape so the existing causal-loss
+    bookkeeping in ``train_one_window`` stays unchanged.
+    """
+    N = xyz_grid.shape[0]
+    K = t_samples.shape[0]
+    device = xyz_grid.device
+    n_spatial = N * N * N
+
+    # Build (K * N**3, 4) flattened (x, y, z, t) input.
+    # Layout: outermost K (time slowest), then spatial — so reshape(K, N, N, N)
+    # gives time-major slices we can later permute to (N, N, N, K) for FFT.
+    xyz_flat = xyz_grid.reshape(-1, 3)                               # (N**3, 3)
+    xyz_tiled = xyz_flat.unsqueeze(0).expand(K, -1, -1).reshape(-1, 3)  # (K*N**3, 3)
+    t_tiled = t_samples.view(K, 1).expand(K, n_spatial).reshape(-1, 1)  # (K*N**3, 1)
+    xyzt = torch.cat([xyz_tiled, t_tiled], dim=-1).contiguous()
+    xyzt = xyzt.detach().requires_grad_(True)
+
+    pred = model(xyzt)                                                # (K*N**3, 4)
+    u_flat = pred[..., 0:1]
+    v_flat = pred[..., 1:2]
+    w_flat = pred[..., 2:3]
+    p_flat = pred[..., 3:4]
+
+    # Time derivatives via AD (last column of the flat-grad).
+    u_t_flat = _grad(u_flat, xyzt)[..., 3:4]
+    v_t_flat = _grad(v_flat, xyzt)[..., 3:4]
+    w_t_flat = _grad(w_flat, xyzt)[..., 3:4]
+
+    # Reshape ``(K*N**3, 1)`` -> ``(N, N, N, K)`` for FFT.
+    def _to_grid(field_flat: torch.Tensor) -> torch.Tensor:
+        return field_flat.view(K, N, N, N).permute(1, 2, 3, 0).contiguous()
+
+    u_grid = _to_grid(u_flat); v_grid = _to_grid(v_flat)
+    w_grid = _to_grid(w_flat); p_grid = _to_grid(p_flat)
+    u_t_grid = _to_grid(u_t_flat); v_t_grid = _to_grid(v_t_flat); w_t_grid = _to_grid(w_t_flat)
+
+    # Wavenumber tensors broadcastable over (N, N, N, K).
+    KX = freqs.view(N, 1, 1, 1)
+    KY = freqs.view(1, N, 1, 1)
+    KZ = freqs.view(1, 1, N, 1)
+
+    u_x = _spectral_grad(u_grid, KX); u_y = _spectral_grad(u_grid, KY); u_z = _spectral_grad(u_grid, KZ)
+    v_x = _spectral_grad(v_grid, KX); v_y = _spectral_grad(v_grid, KY); v_z = _spectral_grad(v_grid, KZ)
+    w_x = _spectral_grad(w_grid, KX); w_y = _spectral_grad(w_grid, KY); w_z = _spectral_grad(w_grid, KZ)
+    p_x = _spectral_grad(p_grid, KX); p_y = _spectral_grad(p_grid, KY); p_z = _spectral_grad(p_grid, KZ)
+
+    rho = problem.rho
+
+    if cs > 0.0:
+        # Smagorinsky LES in spectral space (full stress-tensor form, as in
+        # autodiff_residual). Strain-rate from first derivatives, then
+        # divergence of 2*nu_eff*S via further FFT-based derivatives.
+        Sxx, Syy, Szz = u_x, v_y, w_z
+        Sxy = 0.5 * (u_y + v_x)
+        Sxz = 0.5 * (u_z + w_x)
+        Syz = 0.5 * (v_z + w_y)
+        S_mag = torch.sqrt(
+            2.0 * (Sxx ** 2 + Syy ** 2 + Szz ** 2
+                   + 2.0 * (Sxy ** 2 + Sxz ** 2 + Syz ** 2)) + eps
+        )
+        nu_lam = problem.nu
+        nu_eff = nu_lam + (cs * delta) ** 2 * S_mag
+
+        q_xx = 2.0 * nu_eff * Sxx; q_yy = 2.0 * nu_eff * Syy; q_zz = 2.0 * nu_eff * Szz
+        q_xy = 2.0 * nu_eff * Sxy; q_xz = 2.0 * nu_eff * Sxz; q_yz = 2.0 * nu_eff * Syz
+
+        visc_u = _spectral_grad(q_xx, KX) + _spectral_grad(q_xy, KY) + _spectral_grad(q_xz, KZ)
+        visc_v = _spectral_grad(q_xy, KX) + _spectral_grad(q_yy, KY) + _spectral_grad(q_yz, KZ)
+        visc_w = _spectral_grad(q_xz, KX) + _spectral_grad(q_yz, KY) + _spectral_grad(q_zz, KZ)
+    else:
+        # Laminar: Laplacian via spectral diagonal -k^2.
+        K_SQ = KX ** 2 + KY ** 2 + KZ ** 2
+
+        def _spectral_lap(field_grid: torch.Tensor) -> torch.Tensor:
+            f_hat = torch.fft.fftn(field_grid, dim=(0, 1, 2))
+            return torch.fft.ifftn(-K_SQ * f_hat, dim=(0, 1, 2)).real
+
+        nu = problem.nu
+        visc_u = nu * _spectral_lap(u_grid)
+        visc_v = nu * _spectral_lap(v_grid)
+        visc_w = nu * _spectral_lap(w_grid)
+
+    continuity = u_x + v_y + w_z
+    mom_x = u_t_grid + (u_grid * u_x + v_grid * u_y + w_grid * u_z) + p_x / rho - visc_u
+    mom_y = v_t_grid + (u_grid * v_x + v_grid * v_y + w_grid * v_z) + p_y / rho - visc_v
+    mom_z = w_t_grid + (u_grid * w_x + v_grid * w_y + w_grid * w_z) + p_z / rho - visc_w
+
+    # Flatten back to (N**3 * K, 1) with the time-slowest layout the causal
+    # loss expects (one chunk = one time slice when causal_chunks == K).
+    def _to_flat(field_grid: torch.Tensor) -> torch.Tensor:
+        return field_grid.permute(3, 0, 1, 2).contiguous().view(-1, 1)
+
+    return _to_flat(continuity), _to_flat(mom_x), _to_flat(mom_y), _to_flat(mom_z)
+
+
+# =============================================================================
+# CAN-PINN-faithful — 3D port of pde_residuals_canpinn_cavity at
+# src/lid_benchmark.py:792 (Chiu et al. 2022). The 2D version uses a 9-point
+# stencil but only 5 (C, E/W, N/S) are actually consumed by the FD scheme;
+# the 3D analog is a 7-point cross stencil (C, E/W, N/S, U/D), which
+# generalizes the same formulas to a third spatial axis. Time is treated by
+# autograd (model takes t as an input column).
+#
+# The scheme combines:
+#   * CAN(uw2) upwind-biased Taylor reconstruction at face centers for the
+#     convective fluxes,
+#   * CAN(cd) central-difference + 1/8 dispersion correction for the
+#     pressure gradient,
+#   * plain 2nd-order central FD for the viscous Laplacian, and
+#   * staggered-face divergence for continuity.
+#
+# Smagorinsky LES (cs > 0) reuses the AD-derived strain rate at C to compute
+# nu_eff at the center; the FD Laplacian is then taken with that local nu_eff
+# (matches the 2D harness drop-in design choice b1).
+# =============================================================================
+def _canpinn_stencil_offsets_3d(dx: float, dy: float, dz: float,
+                                device: torch.device,
+                                dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """7-point 3D axis-aligned cross stencil offsets.
+
+    Order: [C, E, W, N, S, U, D] with E=+dx, W=-dx, N=+dy, S=-dy, U=+dz, D=-dz.
+    The t column is always 0 (the stencil is spatial only; time enters via AD).
+    """
+    return torch.tensor([
+        [0.0, 0.0, 0.0, 0.0],   # C
+        [+dx, 0.0, 0.0, 0.0],   # E
+        [-dx, 0.0, 0.0, 0.0],   # W
+        [0.0, +dy, 0.0, 0.0],   # N
+        [0.0, -dy, 0.0, 0.0],   # S
+        [0.0, 0.0, +dz, 0.0],   # U
+        [0.0, 0.0, -dz, 0.0],   # D
+    ], dtype=dtype, device=device)
+
+
+def can_pinn_residual(
+    model: nn.Module,
+    xyzt_centers: torch.Tensor,
+    dx: float, dy: float, dz: float,
+    problem: TGVProblem,
+    *,
+    cs: float = 0.0,
+    delta: float = 0.0,
+    eps: float = 1e-12,
+):
+    """3D faithful CAN-PINN residual at the given center points.
+
+    xyzt_centers: (N_int, 4) tensor of centers, assumed to lie on a uniform
+    periodic grid with spacings ``dx, dy, dz``. Stencil neighbors are wrapped
+    modulo ``problem.L`` along each spatial axis.
+
+    Returns ``(R_continuity, R_mom_u, R_mom_v, R_mom_w)``, each ``(N_int, 1)``.
+    """
+    N_int = xyzt_centers.shape[0]
+    device = xyzt_centers.device
+    dtype = xyzt_centers.dtype
+    L = problem.L
+
+    offs = _canpinn_stencil_offsets_3d(dx, dy, dz, device, dtype)        # (7, 4)
+    xyzt_stencil = xyzt_centers.unsqueeze(0) + offs.unsqueeze(1)         # (7, N_int, 4)
+    xyzt_stencil = torch.cat([
+        xyzt_stencil[..., 0:3] % L,
+        xyzt_stencil[..., 3:4],
+    ], dim=-1)
+    xyzt_stencil = xyzt_stencil.reshape(7 * N_int, 4)
+    xyzt_stencil = xyzt_stencil.detach().requires_grad_(True)
+
+    pred = model(xyzt_stencil)                                           # (7*N_int, 4)
+    u_all = pred[:, 0:1]; v_all = pred[:, 1:2]
+    w_all = pred[:, 2:3]; p_all = pred[:, 3:4]
+
+    ones_u = torch.ones_like(u_all)
+    grad_u = torch.autograd.grad(u_all, xyzt_stencil, ones_u,
+                                 create_graph=True, retain_graph=True)[0]
+    grad_v = torch.autograd.grad(v_all, xyzt_stencil, ones_u,
+                                 create_graph=True, retain_graph=True)[0]
+    grad_w = torch.autograd.grad(w_all, xyzt_stencil, ones_u,
+                                 create_graph=True, retain_graph=True)[0]
+    grad_p = torch.autograd.grad(p_all, xyzt_stencil, ones_u,
+                                 create_graph=True, retain_graph=True)[0]
+
+    # Reshape to (7, N_int, 1).
+    u_s = u_all.reshape(7, N_int, 1); v_s = v_all.reshape(7, N_int, 1)
+    w_s = w_all.reshape(7, N_int, 1); p_s = p_all.reshape(7, N_int, 1)
+    ux_s = grad_u[:, 0:1].reshape(7, N_int, 1)
+    uy_s = grad_u[:, 1:2].reshape(7, N_int, 1)
+    uz_s = grad_u[:, 2:3].reshape(7, N_int, 1)
+    ut_s = grad_u[:, 3:4].reshape(7, N_int, 1)
+    vx_s = grad_v[:, 0:1].reshape(7, N_int, 1)
+    vy_s = grad_v[:, 1:2].reshape(7, N_int, 1)
+    vz_s = grad_v[:, 2:3].reshape(7, N_int, 1)
+    vt_s = grad_v[:, 3:4].reshape(7, N_int, 1)
+    wx_s = grad_w[:, 0:1].reshape(7, N_int, 1)
+    wy_s = grad_w[:, 1:2].reshape(7, N_int, 1)
+    wz_s = grad_w[:, 2:3].reshape(7, N_int, 1)
+    wt_s = grad_w[:, 3:4].reshape(7, N_int, 1)
+    px_s = grad_p[:, 0:1].reshape(7, N_int, 1)
+    py_s = grad_p[:, 1:2].reshape(7, N_int, 1)
+    pz_s = grad_p[:, 2:3].reshape(7, N_int, 1)
+
+    # Stencil index order: 0=C, 1=E, 2=W, 3=N, 4=S, 5=U, 6=D.
+    u_C, u_E, u_W, u_N, u_S, u_U, u_D = (u_s[i] for i in range(7))
+    v_C, v_E, v_W, v_N, v_S, v_U, v_D = (v_s[i] for i in range(7))
+    w_C, w_E, w_W, w_N, w_S, w_U, w_D = (w_s[i] for i in range(7))
+    p_C, p_E, p_W, p_N, p_S, p_U, p_D = (p_s[i] for i in range(7))
+
+    # AD gradients we need (only at the relevant stencil indices).
+    u_x_C, u_x_E, u_x_W = ux_s[0], ux_s[1], ux_s[2]
+    u_y_C, u_y_N, u_y_S = uy_s[0], uy_s[3], uy_s[4]
+    u_z_C, u_z_U, u_z_D = uz_s[0], uz_s[5], uz_s[6]
+    u_t_C = ut_s[0]
+    v_x_C, v_x_E, v_x_W = vx_s[0], vx_s[1], vx_s[2]
+    v_y_C, v_y_N, v_y_S = vy_s[0], vy_s[3], vy_s[4]
+    v_z_C, v_z_U, v_z_D = vz_s[0], vz_s[5], vz_s[6]
+    v_t_C = vt_s[0]
+    w_x_C, w_x_E, w_x_W = wx_s[0], wx_s[1], wx_s[2]
+    w_y_C, w_y_N, w_y_S = wy_s[0], wy_s[3], wy_s[4]
+    w_z_C, w_z_U, w_z_D = wz_s[0], wz_s[5], wz_s[6]
+    w_t_C = wt_s[0]
+    p_x_C, p_x_E, p_x_W = px_s[0], px_s[1], px_s[2]
+    p_y_C, p_y_N, p_y_S = py_s[0], py_s[3], py_s[4]
+    p_z_C, p_z_U, p_z_D = pz_s[0], pz_s[5], pz_s[6]
+
+    # Face velocities (paper eq. 7).
+    u_face_e = 0.5 * (u_E + u_C); u_face_w = 0.5 * (u_W + u_C)
+    v_face_n = 0.5 * (v_N + v_C); v_face_s = 0.5 * (v_S + v_C)
+    w_face_u = 0.5 * (w_U + w_C); w_face_d = 0.5 * (w_D + w_C)
+
+    # CAN(uw2) Taylor-reconstructed face values for the convected variable
+    # (paper eq. 8/9; notebook lines 444-476). Sign of the face velocity
+    # selects the upwind state. /8 dispersion term is OFF here to match the
+    # 2D upstream demo's commented-out form.
+    half_dx = 0.5 * dx; half_dy = 0.5 * dy; half_dz = 0.5 * dz
+
+    def _upwind_face(left_state, right_state, left_grad_at_left, right_grad_at_right,
+                     face_velocity, h_half):
+        """Generic upwind reconstruction at a face between left and right cells."""
+        from_left = left_state + left_grad_at_left * h_half
+        from_right = right_state - right_grad_at_right * h_half
+        return torch.where(face_velocity >= 0.0, from_left, from_right)
+
+    # x-direction face values for u, v, w.
+    U_e = _upwind_face(u_C, u_E, u_x_C, u_x_E, u_face_e, half_dx)
+    U_w = _upwind_face(u_W, u_C, u_x_W, u_x_C, u_face_w, half_dx)
+    V_e = _upwind_face(v_C, v_E, v_x_C, v_x_E, u_face_e, half_dx)
+    V_w = _upwind_face(v_W, v_C, v_x_W, v_x_C, u_face_w, half_dx)
+    W_e = _upwind_face(w_C, w_E, w_x_C, w_x_E, u_face_e, half_dx)
+    W_w = _upwind_face(w_W, w_C, w_x_W, w_x_C, u_face_w, half_dx)
+
+    # y-direction face values.
+    U_n = _upwind_face(u_C, u_N, u_y_C, u_y_N, v_face_n, half_dy)
+    U_s = _upwind_face(u_S, u_C, u_y_S, u_y_C, v_face_s, half_dy)
+    V_n = _upwind_face(v_C, v_N, v_y_C, v_y_N, v_face_n, half_dy)
+    V_s = _upwind_face(v_S, v_C, v_y_S, v_y_C, v_face_s, half_dy)
+    W_n = _upwind_face(w_C, w_N, w_y_C, w_y_N, v_face_n, half_dy)
+    W_s = _upwind_face(w_S, w_C, w_y_S, w_y_C, v_face_s, half_dy)
+
+    # z-direction face values.
+    U_u = _upwind_face(u_C, u_U, u_z_C, u_z_U, w_face_u, half_dz)
+    U_d = _upwind_face(u_D, u_C, u_z_D, u_z_C, w_face_d, half_dz)
+    V_u = _upwind_face(v_C, v_U, v_z_C, v_z_U, w_face_u, half_dz)
+    V_d = _upwind_face(v_D, v_C, v_z_D, v_z_C, w_face_d, half_dz)
+    W_u = _upwind_face(w_C, w_U, w_z_C, w_z_U, w_face_u, half_dz)
+    W_d = _upwind_face(w_D, w_C, w_z_D, w_z_C, w_face_d, half_dz)
+
+    # Conservative-form convective fluxes (paper eq. 8/9):
+    UU_x = (u_face_e * U_e - u_face_w * U_w) / dx
+    VU_y = (v_face_n * U_n - v_face_s * U_s) / dy
+    WU_z = (w_face_u * U_u - w_face_d * U_d) / dz
+    UV_x = (u_face_e * V_e - u_face_w * V_w) / dx
+    VV_y = (v_face_n * V_n - v_face_s * V_s) / dy
+    WV_z = (w_face_u * V_u - w_face_d * V_d) / dz
+    UW_x = (u_face_e * W_e - u_face_w * W_w) / dx
+    VW_y = (v_face_n * W_n - v_face_s * W_s) / dy
+    WW_z = (w_face_u * W_u - w_face_d * W_d) / dz
+
+    # CAN(cd) pressure gradient (paper eq. 12/13). /8 dispersion correction ON.
+    eighth_dx = dx / 8.0; eighth_dy = dy / 8.0; eighth_dz = dz / 8.0
+    p_e = 0.5 * (p_C + p_E) - (p_x_E - p_x_C) * eighth_dx
+    p_w = 0.5 * (p_W + p_C) - (p_x_C - p_x_W) * eighth_dx
+    p_n = 0.5 * (p_C + p_N) - (p_y_N - p_y_C) * eighth_dy
+    p_s = 0.5 * (p_S + p_C) - (p_y_C - p_y_S) * eighth_dy
+    p_u = 0.5 * (p_C + p_U) - (p_z_U - p_z_C) * eighth_dz
+    p_d = 0.5 * (p_D + p_C) - (p_z_C - p_z_D) * eighth_dz
+    P_x = (p_e - p_w) / dx
+    P_y = (p_n - p_s) / dy
+    P_z = (p_u - p_d) / dz
+
+    # Plain 2nd-order central FD for the viscous Laplacian.
+    Uxx = (u_E - 2.0 * u_C + u_W) / (dx * dx)
+    Uyy = (u_N - 2.0 * u_C + u_S) / (dy * dy)
+    Uzz = (u_U - 2.0 * u_C + u_D) / (dz * dz)
+    Vxx = (v_E - 2.0 * v_C + v_W) / (dx * dx)
+    Vyy = (v_N - 2.0 * v_C + v_S) / (dy * dy)
+    Vzz = (v_U - 2.0 * v_C + v_D) / (dz * dz)
+    Wxx = (w_E - 2.0 * w_C + w_W) / (dx * dx)
+    Wyy = (w_N - 2.0 * w_C + w_S) / (dy * dy)
+    Wzz = (w_U - 2.0 * w_C + w_D) / (dz * dz)
+
+    # Staggered-face divergence for continuity (notebook line 365).
+    div = ((u_face_e - u_face_w) / dx
+           + (v_face_n - v_face_s) / dy
+           + (w_face_u - w_face_d) / dz)
+
+    rho = problem.rho
+
+    if cs > 0.0:
+        # AD-derived strain rate at C → local nu_eff (matches 2D harness drop-in).
+        Sxx_C = u_x_C; Syy_C = v_y_C; Szz_C = w_z_C
+        Sxy_C = 0.5 * (u_y_C + v_x_C)
+        Sxz_C = 0.5 * (u_z_C + w_x_C)
+        Syz_C = 0.5 * (v_z_C + w_y_C)
+        S_mag_C = torch.sqrt(
+            2.0 * (Sxx_C ** 2 + Syy_C ** 2 + Szz_C ** 2
+                   + 2.0 * (Sxy_C ** 2 + Sxz_C ** 2 + Syz_C ** 2)) + eps
+        )
+        nu_lam = problem.nu
+        nu_eff = nu_lam + (cs * delta) ** 2 * S_mag_C
+    else:
+        nu_eff = problem.nu
+
+    # Conservative-form momentum residual (paper eq. 14):
+    # mom = U_t + (uU)_x + (vU)_y + (wU)_z - nu·(U_xx + U_yy + U_zz)
+    #          - U·div + P_x.
+    R_continuity = div
+    R_mom_u = u_t_C + UU_x + VU_y + WU_z - nu_eff * (Uxx + Uyy + Uzz) - u_C * div + P_x
+    R_mom_v = v_t_C + UV_x + VV_y + WV_z - nu_eff * (Vxx + Vyy + Vzz) - v_C * div + P_y
+    R_mom_w = w_t_C + UW_x + VW_y + WW_z - nu_eff * (Wxx + Wyy + Wzz) - w_C * div + P_z
+
+    return R_continuity, R_mom_u, R_mom_v, R_mom_w
+
+
+def build_canpinn_centers(N: int, K: int, problem: TGVProblem,
+                          window_size: float, device: torch.device):
+    """Build the (N**3 * K, 4) center grid for CAN-PINN-faithful.
+
+    Returns (xyzt_centers, dx) where dx = dy = dz = L/N. Layout is time-slowest
+    (so reshape ``(K, N**3)`` gives one chunk per time slice when causal loss
+    is on). Same grid is used every epoch within a window.
+    """
+    axis = torch.linspace(0, problem.L, N + 1, device=device)[:-1]
+    X, Y, Z = torch.meshgrid(axis, axis, axis, indexing="ij")
+    xyz_flat = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=-1)  # (N**3, 3)
+    t_samples = torch.linspace(0, window_size, K + 1, device=device)[:-1]
+    xyzt_flat = torch.cat([
+        xyz_flat.unsqueeze(0).expand(K, -1, -1).reshape(-1, 3),
+        t_samples.view(K, 1).expand(K, N ** 3).reshape(-1, 1),
+    ], dim=-1).contiguous()
+    dx = float(problem.L) / N
+    return xyzt_flat, dx
+
+
+# =============================================================================
+# Shared helpers for the discretized-spatial methods (SK-PINN / DT-PINN / SAGE).
+#
+# All three methods evaluate the model on a fixed uniform spatial grid at K
+# time samples per epoch, then apply the same sparse spatial operators to
+# every time slice. The naive form is a Python loop over the K slices, but
+# each slice does its own model forward, its own AD time-grad calls, and K
+# separate ``torch.sparse.mm`` calls per spatial operator — most of that
+# wall-clock is Python / launch overhead rather than arithmetic.
+#
+# The two helpers below collapse the loop into one call each.
+#   - ``_batched_xyzt_K`` builds the (K*N_all, 4) input once.
+#   - ``_apply_sparse_op_K`` applies an (N_all, N_all) operator to a
+#     time-slowest (K*N_all, 1) tensor in a single sparse mm.
+# Mathematics is identical to the per-slice form (each row depends only on
+# its own spatial neighbours), so the result is a fewer-launches optimisation,
+# not a numerical change in the algorithm.
+# =============================================================================
+def _batched_xyzt_K(xyz_grid: torch.Tensor, t_samples: torch.Tensor) -> torch.Tensor:
+    """Build the time-slowest ``(K*N_all, 4)`` input for a batched forward.
+
+    ``xyz_grid``: ``(N_all, 3)`` spatial coordinates (no time column).
+    ``t_samples``: ``(K,)`` time values, one per slice.
+
+    The layout matches the per-slice loop: row ``k*N_all + i`` is
+    ``(xyz_grid[i], t_samples[k])``. Returned tensor has ``requires_grad=True``
+    so AD time-derivatives can be taken via ``torch.autograd.grad`` against
+    column 3.
+    """
+    N_all = xyz_grid.shape[0]
+    K = t_samples.shape[0]
+    xyz_rep = xyz_grid.unsqueeze(0).expand(K, -1, -1).reshape(K * N_all, 3)
+    t_rep = t_samples.view(K, 1, 1).expand(K, N_all, 1).reshape(K * N_all, 1)
+    xyzt = torch.cat([xyz_rep, t_rep], dim=-1).detach()
+    xyzt.requires_grad_(True)
+    return xyzt
+
+
+def _apply_sparse_op_K(D: torch.Tensor, x_kn1: torch.Tensor,
+                       K: int, N_all: int) -> torch.Tensor:
+    """Apply ``(N_all, N_all)`` sparse ``D`` to a time-slowest ``(K*N_all, 1)``
+    tensor via a single ``(N_all, K)`` sparse mm.
+
+    Equivalent to ``cat([D @ x_kn1[k*N_all:(k+1)*N_all] for k in range(K)])``
+    but uses one CUDA launch instead of K. Output is also ``(K*N_all, 1)``
+    in the same time-slowest layout.
+    """
+    x_NK = x_kn1.view(K, N_all).t().contiguous()             # (N_all, K)
+    Dx_NK = torch.sparse.mm(D, x_NK)                         # (N_all, K)
+    return Dx_NK.t().contiguous().view(K * N_all, 1)
+
+
+# =============================================================================
+# SK-PINN — 3D port of build_sk_data + train_sk_pinn at src/lid_benchmark.py:503.
+# Reproducing-Kernel Particle Method (RKPM) with cubic-spline SPH kernel.
+# Constructs sparse derivative matrices Dx, Dy, Dz, Dxx, Dyy, Dzz, Dxy, Dxz,
+# Dyz over a uniform 3D periodic grid; spatial derivatives in the residual
+# are then sparse matvecs, which is the same computational pattern as 2D.
+# Time stays AD (per-time-slice forward + grad on t).
+# =============================================================================
+_SKPINN_TGV_WD = {
+    "mlp": 1e-4,
+    "tsa-pinn": 5e-4,
+    "pirate-net": 1e-3,
+}
+
+
+def _skpinn_sph_kernel_3d(distances: torch.Tensor, h: float) -> torch.Tensor:
+    """3D Monaghan cubic-spline SPH kernel.
+
+    sigma_3d / h^3 normalisation with sigma_3d = 1/pi (vs 15/(7*pi*h^2) in 2D).
+    Support radius is 2h; values vanish for q = r/h > 2.
+    """
+    q = distances / h
+    sigma_3d = 1.0 / math.pi
+    result = torch.zeros_like(distances, dtype=torch.float64)
+    in_close = (q >= 0) & (q <= 1)
+    in_far = (q > 1) & (q <= 2)
+    if in_close.any():
+        q_c = q[in_close]
+        result[in_close] = (sigma_3d / h ** 3) * (1.0 - 1.5 * q_c ** 2 + 0.75 * q_c ** 3)
+    if in_far.any():
+        q_f = q[in_far]
+        result[in_far] = (sigma_3d / h ** 3) * 0.25 * (2.0 - q_f) ** 3
+    return result
+
+
+def _skpinn_compute_C_3d(distance_vectors: torch.Tensor, kernel: torch.Tensor,
+                         h_scale: float) -> torch.Tensor:
+    """RKPM order-2 correction coefficients for 9 derivative operators.
+
+    distance_vectors: (N_all, max_nb, 3) — (Δx, Δy, Δz) per neighbor.
+    kernel:           (N_all, max_nb, 1) — per-neighbor SPH kernel value.
+    h_scale:          dimensionalisation length (typically the grid spacing).
+
+    Returns C: (N_all, max_nb, 9) — derivative weights per neighbor for the
+    operator order (∂x, ∂y, ∂z, ∂²x, ∂²y, ∂²z, ∂xy, ∂xz, ∂yz).
+    """
+    dx_v = distance_vectors[:, :, 0:1]
+    dy_v = distance_vectors[:, :, 1:2]
+    dz_v = distance_vectors[:, :, 2:3]
+
+    # Order-2 monomial basis: 1, x, y, z, x², xy, xz, y², yz, z² → 10 terms.
+    # Each degree-i term is normalised by h_scale**i so the moment matrix is
+    # dimensionless (matches the 2D scaling at src/lid_benchmark.py:481).
+    moment_terms = [torch.ones_like(kernel)]
+    moment_terms.append(dx_v / h_scale)
+    moment_terms.append(dy_v / h_scale)
+    moment_terms.append(dz_v / h_scale)
+    moment_terms.append(dx_v * dx_v / (h_scale ** 2))
+    moment_terms.append(dx_v * dy_v / (h_scale ** 2))
+    moment_terms.append(dx_v * dz_v / (h_scale ** 2))
+    moment_terms.append(dy_v * dy_v / (h_scale ** 2))
+    moment_terms.append(dy_v * dz_v / (h_scale ** 2))
+    moment_terms.append(dz_v * dz_v / (h_scale ** 2))
+    moment_vector = torch.cat(moment_terms, dim=2)                          # (N_all, max_nb, 10)
+    terms_num = moment_vector.shape[-1]
+
+    # H selector: 9 derivative operators expressed in the moment basis. The
+    # leading factor inverts the moment-vector normalisation so the resulting
+    # weights have units of 1/length (first deriv) or 1/length² (second).
+    H = torch.zeros((9, terms_num), dtype=torch.float64,
+                    device=moment_vector.device)
+    inv_h = 1.0 / h_scale
+    inv_h2 = 1.0 / (h_scale ** 2)
+    H[0, 1] = inv_h          # ∂x: select x-monomial
+    H[1, 2] = inv_h          # ∂y
+    H[2, 3] = inv_h          # ∂z
+    H[3, 4] = 2.0 * inv_h2   # ∂²x: select x² with the 2 from the Taylor expansion
+    H[4, 7] = 2.0 * inv_h2   # ∂²y: select y²
+    H[5, 9] = 2.0 * inv_h2   # ∂²z: select z²
+    H[6, 5] = inv_h2         # ∂xy: select xy
+    H[7, 6] = inv_h2         # ∂xz: select xz
+    H[8, 8] = inv_h2         # ∂yz: select yz
+
+    # M = sum_j (m_j m_j^T) * w_j   — moment matrix per node, (N_all, 10, 10).
+    matrix = torch.matmul(
+        moment_vector.unsqueeze(3),                                          # (N_all, max_nb, 10, 1)
+        moment_vector.unsqueeze(2),                                          # (N_all, max_nb, 1, 10)
+    ) * kernel.unsqueeze(-1)                                                 # broadcast kernel
+    matrix_sum = torch.sum(matrix, dim=1)                                    # (N_all, 10, 10)
+    matrix_inverse = torch.inverse(matrix_sum)                               # (N_all, 10, 10)
+
+    # C[i, j, k] = m_j[i] @ M_inv[i] @ H[k]^T.
+    C = torch.matmul(
+        torch.matmul(moment_vector, matrix_inverse),                          # (N_all, max_nb, 10)
+        H.t().view(1, terms_num, 9),                                          # (1, 10, 9)
+    )
+    return C  # (N_all, max_nb, 9)
+
+
+def _skpinn_uniform_periodic_neighbors_3d(N: int, L: float, h: float,
+                                          radius: float):
+    """Enumerate within-radius neighbors on a uniform N**3 periodic grid.
+
+    Returns (neighborhoods, distances, distance_vectors) as torch.float64
+    tensors. ``neighborhoods`` is the flat-index neighbor list per node;
+    distance vectors are signed and use the minimum-image convention.
+    Translation invariance + periodicity makes the offset list identical
+    for every node.
+    """
+    k_max = math.ceil(radius / h)
+    candidate_offsets: List[tuple] = []
+    for ox in range(-k_max, k_max + 1):
+        for oy in range(-k_max, k_max + 1):
+            for oz in range(-k_max, k_max + 1):
+                d2 = (ox * h) ** 2 + (oy * h) ** 2 + (oz * h) ** 2
+                if d2 <= radius ** 2 + 1e-12:
+                    candidate_offsets.append((ox, oy, oz, math.sqrt(d2)))
+    max_nb = len(candidate_offsets)
+    N_all = N ** 3
+
+    # Vectorised flat-index arithmetic for periodic neighbors.
+    ii, jj, kk = np.meshgrid(np.arange(N), np.arange(N), np.arange(N), indexing="ij")
+    ii_flat = ii.flatten(); jj_flat = jj.flatten(); kk_flat = kk.flatten()
+
+    neighborhoods = np.zeros((N_all, max_nb), dtype=np.int64)
+    distance_vectors = np.zeros((N_all, max_nb, 3), dtype=np.float64)
+    distances = np.zeros((N_all, max_nb), dtype=np.float64)
+
+    for nb_idx, (ox, oy, oz, d) in enumerate(candidate_offsets):
+        ni = (ii_flat + ox) % N
+        nj = (jj_flat + oy) % N
+        nk = (kk_flat + oz) % N
+        neighborhoods[:, nb_idx] = ni * (N * N) + nj * N + nk
+        distance_vectors[:, nb_idx, 0] = ox * h
+        distance_vectors[:, nb_idx, 1] = oy * h
+        distance_vectors[:, nb_idx, 2] = oz * h
+        distances[:, nb_idx] = d
+
+    return (
+        torch.from_numpy(neighborhoods),
+        torch.from_numpy(distances),
+        torch.from_numpy(distance_vectors),
+    )
+
+
+def build_skpinn_data_3d(N: int, problem: TGVProblem, h_factor: float,
+                         device: torch.device):
+    """Assemble the 9 sparse derivative matrices for SK-PINN on a uniform
+    N**3 periodic grid. Mirrors src/lid_benchmark.py:build_sk_data() in 3D.
+
+    Returns a dict containing:
+        xyz_grid:  (N**3, 3) flat node coordinates.
+        Dx, Dy, Dz, Dxx, Dyy, Dzz, Dxy, Dxz, Dyz: sparse (N**3, N**3) tensors.
+        h, dx:     scalar grid spacings.
+    """
+    L = problem.L
+    h_grid = L / N                              # uniform grid spacing
+    h_kernel = h_grid * h_factor                # SPH smoothing length
+    radius = 2.0 * h_kernel
+    N_all = N ** 3
+
+    print(f"  SK-PINN: building 3D RKPM matrices for {N}**3={N_all} uniform "
+          f"periodic grid; h_grid={h_grid:.4f}, h_kernel={h_kernel:.4f}, "
+          f"radius={radius:.4f}.")
+
+    # Uniform [0, L)**3 grid (periodic; no endpoint).
+    axis = np.linspace(0, L, N + 1)[:-1]
+    xx, yy, zz = np.meshgrid(axis, axis, axis, indexing="ij")
+    xyz_grid_np = np.column_stack([xx.flatten(), yy.flatten(), zz.flatten()])
+
+    # Periodic neighbor list (structured, exact for uniform grids).
+    nb_t, dist_t, dvec_t = _skpinn_uniform_periodic_neighbors_3d(
+        N, L, h_grid, radius,
+    )
+    max_nb = nb_t.shape[1]
+
+    # SPH kernel + RKPM correction in fp64 for numerical conditioning.
+    kernel = _skpinn_sph_kernel_3d(dist_t, h_kernel)             # (N_all, max_nb)
+    C = _skpinn_compute_C_3d(dvec_t, kernel.unsqueeze(-1), h_grid)  # (N_all, max_nb, 9)
+
+    # Assemble 9 sparse COO matrices on device.
+    rows_arr = np.repeat(np.arange(N_all)[:, None], max_nb, axis=1).flatten()
+    cols_arr = nb_t.numpy().flatten()
+    indices = torch.tensor(np.stack([rows_arr, cols_arr]), dtype=torch.long, device=device)
+
+    op_names = ["Dx", "Dy", "Dz", "Dxx", "Dyy", "Dzz", "Dxy", "Dxz", "Dyz"]
+    matrices = {}
+    kernel_flat = kernel.numpy()
+    for k_op, name in enumerate(op_names):
+        weights = C[:, :, k_op].numpy() * kernel_flat                # (N_all, max_nb)
+        matrices[name] = torch.sparse_coo_tensor(
+            indices,
+            torch.tensor(weights.flatten(), dtype=torch.float32, device=device),
+            (N_all, N_all),
+        ).coalesce()
+
+    print(f"  SK-PINN: 9 sparse matrices, max_nb={max_nb}, "
+          f"nnz_per_op={N_all * max_nb}.")
+
+    return {
+        "xyz_grid": torch.tensor(xyz_grid_np, dtype=torch.float32, device=device),
+        "h_grid": h_grid,
+        "h_kernel": h_kernel,
+        "N": N,
+        "N_all": N_all,
+        **matrices,
+    }
+
+
+def skpinn_residual(
+    model: nn.Module,
+    sk_data: dict,
+    t_samples: torch.Tensor,
+    problem: TGVProblem,
+    *,
+    cs: float = 0.0,
+    delta: float = 0.0,
+    eps: float = 1e-12,
+):
+    """3D SK-PINN NS+LES residual via sparse RKPM derivative matrices.
+
+    Single batched forward + 3 AD time-grad calls + ``_apply_sparse_op_K``-
+    batched RKPM matvecs. Returns ``(continuity, mom_x, mom_y, mom_z)`` each
+    ``(N**3 * K, 1)`` with time-slowest layout.
+    """
+    N_all = sk_data["N_all"]
+    K = t_samples.shape[0]
+    rho = problem.rho
+
+    Dx = sk_data["Dx"]; Dy = sk_data["Dy"]; Dz = sk_data["Dz"]
+    Dxx = sk_data["Dxx"]; Dyy = sk_data["Dyy"]; Dzz = sk_data["Dzz"]
+
+    xyzt = _batched_xyzt_K(sk_data["xyz_grid"], t_samples)
+    pred = model(xyzt)                                              # (K*N_all, 4)
+    u = pred[:, 0:1]; v = pred[:, 1:2]
+    w = pred[:, 2:3]; p = pred[:, 3:4]
+
+    ones_u = torch.ones_like(u)
+    u_t = torch.autograd.grad(u, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    v_t = torch.autograd.grad(v, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    w_t = torch.autograd.grad(w, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+
+    u_x = _apply_sparse_op_K(Dx, u, K, N_all)
+    u_y = _apply_sparse_op_K(Dy, u, K, N_all)
+    u_z = _apply_sparse_op_K(Dz, u, K, N_all)
+    v_x = _apply_sparse_op_K(Dx, v, K, N_all)
+    v_y = _apply_sparse_op_K(Dy, v, K, N_all)
+    v_z = _apply_sparse_op_K(Dz, v, K, N_all)
+    w_x = _apply_sparse_op_K(Dx, w, K, N_all)
+    w_y = _apply_sparse_op_K(Dy, w, K, N_all)
+    w_z = _apply_sparse_op_K(Dz, w, K, N_all)
+    p_x = _apply_sparse_op_K(Dx, p, K, N_all)
+    p_y = _apply_sparse_op_K(Dy, p, K, N_all)
+    p_z = _apply_sparse_op_K(Dz, p, K, N_all)
+
+    if cs > 0.0:
+        # Smagorinsky LES with full stress tensor (mirrors autodiff_residual).
+        Sxx, Syy, Szz = u_x, v_y, w_z
+        Sxy = 0.5 * (u_y + v_x)
+        Sxz = 0.5 * (u_z + w_x)
+        Syz = 0.5 * (v_z + w_y)
+        S_mag = torch.sqrt(
+            2.0 * (Sxx ** 2 + Syy ** 2 + Szz ** 2
+                   + 2.0 * (Sxy ** 2 + Sxz ** 2 + Syz ** 2)) + eps
+        )
+        nu_lam = problem.nu
+        nu_eff = nu_lam + (cs * delta) ** 2 * S_mag
+
+        q_xx = 2.0 * nu_eff * Sxx; q_yy = 2.0 * nu_eff * Syy; q_zz = 2.0 * nu_eff * Szz
+        q_xy = 2.0 * nu_eff * Sxy; q_xz = 2.0 * nu_eff * Sxz; q_yz = 2.0 * nu_eff * Syz
+
+        visc_u = (_apply_sparse_op_K(Dx, q_xx, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_xy, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_xz, K, N_all))
+        visc_v = (_apply_sparse_op_K(Dx, q_xy, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_yy, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_yz, K, N_all))
+        visc_w = (_apply_sparse_op_K(Dx, q_xz, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_yz, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_zz, K, N_all))
+    else:
+        nu = problem.nu
+        u_xx = _apply_sparse_op_K(Dxx, u, K, N_all)
+        u_yy = _apply_sparse_op_K(Dyy, u, K, N_all)
+        u_zz = _apply_sparse_op_K(Dzz, u, K, N_all)
+        v_xx = _apply_sparse_op_K(Dxx, v, K, N_all)
+        v_yy = _apply_sparse_op_K(Dyy, v, K, N_all)
+        v_zz = _apply_sparse_op_K(Dzz, v, K, N_all)
+        w_xx = _apply_sparse_op_K(Dxx, w, K, N_all)
+        w_yy = _apply_sparse_op_K(Dyy, w, K, N_all)
+        w_zz = _apply_sparse_op_K(Dzz, w, K, N_all)
+        visc_u = nu * (u_xx + u_yy + u_zz)
+        visc_v = nu * (v_xx + v_yy + v_zz)
+        visc_w = nu * (w_xx + w_yy + w_zz)
+
+    continuity = u_x + v_y + w_z
+    mom_x = u_t + (u * u_x + v * u_y + w * u_z) + p_x / rho - visc_u
+    mom_y = v_t + (u * v_x + v * v_y + w * v_z) + p_y / rho - visc_v
+    mom_z = w_t + (u * w_x + v * w_y + w * w_z) + p_z / rho - visc_w
+    return continuity, mom_x, mom_y, mom_z
+
+
+# =============================================================================
+# DT-PINN — 3D periodic port of Sharma & Shankar 2022 RBF-FD operators on
+# scattered nodes. The 2D paper-faithful build at src/rbf_fd_operators.py
+# uses Dirichlet boundary + ghost-node augmentation; for the triply-periodic
+# TGV domain the boundary set is empty and neighbor search wraps modulo L
+# via 27-image augmentation. Operators Dx/Dy/Dz/Dxx/Dyy/Dzz are returned as
+# sparse PyTorch tensors and applied via sparse matvecs in the residual.
+# =============================================================================
+def build_dtpinn_operators_3d_periodic(N: int, problem: TGVProblem,
+                                       p_order: int, device: torch.device):
+    """Build sparse RBF-FD operators on a uniform N**3 periodic grid.
+
+    Returns a dict with the precomputed grid + sparse derivative matrices,
+    matching the structure used by ``build_skpinn_data_3d``.
+    """
+    # Local imports keep the Phase 1/2 path independent of the RBF-FD code.
+    import scipy.linalg
+    import scipy.sparse
+    from scipy.spatial import cKDTree
+    from rbf_fd_operators import (
+        RBFFDParams, _phs, _phs_drbf_over_r,
+        total_degree_indices, mpoly_eval, _legendre_recurrence, _EPS,
+    )
+
+    L = problem.L
+    h = L / N
+    Ni = N ** 3
+
+    axis = np.linspace(0, L, N + 1)[:-1]
+    xx, yy, zz = np.meshgrid(axis, axis, axis, indexing="ij")
+    Xi = np.column_stack([xx.flatten(), yy.flatten(), zz.flatten()])
+
+    # 27-image augmentation for periodic neighbor search.
+    img_offsets = np.array([
+        [ox * L, oy * L, oz * L]
+        for ox in (-1, 0, 1) for oy in (-1, 0, 1) for oz in (-1, 0, 1)
+    ])  # (27, 3)
+    augmented = (Xi[None] + img_offsets[:, None, :]).reshape(-1, 3)  # (27*Ni, 3)
+    tree = cKDTree(augmented)
+
+    params_grad = RBFFDParams.from_orders(s_dim=3, p=p_order, theta=1)
+    params_lap = RBFFDParams.from_orders(s_dim=3, p=p_order, theta=2)
+    n_grad = params_grad.stencil_size
+    n_lap = params_lap.stencil_size
+    n_query = max(n_grad, n_lap)
+
+    print(f"  DT-PINN: building 3D periodic RBF-FD on {N}**3={Ni} nodes; "
+          f"p={p_order}, h={h:.4f}, n_grad={n_grad}, n_lap={n_lap}.")
+
+    _, idx_aug = tree.query(Xi, k=n_query)                                  # (Ni, n_query)
+    primary_idx = idx_aug % Ni                                              # (Ni, n_query) primary block
+
+    alpha_grad = total_degree_indices(3, params_grad.ell)
+    alpha_lap = total_degree_indices(3, params_lap.ell)
+
+    derivs_grad = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    derivs_lap = [(2, 0, 0), (0, 2, 0), (0, 0, 2)]
+    all_derivs = derivs_grad + derivs_lap
+
+    rows_acc = {d: [] for d in all_derivs}
+    cols_acc = {d: [] for d in all_derivs}
+    vals_acc = {d: [] for d in all_derivs}
+
+    for ic in range(Ni):
+        je_aug = idx_aug[ic]                                                 # (n_query,)
+        stencil_xyz = augmented[je_aug]                                      # (n_query, 3) in image space
+
+        # ---- Gradient operators (theta=1, scaled polynomial coords) ----
+        sg = stencil_xyz[:n_grad]
+        diffs_g = sg[:, None, :] - sg[None, :, :]
+        rd_g = np.sqrt(np.maximum(np.sum(diffs_g * diffs_g, axis=2), 0.0))
+        A_rbf_g = _phs(rd_g, params_grad.m)
+
+        w_scale = rd_g[0, n_grad - 1]
+        if w_scale <= 0:
+            raise RuntimeError(f"degenerate gradient stencil at node {ic}")
+        pc_g = (sg - sg[0]) / w_scale
+        v_g = mpoly_eval(pc_g, alpha_grad, _legendre_recurrence)
+        A_g = np.block([
+            [A_rbf_g, v_g],
+            [v_g.T, np.zeros((params_grad.poly_count, params_grad.poly_count))],
+        ])
+        try:
+            lu_g = scipy.linalg.lu_factor(A_g)
+        except Exception:
+            lu_g = None
+
+        D_phs_g = _phs_drbf_over_r(rd_g[0, :], params_grad.m)
+        for d in derivs_grad:
+            rhs = np.empty(n_grad + params_grad.poly_count, dtype=np.float64)
+            ax = 0 if d == (1, 0, 0) else (1 if d == (0, 1, 0) else 2)
+            d_comp = sg[0, ax] - sg[:, ax]
+            rhs[:n_grad] = d_comp * D_phs_g
+            d_p = mpoly_eval(pc_g[:1], alpha_grad, _legendre_recurrence,
+                             deriv=list(d))[0] / w_scale
+            rhs[n_grad:] = d_p
+            if lu_g is not None:
+                sol = scipy.linalg.lu_solve(lu_g, rhs)
+            else:
+                sol = np.linalg.solve(A_g, rhs)
+            w = sol[:n_grad]
+            rows_acc[d].append(np.full(n_grad, ic, dtype=np.int64))
+            cols_acc[d].append(primary_idx[ic, :n_grad].astype(np.int64))
+            vals_acc[d].append(w)
+
+        # ---- Laplacian-component operators (theta=2, unscaled polynomial coords) ----
+        sl = stencil_xyz[:n_lap]
+        diffs_l = sl[:, None, :] - sl[None, :, :]
+        rd_l = np.sqrt(np.maximum(np.sum(diffs_l * diffs_l, axis=2), 0.0))
+        A_rbf_l = _phs(rd_l, params_lap.m)
+        pc_l = sl - sl[0]
+        v_l = mpoly_eval(pc_l, alpha_lap, _legendre_recurrence)
+        A_l = np.block([
+            [A_rbf_l, v_l],
+            [v_l.T, np.zeros((params_lap.poly_count, params_lap.poly_count))],
+        ])
+        try:
+            lu_l = scipy.linalg.lu_factor(A_l)
+        except Exception:
+            lu_l = None
+
+        r_safe = rd_l[0, :] + _EPS
+        t_a = params_lap.m * r_safe ** (params_lap.m - 2)
+        t_b = params_lap.m * (params_lap.m - 2) * r_safe ** (params_lap.m - 4)
+
+        for d in derivs_lap:
+            rhs = np.empty(n_lap + params_lap.poly_count, dtype=np.float64)
+            ax = 0 if d == (2, 0, 0) else (1 if d == (0, 2, 0) else 2)
+            d_comp = sl[0, ax] - sl[:, ax]
+            rhs[:n_lap] = t_a + t_b * (d_comp * d_comp)
+            d_p = mpoly_eval(pc_l[:1], alpha_lap, _legendre_recurrence,
+                             deriv=list(d))[0]
+            rhs[n_lap:] = d_p
+            if lu_l is not None:
+                sol = scipy.linalg.lu_solve(lu_l, rhs)
+            else:
+                sol = np.linalg.solve(A_l, rhs)
+            w = sol[:n_lap]
+            rows_acc[d].append(np.full(n_lap, ic, dtype=np.int64))
+            cols_acc[d].append(primary_idx[ic, :n_lap].astype(np.int64))
+            vals_acc[d].append(w)
+
+    # Assemble sparse PyTorch operators. coalesce() sums duplicate entries
+    # which can arise when two periodic images of the same primary node both
+    # appear in a stencil (rare for radius << L/2, but supported).
+    op_names = {
+        (1, 0, 0): "Dx", (0, 1, 0): "Dy", (0, 0, 1): "Dz",
+        (2, 0, 0): "Dxx", (0, 2, 0): "Dyy", (0, 0, 2): "Dzz",
+    }
+    matrices = {}
+    for d, name in op_names.items():
+        rows = np.concatenate(rows_acc[d])
+        cols = np.concatenate(cols_acc[d])
+        vals = np.concatenate(vals_acc[d])
+        indices = torch.tensor(np.stack([rows, cols]), dtype=torch.long, device=device)
+        matrices[name] = torch.sparse_coo_tensor(
+            indices, torch.tensor(vals, dtype=torch.float32, device=device),
+            (Ni, Ni),
+        ).coalesce()
+
+    print(f"  DT-PINN: assembled 6 sparse operators (Dx/Dy/Dz/Dxx/Dyy/Dzz).")
+
+    return {
+        "xyz_grid": torch.tensor(Xi, dtype=torch.float32, device=device),
+        "h_grid": h,
+        "N": N,
+        "N_all": Ni,
+        "p_order": p_order,
+        **matrices,
+    }
+
+
+def _sage_compute_tgv_pde(pred, g, les_active: bool,
+                          nu_lam: float, rho: float,
+                          cs_delta_sq: float, eps_les: float):
+    """Trace-friendly 3D NS+LES residual on a uniform periodic grid.
+
+    Mirrors ``compute_pde_terms_sparse`` in the 2D SAGE pipeline but with
+    7 input columns: the 4 model outputs (u, v, w, p) plus the 3 AD-derived
+    time derivatives (u_t, v_t, w_t), which are passed in as additional
+    columns of ``pred`` so SAGE can produce a single combined upstream and
+    a downstream ``cat``-then-``backward`` propagates through both the
+    spatial and temporal-AD branches in one call.
+
+    The function is split-on-``les_active`` at trace time: each LES setting
+    produces its own emitted backward (cached upstream).
+    """
+    Dx = g["Dx"]; Dy = g["Dy"]; Dz = g["Dz"]
+
+    u = pred[:, 0:1]; v = pred[:, 1:2]
+    w = pred[:, 2:3]; p = pred[:, 3:4]
+    u_t = pred[:, 4:5]; v_t = pred[:, 5:6]; w_t = pred[:, 6:7]
+
+    u_x = torch.sparse.mm(Dx, u); u_y = torch.sparse.mm(Dy, u); u_z = torch.sparse.mm(Dz, u)
+    v_x = torch.sparse.mm(Dx, v); v_y = torch.sparse.mm(Dy, v); v_z = torch.sparse.mm(Dz, v)
+    w_x = torch.sparse.mm(Dx, w); w_y = torch.sparse.mm(Dy, w); w_z = torch.sparse.mm(Dz, w)
+    p_x = torch.sparse.mm(Dx, p); p_y = torch.sparse.mm(Dy, p); p_z = torch.sparse.mm(Dz, p)
+
+    if les_active:
+        Sxx, Syy, Szz = u_x, v_y, w_z
+        Sxy = 0.5 * (u_y + v_x)
+        Sxz = 0.5 * (u_z + w_x)
+        Syz = 0.5 * (v_z + w_y)
+        S_mag = torch.sqrt(
+            2.0 * (Sxx ** 2 + Syy ** 2 + Szz ** 2
+                   + 2.0 * (Sxy ** 2 + Sxz ** 2 + Syz ** 2)) + eps_les
+        )
+        nu_eff = nu_lam + cs_delta_sq * S_mag
+        q_xx = 2.0 * nu_eff * Sxx; q_yy = 2.0 * nu_eff * Syy; q_zz = 2.0 * nu_eff * Szz
+        q_xy = 2.0 * nu_eff * Sxy; q_xz = 2.0 * nu_eff * Sxz; q_yz = 2.0 * nu_eff * Syz
+        visc_u = (torch.sparse.mm(Dx, q_xx) + torch.sparse.mm(Dy, q_xy)
+                  + torch.sparse.mm(Dz, q_xz))
+        visc_v = (torch.sparse.mm(Dx, q_xy) + torch.sparse.mm(Dy, q_yy)
+                  + torch.sparse.mm(Dz, q_yz))
+        visc_w = (torch.sparse.mm(Dx, q_xz) + torch.sparse.mm(Dy, q_yz)
+                  + torch.sparse.mm(Dz, q_zz))
+    else:
+        Dxx = g["Dxx"]; Dyy = g["Dyy"]; Dzz = g["Dzz"]
+        u_xx = torch.sparse.mm(Dxx, u); u_yy = torch.sparse.mm(Dyy, u); u_zz = torch.sparse.mm(Dzz, u)
+        v_xx = torch.sparse.mm(Dxx, v); v_yy = torch.sparse.mm(Dyy, v); v_zz = torch.sparse.mm(Dzz, v)
+        w_xx = torch.sparse.mm(Dxx, w); w_yy = torch.sparse.mm(Dyy, w); w_zz = torch.sparse.mm(Dzz, w)
+        visc_u = nu_lam * (u_xx + u_yy + u_zz)
+        visc_v = nu_lam * (v_xx + v_yy + v_zz)
+        visc_w = nu_lam * (w_xx + w_yy + w_zz)
+
+    inv_rho = 1.0 / rho
+    continuity = u_x + v_y + w_z
+    mom_x = u_t + (u * u_x + v * u_y + w * u_z) + inv_rho * p_x - visc_u
+    mom_y = v_t + (u * v_x + v * v_y + w * v_z) + inv_rho * p_y - visc_v
+    mom_z = w_t + (u * w_x + v * w_y + w * w_z) + inv_rho * p_z - visc_w
+    return continuity, mom_x, mom_y, mom_z
+
+
+_SAGE_BACKWARD_CACHE: dict = {}
+
+
+def get_sage_backward_tgv(les_active: bool, nu_lam: float, rho: float,
+                          cs_delta_sq: float, eps_les: float,
+                          external_seeds: bool = True):
+    """Lazy-trace + cache of the SAGE-emitted backward for TGV.
+
+    The returned function has signature
+        ``generated_backward(pred_det, g[, dc, dmx, dmy, dmz])``
+    and produces the (N_all*K, 7) tensor of adjoints w.r.t.
+    ``[u, v, w, p, u_t, v_t, w_t]``. The caller stacks the model outputs
+    with the AD time derivatives, calls SAGE for the upstream, and then
+    feeds it into ``combined.backward(upstream)`` so propagation through
+    both the spatial and temporal-AD branches happens in a single call.
+
+    ``external_seeds=False`` (the non-causal default in ``train_one_window``)
+    has SAGE compute the residuals + ``2/M * mask`` seeds itself; the caller
+    only supplies ``g`` containing ``M`` and ``interior_mask``. This mirrors
+    the 2D ``train_sage`` pattern and avoids the redundant outside-residual
+    pass.
+
+    ``external_seeds=True`` keeps the per-chunk weighted seeding flow used
+    by the causal-loss path: the caller computes residuals + per-chunk
+    weights, builds explicit seeds, and hands them to the emitted backward
+    as positional arguments.
+    """
+    # Local import keeps SAGE machinery off the bit-equivalence path.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from symbolic_vjp import trace_pde_forward, emit_backward
+
+    key = (bool(les_active), float(nu_lam), float(rho),
+           float(cs_delta_sq), float(eps_les), bool(external_seeds))
+    if key in _SAGE_BACKWARD_CACHE:
+        return _SAGE_BACKWARD_CACHE[key]
+
+    tape: list = []
+    constants = ["Dx", "Dy", "Dz"] + (
+        [] if les_active else ["Dxx", "Dyy", "Dzz"]
+    )
+    input_names = ["u", "v", "w", "p", "u_t", "v_t", "w_t"]
+
+    def _trace_fn(pred, g):
+        return _sage_compute_tgv_pde(
+            pred, g,
+            les_active=les_active,
+            nu_lam=nu_lam, rho=rho,
+            cs_delta_sq=cs_delta_sq, eps_les=eps_les,
+        )
+
+    outputs, input_vars = trace_pde_forward(
+        _trace_fn, None, tape, sparse=True,
+        constants=constants, input_names=input_names,
+    )
+    seed_names = ["dc", "dmx", "dmy", "dmz"]
+    source, fn = emit_backward(
+        tape, list(outputs), seed_names, input_vars,
+        sparse=True, input_names=input_names,
+        external_seeds=bool(external_seeds),
+    )
+    _SAGE_BACKWARD_CACHE[key] = (source, fn)
+    return source, fn
+
+
+def _block_diagonal_sparse(M: torch.Tensor, K: int) -> torch.Tensor:
+    """Tile a sparse (n, n) operator into a block-diagonal (K*n, K*n).
+
+    Used by SAGE so that a single emitted backward call can process all
+    K time slices of the stacked combined tensor in one pass — applying
+    the spatial sparse operator independently within each block.
+    """
+    M = M.coalesce()
+    n = M.shape[0]
+    indices = M.indices(); values = M.values()
+    rows_blocks, cols_blocks = [], []
+    for k in range(K):
+        rows_blocks.append(indices[0] + k * n)
+        cols_blocks.append(indices[1] + k * n)
+    new_rows = torch.cat(rows_blocks)
+    new_cols = torch.cat(cols_blocks)
+    new_vals = values.repeat(K)
+    new_indices = torch.stack([new_rows, new_cols])
+    return torch.sparse_coo_tensor(
+        new_indices, new_vals, (K * n, K * n),
+        device=M.device,
+    ).coalesce()
+
+
+def sage_compute_combined(model: nn.Module, dt_data: dict,
+                          t_samples: torch.Tensor) -> torch.Tensor:
+    """Build the ``(K*N_all, 7)`` SAGE input tensor with AD graph.
+
+    Single batched forward through the model + 3 batched AD time-grad calls
+    (one per ``u``/``v``/``w`` across all K time slices). Columns are
+    ``[u, v, w, p, u_t, v_t, w_t]`` in time-slowest layout.
+
+    The spatial branch (sparse matvecs + LES closure) is NOT computed here;
+    SAGE's emitted backward owns that path so we don't pay for it twice.
+    The caller passes ``combined.detach()`` into the emitted backward, then
+    routes the returned upstream into ``combined.backward(gradient=upstream)``
+    to propagate ``∂loss_pde/∂model_params`` through both the spatial and
+    temporal-AD subgraphs in a single PyTorch backward.
+    """
+    xyzt = _batched_xyzt_K(dt_data["xyz_grid"], t_samples)
+    pred = model(xyzt)                                          # (K*N_all, 4)
+    u = pred[:, 0:1]
+    ones_u = torch.ones_like(u)
+    u_t = torch.autograd.grad(u, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    v_t = torch.autograd.grad(pred[:, 1:2], xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    w_t = torch.autograd.grad(pred[:, 2:3], xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    return torch.cat([pred, u_t, v_t, w_t], dim=1)              # (K*N_all, 7)
+
+
+def _sage_compute_tgv_residuals_eval(combined_det: torch.Tensor,
+                                     sage_g: dict,
+                                     les_active: bool,
+                                     nu_lam: float, rho: float,
+                                     cs_delta_sq: float, eps_les: float):
+    """Evaluate ``(continuity, mom_x, mom_y, mom_z)`` in ``no_grad`` mode.
+
+    Used by the causal-loss path (to build per-chunk weighted seeds) and the
+    LOG_INTERVAL printer. Mirrors what SAGE does internally — sharing
+    ``_sage_compute_tgv_pde`` keeps the two consistent.
+    """
+    with torch.no_grad():
+        return _sage_compute_tgv_pde(
+            combined_det, sage_g,
+            les_active=les_active,
+            nu_lam=nu_lam, rho=rho,
+            cs_delta_sq=cs_delta_sq, eps_les=eps_les,
+        )
+
+
+def dtpinn_residual(
+    model: nn.Module,
+    dt_data: dict,
+    t_samples: torch.Tensor,
+    problem: TGVProblem,
+    *,
+    cs: float = 0.0,
+    delta: float = 0.0,
+    eps: float = 1e-12,
+):
+    """3D DT-PINN NS+LES residual via sparse RBF-FD matvecs + AD time.
+
+    Single batched forward + 3 AD time-grad calls (one per ``u``/``v``/``w``
+    across all K slices) + ``_apply_sparse_op_K``-batched spatial mms.
+    Returns ``(continuity, mom_x, mom_y, mom_z)``, each ``(K*N_all, 1)`` in
+    the time-slowest layout that the causal-loss bookkeeping expects.
+    """
+    N_all = dt_data["N_all"]
+    K = t_samples.shape[0]
+    rho = problem.rho
+
+    Dx = dt_data["Dx"]; Dy = dt_data["Dy"]; Dz = dt_data["Dz"]
+    Dxx = dt_data["Dxx"]; Dyy = dt_data["Dyy"]; Dzz = dt_data["Dzz"]
+
+    xyzt = _batched_xyzt_K(dt_data["xyz_grid"], t_samples)
+    pred = model(xyzt)                                              # (K*N_all, 4)
+    u = pred[:, 0:1]; v = pred[:, 1:2]
+    w = pred[:, 2:3]; p = pred[:, 3:4]
+
+    ones_u = torch.ones_like(u)
+    u_t = torch.autograd.grad(u, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    v_t = torch.autograd.grad(v, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+    w_t = torch.autograd.grad(w, xyzt, ones_u, create_graph=True, retain_graph=True)[0][:, 3:4]
+
+    u_x = _apply_sparse_op_K(Dx, u, K, N_all)
+    u_y = _apply_sparse_op_K(Dy, u, K, N_all)
+    u_z = _apply_sparse_op_K(Dz, u, K, N_all)
+    v_x = _apply_sparse_op_K(Dx, v, K, N_all)
+    v_y = _apply_sparse_op_K(Dy, v, K, N_all)
+    v_z = _apply_sparse_op_K(Dz, v, K, N_all)
+    w_x = _apply_sparse_op_K(Dx, w, K, N_all)
+    w_y = _apply_sparse_op_K(Dy, w, K, N_all)
+    w_z = _apply_sparse_op_K(Dz, w, K, N_all)
+    p_x = _apply_sparse_op_K(Dx, p, K, N_all)
+    p_y = _apply_sparse_op_K(Dy, p, K, N_all)
+    p_z = _apply_sparse_op_K(Dz, p, K, N_all)
+
+    if cs > 0.0:
+        Sxx, Syy, Szz = u_x, v_y, w_z
+        Sxy = 0.5 * (u_y + v_x)
+        Sxz = 0.5 * (u_z + w_x)
+        Syz = 0.5 * (v_z + w_y)
+        S_mag = torch.sqrt(
+            2.0 * (Sxx ** 2 + Syy ** 2 + Szz ** 2
+                   + 2.0 * (Sxy ** 2 + Sxz ** 2 + Syz ** 2)) + eps
+        )
+        nu_lam = problem.nu
+        nu_eff = nu_lam + (cs * delta) ** 2 * S_mag
+
+        q_xx = 2.0 * nu_eff * Sxx; q_yy = 2.0 * nu_eff * Syy; q_zz = 2.0 * nu_eff * Szz
+        q_xy = 2.0 * nu_eff * Sxy; q_xz = 2.0 * nu_eff * Sxz; q_yz = 2.0 * nu_eff * Syz
+
+        visc_u = (_apply_sparse_op_K(Dx, q_xx, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_xy, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_xz, K, N_all))
+        visc_v = (_apply_sparse_op_K(Dx, q_xy, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_yy, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_yz, K, N_all))
+        visc_w = (_apply_sparse_op_K(Dx, q_xz, K, N_all)
+                  + _apply_sparse_op_K(Dy, q_yz, K, N_all)
+                  + _apply_sparse_op_K(Dz, q_zz, K, N_all))
+    else:
+        nu = problem.nu
+        u_xx = _apply_sparse_op_K(Dxx, u, K, N_all)
+        u_yy = _apply_sparse_op_K(Dyy, u, K, N_all)
+        u_zz = _apply_sparse_op_K(Dzz, u, K, N_all)
+        v_xx = _apply_sparse_op_K(Dxx, v, K, N_all)
+        v_yy = _apply_sparse_op_K(Dyy, v, K, N_all)
+        v_zz = _apply_sparse_op_K(Dzz, v, K, N_all)
+        w_xx = _apply_sparse_op_K(Dxx, w, K, N_all)
+        w_yy = _apply_sparse_op_K(Dyy, w, K, N_all)
+        w_zz = _apply_sparse_op_K(Dzz, w, K, N_all)
+        visc_u = nu * (u_xx + u_yy + u_zz)
+        visc_v = nu * (v_xx + v_yy + v_zz)
+        visc_w = nu * (w_xx + w_yy + w_zz)
+
+    continuity = u_x + v_y + w_z
+    mom_x = u_t + (u * u_x + v * u_y + w * u_z) + p_x / rho - visc_u
+    mom_y = v_t + (u * v_x + v * v_y + w * v_z) + p_y / rho - visc_v
+    mom_z = w_t + (u * w_x + v * w_y + w * w_z) + p_z / rho - visc_w
+    return continuity, mom_x, mom_y, mom_z
+
+
+# =============================================================================
 # Sampling helpers
 # =============================================================================
 def sample_interior(batch_size: int, problem: TGVProblem, window_size: float,
@@ -480,6 +1882,24 @@ def sample_ic_xyz(batch_size: int, problem: TGVProblem,
     """(B, 3) uniformly random in [0, L]^3."""
     rand = torch.rand(batch_size, 3, device=device, generator=generator)
     return rand * problem.L
+
+
+# =============================================================================
+# RoPINN gradient-variance trust-region calibration (port of
+# src/lid_benchmark.py:1671). The variance is a normalized stat over the last
+# ROPINN_PAST_ITERATIONS flattened gradient vectors; small variance means the
+# loss surface is locally smooth so we can grow the perturbation radius.
+# =============================================================================
+def compute_gradient_variance(gradient_list) -> float:
+    if len(gradient_list) < 2:
+        return 1.0
+    arr = np.array(gradient_list)
+    std_grad = np.std(arr, axis=0)
+    mean_abs_grad = np.mean(np.abs(arr), axis=0) + 1e-6
+    variance = float((std_grad / mean_abs_grad).mean())
+    if variance == 0.0:
+        variance = 1.0
+    return variance
 
 
 # =============================================================================
@@ -505,6 +1925,7 @@ def _build_optimizer(
     optimizer_name: str,
     lr: float,
     *,
+    weight_decay: float = 0.0,
     soap_betas=(0.9, 0.999),
     soap_shampoo_beta: float = -1.0,
     soap_eps: float = 1e-8,
@@ -513,11 +1934,16 @@ def _build_optimizer(
 ) -> torch.optim.Optimizer:
     """Construct the per-window optimizer based on --optimizer.
 
-    'adam' is the Phase 1/2 default and bit-equivalent.
+    'adam' is the Phase 1/2 default and bit-equivalent (weight_decay=0).
     'soap' instantiates the vendored Vyas et al. (2024) SOAP optimizer
-    (see ``src/soap.py``).
+    (see ``src/soap.py``). The ``weight_decay`` kwarg targets Adam (used by
+    SK-PINN's per-model regulariser); SOAP's regulariser remains
+    ``soap_weight_decay`` to preserve Phase 3's bit-equivalence at defaults.
     """
     if optimizer_name == "adam":
+        if weight_decay > 0.0:
+            return torch.optim.Adam(model.parameters(), lr=lr,
+                                    weight_decay=weight_decay)
         return torch.optim.Adam(model.parameters(), lr=lr)
     if optimizer_name == "soap":
         # Local import keeps Phase 1/2 path independent of soap.py.
@@ -561,6 +1987,24 @@ def train_one_window(
     soap_eps: float = 1e-8,
     soap_weight_decay: float = 0.0,
     soap_precondition_frequency: int = 10,
+    tsa_reg_weight: float = 0.0,
+    method: str = "autodiff",
+    ropinn_initial_region: float = 1e-4,
+    ropinn_region_max: float = 0.01,
+    ropinn_past_iterations: int = 10,
+    spectral_n: int = 16,
+    spectral_k: int = 4,
+    canpinn_n: int = 10,
+    canpinn_k: int = 4,
+    skpinn_n: int = 12,
+    skpinn_k: int = 4,
+    skpinn_wd: float = 0.0,
+    skpinn_h_factor: float = 1.4,
+    skpinn_data: Optional[dict] = None,
+    dtpinn_k: int = 4,
+    dtpinn_data: Optional[dict] = None,
+    sage_backward_fn=None,
+    sage_les_active: bool = False,
 ) -> dict:
     """Train one time window. Returns a small dict of stats.
 
@@ -569,9 +2013,22 @@ def train_one_window(
     * ``causal_eps > 0.0`` enables the causal PDE loss with ``causal_chunks``
       temporal slices per epoch (port of ``CausalLossNorm`` at
       ``temp/physicsnemo/physicsnemo/sym/loss/loss.py:271``).
+
+    Method dispatch (post-Phase-3 baseline ports):
+    * ``method='autodiff'`` (default) — fresh-sample PDE residual every epoch,
+      bit-equivalent to the Phase 1/2/3 path.
+    * ``method='ropinn'`` — region-optimized: holds a fixed (x,y,z,t) base
+      sampled once at window start; perturbs it by uniform random in
+      ``[0, current_region]`` each epoch. ``current_region`` is calibrated
+      from the running gradient variance over the last
+      ``ropinn_past_iterations`` epochs (port of
+      ``src/lid_benchmark.py:train_ropinn``).
+      Periodic dimensions (x, y, z) wrap modulo ``problem.L``; the time
+      dimension is clamped to ``[0, window_size]``.
     """
     optimizer = _build_optimizer(
         model, optimizer_name, lr,
+        weight_decay=skpinn_wd if method == "sk-pinn" else 0.0,
         soap_betas=soap_betas,
         soap_shampoo_beta=soap_shampoo_beta,
         soap_eps=soap_eps,
@@ -588,6 +2045,141 @@ def train_one_window(
     nan_seen = False
     causal_active = causal_eps > 0.0
 
+    # ----- RoPINN state: fixed interior base + gradient-variance history -----
+    ropinn_active = method == "ropinn"
+    if ropinn_active:
+        xyzt_int_base = sample_interior(
+            batch_interior, problem, window_size, device, generator,
+        ).detach()
+        ropinn_grad_history: List[np.ndarray] = []
+        ropinn_grad_variance = 1.0
+
+    # ----- Spectral-AD state: structured 4D grid + wavenumber array. Built once
+    # per window; the same grid is used every epoch (mirrors the 2D
+    # chebyshev-pinn pattern of a fixed Chebyshev tensor-product grid). When
+    # causal loss is active, --spectral-k must equal --causal-chunks because
+    # each time slice contributes one chunk of N**3 points.
+    spectral_active = method == "chebyshev-pinn"
+    if spectral_active:
+        if causal_active and spectral_k != causal_chunks:
+            raise ValueError(
+                "method=chebyshev-pinn with --causal-eps>0 requires "
+                f"--spectral-k == --causal-chunks, but got "
+                f"spectral_k={spectral_k}, causal_chunks={causal_chunks}."
+            )
+        spectral_xyz_grid, spectral_t_samples, spectral_freqs = build_spectral_grid(
+            spectral_n, spectral_k, problem, window_size, device,
+        )
+
+    # ----- CAN-PINN-faithful state: structured center grid + spacings. Built
+    # once per window. Same constraint as Spectral-AD on causal_chunks.
+    canpinn_active = method == "can-pinn-faithful"
+    if canpinn_active:
+        if causal_active and canpinn_k != causal_chunks:
+            raise ValueError(
+                "method=can-pinn-faithful with --causal-eps>0 requires "
+                f"--canpinn-k == --causal-chunks, but got "
+                f"canpinn_k={canpinn_k}, causal_chunks={causal_chunks}."
+            )
+        canpinn_centers, canpinn_dx = build_canpinn_centers(
+            canpinn_n, canpinn_k, problem, window_size, device,
+        )
+
+    # ----- SK-PINN state: precomputed sparse RKPM derivative matrices +
+    # per-window time samples. The matrices are translation-invariant on the
+    # uniform periodic grid so they can be reused across windows; the caller
+    # passes ``skpinn_data`` once and we just rebuild the time samples here.
+    skpinn_active = method == "sk-pinn"
+    if skpinn_active:
+        if causal_active and skpinn_k != causal_chunks:
+            raise ValueError(
+                "method=sk-pinn with --causal-eps>0 requires "
+                f"--skpinn-k == --causal-chunks, but got "
+                f"skpinn_k={skpinn_k}, causal_chunks={causal_chunks}."
+            )
+        if skpinn_data is None:
+            raise RuntimeError(
+                "method=sk-pinn requires precomputed RKPM matrices; "
+                "build_skpinn_data_3d must be called once before train_one_window."
+            )
+        skpinn_t_samples = torch.linspace(
+            0, window_size, skpinn_k + 1, device=device,
+        )[:-1]
+
+    # ----- DT-PINN state: precomputed sparse RBF-FD operators (built once
+    # by main, reused across windows). Same causal-chunks compatibility rule.
+    dtpinn_active = method == "dtpinn"
+    if dtpinn_active:
+        if causal_active and dtpinn_k != causal_chunks:
+            raise ValueError(
+                "method=dtpinn with --causal-eps>0 requires "
+                f"--dtpinn-k == --causal-chunks, but got "
+                f"dtpinn_k={dtpinn_k}, causal_chunks={causal_chunks}."
+            )
+        if dtpinn_data is None:
+            raise RuntimeError(
+                "method=dtpinn requires precomputed RBF-FD operators; "
+                "build_dtpinn_operators_3d_periodic must be called once before "
+                "train_one_window."
+            )
+        dtpinn_t_samples = torch.linspace(
+            0, window_size, dtpinn_k + 1, device=device,
+        )[:-1]
+
+    # ----- SAGE state: shares DT-PINN's RBF-FD matrices + a precompiled
+    # SAGE backward function (cached in main()).
+    #
+    # Two seeding modes are supported. ``causal_active`` selects the form
+    # ``main()`` traced + cached via ``external_seeds=True`` (per-chunk
+    # weighted seeds built outside SAGE every epoch). The non-causal mode
+    # uses ``external_seeds=False``: SAGE recomputes residuals + the
+    # ``2/M * mask`` seeds itself in a single forward+backward, mirroring
+    # the 2D ``train_sage`` pattern. ``sage_g_dict`` therefore carries
+    # ``M`` and ``interior_mask`` for the internal-seeds path; it carries
+    # the LES coefficients only for the on-demand residual computation
+    # used by the causal seed builder and the LOG_INTERVAL / NaN guard.
+    sage_active = method == "sage"
+    if sage_active:
+        if causal_active and dtpinn_k != causal_chunks:
+            raise ValueError(
+                "method=sage with --causal-eps>0 requires "
+                f"--dtpinn-k == --causal-chunks, but got "
+                f"dtpinn_k={dtpinn_k}, causal_chunks={causal_chunks}."
+            )
+        if dtpinn_data is None:
+            raise RuntimeError(
+                "method=sage requires precomputed RBF-FD operators; "
+                "build_dtpinn_operators_3d_periodic must be called once."
+            )
+        if sage_backward_fn is None:
+            raise RuntimeError(
+                "method=sage requires a SAGE-emitted backward function; "
+                "main() must call get_sage_backward_tgv before train_one_window."
+            )
+        sage_t_samples = torch.linspace(
+            0, window_size, dtpinn_k + 1, device=device,
+        )[:-1]
+        # Block-diagonal sparse ops so one matmul covers all K time slices.
+        sage_M_total = dtpinn_data["N_all"] * dtpinn_k
+        sage_g_dict = {
+            "Dx": _block_diagonal_sparse(dtpinn_data["Dx"], dtpinn_k),
+            "Dy": _block_diagonal_sparse(dtpinn_data["Dy"], dtpinn_k),
+            "Dz": _block_diagonal_sparse(dtpinn_data["Dz"], dtpinn_k),
+            "Dxx": _block_diagonal_sparse(dtpinn_data["Dxx"], dtpinn_k),
+            "Dyy": _block_diagonal_sparse(dtpinn_data["Dyy"], dtpinn_k),
+            "Dzz": _block_diagonal_sparse(dtpinn_data["Dzz"], dtpinn_k),
+            "N_all": sage_M_total,
+            # Internal-seeds path reads these from g (matching emit_backward's
+            # ``mask = g['interior_mask']`` / ``M = g['M']`` lines). All
+            # 3D-periodic TGV points are interior so the mask is all-ones.
+            "M": sage_M_total,
+            "interior_mask": torch.ones(sage_M_total, 1, device=device),
+        }
+        sage_nu_lam = problem.nu
+        sage_rho = problem.rho
+        sage_cs_delta_sq = (les_cs * les_delta) ** 2
+        sage_eps_les = les_eps
+
     if device.type == "cuda":
         torch.cuda.synchronize()
     t_start = time.perf_counter()
@@ -595,24 +2187,205 @@ def train_one_window(
     for epoch in range(epochs):
         optimizer.zero_grad()
 
-        # --- PDE residual on interior ---
-        xyzt_int = sample_interior(batch_interior, problem, window_size, device, generator)
-        if causal_active:
-            # Sort by t_local ascending and trim to a multiple of causal_chunks
-            # so reshape(causal_chunks, -1) gives temporally-contiguous slices.
-            sort_idx = torch.argsort(xyzt_int[:, 3])
-            n_keep = (xyzt_int.shape[0] // causal_chunks) * causal_chunks
-            if n_keep == 0:
-                raise ValueError(
-                    f"batch_interior={xyzt_int.shape[0]} is smaller than "
-                    f"causal_chunks={causal_chunks}; increase --batch-interior."
+        # ---------------------------------------------------------------
+        # SAGE specialised flow.
+        #
+        # Hot path each epoch (non-causal):
+        #   * one batched model forward over (K*N_all, 4),
+        #   * three batched AD time-grad calls (one per u/v/w),
+        #   * one SAGE-emitted-backward call which itself runs the spatial
+        #     forward + builds 2/M*mask seeds + emits the adjoint upstream,
+        #   * one IC forward + ``ic_total.backward()``,
+        #   * one ``combined.backward(upstream)`` to fold the SAGE-emitted
+        #     upstream back through the model + time-AD graph.
+        # No outside-residual computation, no ``loss_pde`` tensor, no
+        # per-epoch finite check — those happen at LOG_INTERVAL only,
+        # mirroring the 2D ``train_sage`` pattern.
+        #
+        # Causal path keeps the explicit-seeds flow because per-chunk
+        # weighting needs residual values to compute ``w_causal`` before
+        # SAGE runs. Residuals are computed in ``no_grad`` from
+        # ``combined.detach()``, then handed into SAGE as positional seeds.
+        # ---------------------------------------------------------------
+        if sage_active:
+            combined = sage_compute_combined(model, dtpinn_data, sage_t_samples)
+
+            if causal_active:
+                cont, mx, my, mz = _sage_compute_tgv_residuals_eval(
+                    combined.detach(), sage_g_dict,
+                    les_active=sage_les_active,
+                    nu_lam=sage_nu_lam, rho=sage_rho,
+                    cs_delta_sq=sage_cs_delta_sq, eps_les=sage_eps_les,
                 )
-            xyzt_int = xyzt_int[sort_idx[:n_keep]].contiguous()
-        xyzt_int.requires_grad_(True)
-        cont, mx, my, mz = autodiff_residual(
-            model, xyzt_int, problem,
-            cs=les_cs, delta=les_delta, eps=les_eps,
-        )
+                # Wang et al. 2022 causal weighting (matches non-SAGE path).
+                pointwise = (cont.pow(2) + mx.pow(2) + my.pow(2) + mz.pow(2)).reshape(-1)
+                chunk_loss = pointwise.reshape(causal_chunks, -1).mean(dim=-1)
+                cs_sum = torch.cumsum(chunk_loss, dim=0)
+                prefix_sum = torch.cat([
+                    torch.zeros(1, device=chunk_loss.device, dtype=chunk_loss.dtype),
+                    cs_sum[:-1],
+                ])
+                w_causal = torch.exp(-causal_eps * prefix_sum)
+
+                N_total = cont.shape[0]
+                N_per_chunk = N_total // causal_chunks
+                per_chunk_scale = 2.0 / N_per_chunk
+                w_view = w_causal.view(causal_chunks, 1, 1) * per_chunk_scale
+                dc = (cont.view(causal_chunks, N_per_chunk, 1) * w_view).reshape(N_total, 1)
+                dmx = (mx.view(causal_chunks, N_per_chunk, 1) * w_view).reshape(N_total, 1)
+                dmy = (my.view(causal_chunks, N_per_chunk, 1) * w_view).reshape(N_total, 1)
+                dmz = (mz.view(causal_chunks, N_per_chunk, 1) * w_view).reshape(N_total, 1)
+
+                loss_pde_val = float((w_causal * chunk_loss).sum())
+                upstream = sage_backward_fn(
+                    combined.detach(), sage_g_dict, dc, dmx, dmy, dmz,
+                )
+            else:
+                # Internal-seeds: SAGE forward+seeds+backward in one call.
+                upstream = sage_backward_fn(combined.detach(), sage_g_dict)
+                loss_pde_val = float("nan")  # set on demand at LOG_INTERVAL
+
+            # IC / window-match (same as standard path; PyTorch AD).
+            xyz_ic = sample_ic_xyz(batch_ic, problem, device, generator)
+            t_zero = torch.zeros(batch_ic, 1, device=device)
+            xyzt_ic = torch.cat([xyz_ic, t_zero], dim=-1)
+            pred_ic = model(xyzt_ic)
+            if prev_model is None:
+                u0, v0, w0, p0 = problem.initial_condition(
+                    xyz_ic[:, 0:1], xyz_ic[:, 1:2], xyz_ic[:, 2:3]
+                )
+                ic_terms = (
+                    (pred_ic[..., 0:1] - u0).pow(2).mean()
+                    + (pred_ic[..., 1:2] - v0).pow(2).mean()
+                    + (pred_ic[..., 2:3] - w0).pow(2).mean()
+                    + (pred_ic[..., 3:4] - p0).pow(2).mean()
+                )
+            else:
+                t_end = torch.full((batch_ic, 1), window_size, device=device)
+                xyzt_prev = torch.cat([xyz_ic, t_end], dim=-1)
+                with torch.no_grad():
+                    prev_pred = prev_model(xyzt_prev)
+                ic_terms = (
+                    (pred_ic[..., 0:1] - prev_pred[..., 0:1]).pow(2).mean()
+                    + (pred_ic[..., 1:2] - prev_pred[..., 1:2]).pow(2).mean()
+                    + (pred_ic[..., 2:3] - prev_pred[..., 2:3]).pow(2).mean()
+                )
+            loss_ic = ic_weight * ic_terms
+
+            reg_term = None
+            if tsa_reg_weight > 0.0 and hasattr(model, "regularization_loss"):
+                reg_term = tsa_reg_weight * model.regularization_loss()
+            ic_total = loss_ic + (reg_term if reg_term is not None else 0.0)
+            ic_total.backward()
+            combined.backward(gradient=upstream)
+
+            optimizer.step()
+            scheduler.step()
+
+            last_ic = float(loss_ic.detach())
+            log_now = (epoch + 1) % LOG_INTERVAL == 0
+            if log_now or epoch == epochs - 1:
+                # Compute residuals on demand (cheap; once per LOG_INTERVAL)
+                # so the printed loss + the NaN guard reflect the current
+                # state without paying for residuals every epoch.
+                if not causal_active:
+                    cont, mx, my, mz = _sage_compute_tgv_residuals_eval(
+                        combined.detach(), sage_g_dict,
+                        les_active=sage_les_active,
+                        nu_lam=sage_nu_lam, rho=sage_rho,
+                        cs_delta_sq=sage_cs_delta_sq, eps_les=sage_eps_les,
+                    )
+                    loss_pde_val = float(
+                        cont.pow(2).mean() + mx.pow(2).mean()
+                        + my.pow(2).mean() + mz.pow(2).mean()
+                    )
+                last_pde = loss_pde_val
+                last_loss = last_pde + last_ic + (
+                    float(reg_term.detach()) if reg_term is not None else 0.0
+                )
+                if not math.isfinite(last_loss):
+                    print(f"  {log_prefix} epoch {epoch+1}: NaN/Inf loss — stopping window early.")
+                    nan_seen = True
+                    break
+                if log_now:
+                    print(f"  {log_prefix} epoch {epoch+1:>6d}  loss={last_loss:.4e}  "
+                          f"pde={last_pde:.4e}  ic={last_ic:.4e}  "
+                          f"lr={scheduler.get_last_lr()[0]:.2e}  [SAGE]")
+            else:
+                # Quick non-finite probe on the SAGE upstream (single
+                # reduction; ~us on GPU). Catches NaN within one epoch
+                # without paying for the full residual computation.
+                if not torch.isfinite(upstream).all():
+                    print(f"  {log_prefix} epoch {epoch+1}: NaN/Inf in SAGE upstream — stopping window early.")
+                    nan_seen = True
+                    break
+            continue  # skip the standard PDE-loss + .backward() block below
+
+        # --- PDE residual on interior ---
+        if spectral_active:
+            # Spectral-AD: residual computed on the fixed structured 4D grid
+            # using FFT spatial derivatives + AD time derivative. The flat
+            # output is laid out time-slowest so that ``reshape(K, N**3)``
+            # gives one chunk per time slice when causal loss is on.
+            cont, mx, my, mz = spectral_residual(
+                model, spectral_xyz_grid, spectral_t_samples, spectral_freqs,
+                problem, cs=les_cs, delta=les_delta, eps=les_eps,
+            )
+        elif canpinn_active:
+            # CAN-PINN-faithful: residual at fixed centers using 7-point
+            # axis-aligned cross stencil + AD time. Time-slowest layout so the
+            # causal loss naturally chunks by time slice.
+            cont, mx, my, mz = can_pinn_residual(
+                model, canpinn_centers,
+                canpinn_dx, canpinn_dx, canpinn_dx,
+                problem, cs=les_cs, delta=les_delta, eps=les_eps,
+            )
+        elif skpinn_active:
+            # SK-PINN: spatial via sparse RKPM matvecs, time via AD on the
+            # t input column. Time-slowest layout via per-time-slice loop.
+            cont, mx, my, mz = skpinn_residual(
+                model, skpinn_data, skpinn_t_samples, problem,
+                cs=les_cs, delta=les_delta, eps=les_eps,
+            )
+        elif dtpinn_active:
+            # DT-PINN: spatial via sparse RBF-FD matvecs, time via AD.
+            cont, mx, my, mz = dtpinn_residual(
+                model, dtpinn_data, dtpinn_t_samples, problem,
+                cs=les_cs, delta=les_delta, eps=les_eps,
+            )
+        else:
+            if ropinn_active:
+                current_region = float(np.clip(
+                    ropinn_initial_region / ropinn_grad_variance,
+                    a_min=0.0, a_max=ropinn_region_max,
+                ))
+                perturbation = torch.rand(
+                    xyzt_int_base.shape, device=device, generator=generator
+                ) * current_region
+                xyzt_int = xyzt_int_base + perturbation
+                # Periodic in x,y,z; clamp in t.
+                xyzt_int = torch.cat([
+                    xyzt_int[..., 0:3] % problem.L,
+                    xyzt_int[..., 3:4].clamp(0.0, window_size),
+                ], dim=-1)
+            else:
+                xyzt_int = sample_interior(batch_interior, problem, window_size, device, generator)
+            if causal_active:
+                # Sort by t_local ascending and trim to a multiple of causal_chunks
+                # so reshape(causal_chunks, -1) gives temporally-contiguous slices.
+                sort_idx = torch.argsort(xyzt_int[:, 3])
+                n_keep = (xyzt_int.shape[0] // causal_chunks) * causal_chunks
+                if n_keep == 0:
+                    raise ValueError(
+                        f"batch_interior={xyzt_int.shape[0]} is smaller than "
+                        f"causal_chunks={causal_chunks}; increase --batch-interior."
+                    )
+                xyzt_int = xyzt_int[sort_idx[:n_keep]].contiguous()
+            xyzt_int.requires_grad_(True)
+            cont, mx, my, mz = autodiff_residual(
+                model, xyzt_int, problem,
+                cs=les_cs, delta=les_delta, eps=les_eps,
+            )
         if causal_active:
             # Wang et al. 2022 ("Respecting causality is all you need...")
             # causal weighting per the paper's Eq. (10) and the
@@ -682,12 +2455,33 @@ def train_one_window(
 
         loss = loss_pde + loss_ic
 
+        # Optional architecture-specific regularizer (TSA-PINN's Dynamic Slope
+        # Recovery; gated on tsa_reg_weight > 0 so MLP / PirateNet bit-equiv
+        # is preserved at default flags).
+        if tsa_reg_weight > 0.0 and hasattr(model, "regularization_loss"):
+            loss = loss + tsa_reg_weight * model.regularization_loss()
+
         if not torch.isfinite(loss):
             print(f"  {log_prefix} epoch {epoch+1}: NaN/Inf loss — stopping window early.")
             nan_seen = True
             break
 
         loss.backward()
+
+        if ropinn_active:
+            # Track flattened gradients for trust-region calibration. Adam
+            # / SOAP do not modify ``.grad`` so reading after backward (and
+            # before the next zero_grad) is fine.
+            grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.detach().view(-1))
+            if grads:
+                flat_grad = torch.cat(grads).cpu().numpy()
+                ropinn_grad_history.append(flat_grad)
+                ropinn_grad_history = ropinn_grad_history[-ropinn_past_iterations:]
+                ropinn_grad_variance = compute_gradient_variance(ropinn_grad_history)
+
         optimizer.step()
         scheduler.step()
 
@@ -696,8 +2490,13 @@ def train_one_window(
         last_ic = float(loss_ic.detach())
 
         if (epoch + 1) % LOG_INTERVAL == 0:
+            extra = ""
+            if ropinn_active:
+                extra = (f"  region={current_region:.2e}"
+                         f"  grad_var={ropinn_grad_variance:.3f}")
             print(f"  {log_prefix} epoch {epoch+1:>6d}  loss={last_loss:.4e}  "
-                  f"pde={last_pde:.4e}  ic={last_ic:.4e}  lr={scheduler.get_last_lr()[0]:.2e}")
+                  f"pde={last_pde:.4e}  ic={last_ic:.4e}  "
+                  f"lr={scheduler.get_last_lr()[0]:.2e}{extra}")
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -834,6 +2633,59 @@ def main():
           f"causal_eps={args.causal_eps} causal_chunks={args.causal_chunks} "
           f"les_cs={args.les_cs}")
 
+    # Resolve SK-PINN weight decay (per-model lookup unless user overrides).
+    if args.skpinn_wd < 0.0:
+        skpinn_wd_resolved = _SKPINN_TGV_WD.get(args.model, 1e-4)
+    else:
+        skpinn_wd_resolved = float(args.skpinn_wd)
+
+    # Build SK-PINN derivative matrices once (translation-invariant, reused
+    # across windows). Skip for other methods to avoid the build cost.
+    skpinn_data = None
+    if args.method == "sk-pinn":
+        skpinn_data = build_skpinn_data_3d(
+            args.skpinn_n, problem, args.skpinn_h_factor, device,
+        )
+        print(f"  SK-PINN: weight_decay={skpinn_wd_resolved:.1e} "
+              f"(model={args.model}).")
+
+    # Build DT-PINN RBF-FD operators once (also translation-invariant).
+    # SAGE shares the same operators (its emitted backward references
+    # ``g['Dx']`` etc. on the same sparse matrices).
+    dtpinn_data = None
+    if args.method in ("dtpinn", "sage"):
+        dtpinn_data = build_dtpinn_operators_3d_periodic(
+            args.dtpinn_n, problem, args.dtpinn_p, device,
+        )
+
+    # Trace + emit the SAGE backward (cached). The trace is split on whether
+    # the LES branch is active; both branches use the same input layout
+    # (4 model outputs + 3 AD time derivatives = 7 columns).
+    #
+    # Seeding mode is fixed at trace time. ``--causal-eps>0`` uses
+    # external seeds (per-chunk weights need residual values to build w_t,
+    # so the seeds can't be the standard ``2/M*mask`` form). ``--causal-eps==0``
+    # uses internal seeds — SAGE recomputes residuals + standard seeds in one
+    # forward+backward, mirroring the 2D pattern.
+    sage_backward_fn = None
+    sage_les_active_flag = False
+    if args.method == "sage":
+        sage_les_active_flag = args.les_cs > 0.0
+        nu_lam_val = problem.nu
+        rho_val = problem.rho
+        cs_delta_sq_val = (args.les_cs * args.les_delta) ** 2
+        eps_les_val = args.les_eps
+        sage_external_seeds = args.causal_eps > 0.0
+        sage_source, sage_backward_fn = get_sage_backward_tgv(
+            les_active=sage_les_active_flag,
+            nu_lam=nu_lam_val, rho=rho_val,
+            cs_delta_sq=cs_delta_sq_val, eps_les=eps_les_val,
+            external_seeds=sage_external_seeds,
+        )
+        print(f"  SAGE: traced backward (les_active={sage_les_active_flag}, "
+              f"nu={nu_lam_val:.4e}, rho={rho_val}, cs_delta_sq={cs_delta_sq_val:.4e}, "
+              f"external_seeds={sage_external_seeds}).")
+
     snapshots: List[WindowSnapshot] = []
     prev_model: Optional[nn.Module] = None
     nan_windows = 0
@@ -873,6 +2725,24 @@ def main():
                 soap_eps=args.soap_eps,
                 soap_weight_decay=args.soap_weight_decay,
                 soap_precondition_frequency=args.soap_precondition_frequency,
+                tsa_reg_weight=(args.tsa_reg_weight if args.model == "tsa-pinn" else 0.0),
+                method=args.method,
+                ropinn_initial_region=args.ropinn_initial_region,
+                ropinn_region_max=args.ropinn_region_max,
+                ropinn_past_iterations=args.ropinn_past_iterations,
+                spectral_n=args.spectral_n,
+                spectral_k=args.spectral_k,
+                canpinn_n=args.canpinn_n,
+                canpinn_k=args.canpinn_k,
+                skpinn_n=args.skpinn_n,
+                skpinn_k=args.skpinn_k,
+                skpinn_wd=skpinn_wd_resolved,
+                skpinn_h_factor=args.skpinn_h_factor,
+                skpinn_data=skpinn_data,
+                dtpinn_k=args.dtpinn_k,
+                dtpinn_data=dtpinn_data,
+                sage_backward_fn=sage_backward_fn,
+                sage_les_active=sage_les_active_flag,
             )
             total_wall += stats["wall_time_s"]
             final_loss = stats["final_loss"]

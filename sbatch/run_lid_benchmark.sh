@@ -179,25 +179,28 @@ models=(
 #   methods: autodiff
 #   models : mlp, pirate-net
 #
-# DT-PINN, SAGE, CAN-PINN, RoPINN, SK-PINN, and the tsa-pinn architecture
-# are NOT YET implemented for 3D periodic Navier-Stokes — adding them is a
-# separate, multi-day task per method (RBF-FD on a 3D periodic grid for
-# DT-PINN, SAGE wiring for the 3D NS residual + Smagorinsky LES, Chiu et al.
-# Taylor-expansion stencils in 3D for CAN-PINN, etc.). When those are added
-# to src/taylor_green_benchmark.py, simply append to tgv_methods / tgv_models
-# below and the existing loop submits them.
+# 2026-05-08 (afternoon): DT-PINN, SAGE, CAN-PINN, RoPINN, SK-PINN,
+# Spectral-AD (chebyshev-pinn, 3D Fourier form), and the tsa-pinn
+# architecture are now implemented in src/taylor_green_benchmark.py for
+# 3D periodic Navier-Stokes + Smagorinsky LES. Defaults match the
+# headline Phase 3 paperscale recipe (Re=1600, LES, causal-mean, SOAP).
+# Per-method discretisation knobs (e.g. --dtpinn-n=12, --canpinn-n=10,
+# --skpinn-n=12, --spectral-n=16) are passed below; --dtpinn-k /
+# --canpinn-k / --skpinn-k / --spectral-k must match TGV_CAUSAL_CHUNKS
+# whenever the causal loss is enabled.
 tgv_methods=(
     autodiff
-    # dtpinn               # not implemented for 3D periodic NS yet
-    # sage                 # not implemented for 3D periodic NS yet
-    # can-pinn-faithful    # not implemented for 3D periodic NS yet
-    # ropinn               # not implemented for 3D periodic NS yet
-    # sk-pinn              # not implemented for 3D periodic NS yet
+    chebyshev-pinn
+    ropinn
+    sk-pinn
+    can-pinn-faithful
+    dtpinn
+    sage
 )
 tgv_models=(
     mlp
     pirate-net
-    # tsa-pinn             # not implemented in src/taylor_green_benchmark.py yet
+    tsa-pinn
 )
 # Seed list for TGV is intentionally smaller than the 2D seeds (paperscale
 # is a 24h job; n=1 lands the headline row first, multi-seed can follow).
@@ -322,6 +325,23 @@ TGV_IC_WEIGHT=100
 TGV_OUTPUT_CSV="${TGV_OUTPUT_CSV_OVERRIDE:-results/tgv_phase3_results.csv}"
 TGV_TAG="${TGV_TAG_OVERRIDE:-tgv_phase3_re${TGV_RE}_$(date +%Y%m%d)}"
 
+# Per-method discretisation knobs for the 3D periodic NS port. K-flags
+# (--dtpinn-k, --canpinn-k, --skpinn-k, --spectral-k) must equal
+# $TGV_CAUSAL_CHUNKS whenever the causal loss is on (the residual layout is
+# time-slowest with one causal chunk per time slice). These defaults match
+# the validated dev-box smokes from 2026-05-08:
+#     spectral-AD : N=16, K=$TGV_CAUSAL_CHUNKS  (3D Fourier on uniform periodic grid)
+#     CAN-PINN    : N=10, K=$TGV_CAUSAL_CHUNKS  (7-point cross stencil)
+#     SK-PINN     : N=12, K=$TGV_CAUSAL_CHUNKS  (sparse RKPM)
+#     DT-PINN     : N=12, K=$TGV_CAUSAL_CHUNKS  (RBF-FD, p=2)
+#     SAGE        : reuses DT-PINN's RBF-FD operators
+TGV_SPECTRAL_N=16
+TGV_CANPINN_N=10
+TGV_SKPINN_N=12
+TGV_DTPINN_N=12
+TGV_DTPINN_P=2
+TGV_METHOD_K=$TGV_CAUSAL_CHUNKS  # must match TGV_CAUSAL_CHUNKS when causal active
+
 # ============================================================================
 # SLURM RESOURCE ALLOCATION
 # ============================================================================
@@ -436,6 +456,7 @@ if [[ ${#tgv_methods[@]} -gt 0 ]]; then
     echo "TGV models:        ${tgv_models[*]}"
     echo "TGV seeds:         ${tgv_seeds[*]} (${#tgv_seeds[@]} seeds)"
     echo "TGV config:        Re=$TGV_RE, $TGV_NUM_WINDOWS win x $TGV_EPOCHS_PER_WINDOW ep, $TGV_OPTIMIZER, lr=$TGV_LR, LES cs=$TGV_LES_CS, causal eps=$TGV_CAUSAL_EPS"
+    echo "TGV method grids:  spectral N=$TGV_SPECTRAL_N, canpinn N=$TGV_CANPINN_N, skpinn N=$TGV_SKPINN_N, dtpinn N=$TGV_DTPINN_N (p=$TGV_DTPINN_P), method K=$TGV_METHOD_K"
 fi
 if [[ "$MATCH_PROTOCOL_DTPINN" != "1" ]]; then
     echo "Faithful DT-PINN:  $DTPINN_OPTIMIZER, lr=$DTPINN_LR, epochs=$DTPINN_EPOCHS, $DTPINN_DTYPE"
@@ -793,6 +814,15 @@ for method in "${tgv_methods[@]}"; do
                         --optimizer=$TGV_OPTIMIZER \
                         --lr=$TGV_LR \
                         --ic-weight=$TGV_IC_WEIGHT \
+                        --spectral-n=$TGV_SPECTRAL_N \
+                        --spectral-k=$TGV_METHOD_K \
+                        --canpinn-n=$TGV_CANPINN_N \
+                        --canpinn-k=$TGV_METHOD_K \
+                        --skpinn-n=$TGV_SKPINN_N \
+                        --skpinn-k=$TGV_METHOD_K \
+                        --dtpinn-n=$TGV_DTPINN_N \
+                        --dtpinn-p=$TGV_DTPINN_P \
+                        --dtpinn-k=$TGV_METHOD_K \
                         --seed=$seed \
                         --output-csv=$TGV_OUTPUT_CSV \
                         --tag=${TGV_TAG}_s${seed}
